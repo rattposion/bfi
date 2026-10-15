@@ -24,6 +24,7 @@
     <ClInclude Include="features.h" />
     <ClInclude Include="hooks.h" />
     <ClInclude Include="il2cpp.h" />
+    <ClInclude Include="il2cpp_api.h" />
     <ClInclude Include="imgui\backends\imgui_impl_dx11.h" />
     <ClInclude Include="imgui\backends\imgui_impl_opengl3.h" />
     <ClInclude Include="imgui\backends\imgui_impl_opengl3_loader.h" />
@@ -52,6 +53,7 @@
     <ClCompile Include="config.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="esp.cpp" />
+    <ClCompile Include="features.cpp" />
     <ClCompile Include="hooks.cpp" />
     <ClCompile Include="il2cpp.cpp" />
     <ClCompile Include="imgui\backends\imgui_impl_dx11.cpp" />

@@ -1,4 +1,20 @@
 #pragma once
+
+// =====================================================================
+//  Config global.
+//  Funciona das DUAS formas e aponta para o MESMO objeto:
+//      C.esp      -> variavel (referencia)
+//      C(esp)     -> macro
+// =====================================================================
+struct Config;
+extern Config  g_cfg;
+extern Config& C;
+
+#ifdef C
+#undef C
+#endif
+#define C(f) g_cfg.f
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif

@@ -1,103 +1,139 @@
+// ============================================================================
+//  esp.cpp — desenho do ESP. Roda na thread de render, zero chamada il2cpp.
+// ============================================================================
 #include "features.h"
+#include "sdk.h"
+#include "hooks.h"
+#include "common.h"
+
+#include <imgui.h>
+#include <cstring>
+#include <cmath>
+#include <cstdio>
 
 namespace ESP {
+
+    static inline ImU32 Col(const float c[4], float aMul = 1.f) {
+        return IM_COL32((int)(c[0] * 255.f), (int)(c[1] * 255.f),
+            (int)(c[2] * 255.f), (int)(c[3] * 255.f * aMul));
+    }
+
+    static inline void Box(ImDrawList* dl, float x0, float y0, float x1, float y1,
+        ImU32 col, float th) {
+        dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), col, 0.f, 0, th);
+    }
+
+    // =====================================================================
     void Draw() {
-        if (!C.esp) return;
-
-        ImGuiIO& io = ImGui::GetIO();
-        float sh = io.DisplaySize.y;
-        auto* dl = ImGui::GetBackgroundDrawList();
-
-        ImVec4 col(C.espColor[0], C.espColor[1], C.espColor[2], C.espColor[3]);
-        ImU32  ucol = ImGui::GetColorU32(col);
-
         SDK::dbg_drawn = 0;
 
-        // ZERO il2cpp aqui: usa scrHead/scrFeet projetados na main thread
-        EnterCriticalSection(&g_targetCs);
-        int n = g_targetCount;
-        for (int i = 0; i < n; i++) {
-            Target& t = g_targets[i];
-            if (!t.player || t.player == g_localPlayer) continue;
-            if (C.teamCheck && g_localTeam >= 0 && t.team == g_localTeam) continue;
-            if (!t.alive || !t.onScreen) continue;
+        static int s_lastDrawn = -1;
 
-            float hx = t.scrHead.x, hy = sh - t.scrHead.y + C.espOffY;
-            float fx = t.scrFeet.x, fy = sh - t.scrFeet.y + C.espOffY;
-            float height = (fy - hy) * C.espScaleY;
-            if (height < 2) continue;
-            float width = height * 0.42f;
-            SDK::dbg_drawn++;
+        if (!C.esp) return;
+        if (!SDK::g_localPlayer) return;
+
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+        ImU32 colBox = Col(C.espBoxColor);
+        ImU32 colText = Col(C.espTextColor);
+        ImU32 colSkel = Col(C.espSkelColor);
+        float th = C.espThickness;
+
+        int drawn = 0;
+        float cx = (float)SDK::ScreenW() * 0.5f;
+        float cy = (float)SDK::ScreenH();
+
+        int cTotal = 0, cSelf = 0, cMorto = 0, cNpc = 0, cTime = 0, cTela = 0, cDist = 0, cAltura = 0;
+
+        SDK::LockTargets();
+        int n = SDK::g_targetCount;
+
+        for (int i = 0; i < n; ++i) {
+            Target& t = SDK::g_targets[i];
+            cTotal++;
+
+            if (!t.player) { cSelf++; continue; }
+            if (t.player == SDK::g_localPlayer) { cSelf++; continue; }
+            if (!t.alive) { cMorto++; continue; }
+            if (C.espNpc && t.npc) { cNpc++; continue; }
+            if (C.teamCheck && SDK::g_localTeam != 0 && t.team == SDK::g_localTeam) { cTime++; continue; }
+            if (!t.onScreen) { cTela++; continue; }
+            if (C.espMaxDist > 1.f && t.dist > C.espMaxDist) { cDist++; continue; }
+
+            float top = t.scrHead.y + C.espOffY;
+            float h = (t.scrFeet.y - top) * C.espScaleY;
+            if (h < 4.f || h > 2000.f) { cAltura++; continue; }
+
+            float w = h * 0.5f * (C.espBodyH / 1.8f);
+            float x0 = t.scrHead.x - w * 0.5f;
+            float y0 = top;
+            float x1 = t.scrHead.x + w * 0.5f;
+            float y1 = top + h;
+
+            if (C.espFill)
+                dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), Col(C.espBoxColor, 0.20f));
 
             if (C.espBox)
-                dl->AddRect(ImVec2(hx - width / 2, hy), ImVec2(hx + width / 2, fy), ucol, 0, 0, 1.5f);
-
-            if (C.espSnapline)
-                dl->AddLine(ImVec2(io.DisplaySize.x / 2, sh), ImVec2(hx, fy), ucol, 1.f);
+                Box(dl, x0, y0, x1, y1, colBox, th);
 
             if (C.espHealth) {
-                const float barW = 5.f;
-                float bx = hx - width / 2 - 9.f;
-                float by = hy;
-                float bh = height;
-                float pct = t.hp / 100.f;
-                if (pct < 0.f) pct = 0.f;
-                if (pct > 1.f) pct = 1.f;
+                float hp = t.health * 0.01f;
+                if (hp > 1.f) hp = 1.f;
+                if (hp < 0.f) hp = 0.f;
 
-                dl->AddRectFilled(ImVec2(bx - 1, by - 1), ImVec2(bx + barW + 1, by + bh + 1),
-                    IM_COL32(0, 0, 0, 230), 2.f);
-                dl->AddRect(ImVec2(bx - 1, by - 1), ImVec2(bx + barW + 1, by + bh + 1),
-                    IM_COL32(255, 255, 255, 170), 2.f);
-
-                float fh = bh * pct;
-                float r = 1.00f - 0.75f * pct;
-                float g = 0.15f + 0.85f * pct;
-                ImU32 hcol = ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, 0.15f, 1.f));
-                dl->AddRectFilled(ImVec2(bx, by + bh - fh), ImVec2(bx + barW, by + bh), hcol, 1.f);
+                float bw = 4.f;
+                float bx = x0 - bw - 2.f;
+                dl->AddRectFilled(ImVec2(bx, y0), ImVec2(bx + bw, y1), IM_COL32(0, 0, 0, 180));
+                dl->AddRectFilled(ImVec2(bx, y1 - h * hp), ImVec2(bx + bw, y1),
+                    IM_COL32((int)(255.f * (1.f - hp)), (int)(255.f * hp), 0, 255));
 
                 if (C.espHealthNum) {
-                    char b[16];
-                    sprintf_s(b, "%d", t.health);
-                    ImVec2 ts = ImGui::CalcTextSize(b);
-                    dl->AddText(ImVec2(bx - ts.x - 4.f, by - 2.f), IM_COL32(255, 255, 255, 235), b);
+                    char hpBuf[16];
+                    sprintf_s(hpBuf, sizeof(hpBuf), "%.0f", (double)t.health);
+                    dl->AddText(ImVec2(bx - 22.f, y0), colText, hpBuf);
                 }
             }
 
-            if (C.espName && !t.name.empty() && t.name != "?") {
-                ImVec2 ts = ImGui::CalcTextSize(t.name.c_str());
-                dl->AddText(ImVec2(hx - ts.x / 2 + 1, hy - 15), IM_COL32(0, 0, 0, 220), t.name.c_str());
-                dl->AddText(ImVec2(hx - ts.x / 2, hy - 16), ucol, t.name.c_str());
+            if (C.espSkeleton) {
+                dl->AddLine(ImVec2(t.scrHead.x, y0), ImVec2(t.scrHead.x, y1), colSkel, th);
+                float sy = y0 + h * 0.22f;
+                dl->AddLine(ImVec2(x0, sy), ImVec2(x1, sy), colSkel, th);
+                dl->AddLine(ImVec2(x0, sy), ImVec2(t.scrHead.x, y0 + h * 0.06f), colSkel, th);
+                dl->AddLine(ImVec2(x1, sy), ImVec2(t.scrHead.x, y0 + h * 0.06f), colSkel, th);
             }
 
-            if (C.espWeapon && !t.weapon.empty()) {
-                ImVec2 ts = ImGui::CalcTextSize(t.weapon.c_str());
-                dl->AddText(ImVec2(hx - ts.x / 2, fy + 15), IM_COL32(200, 200, 255, 220), t.weapon.c_str());
+            char buf[96];
+
+            if (C.espName && t.name[0]) {
+                float tw = (float)strlen(t.name) * (C.espFontSize * 0.55f);
+                dl->AddText(ImVec2(t.scrHead.x - tw * 0.5f, y0 - C.espFontSize - 2.f),
+                    colText, t.name);
+            }
+
+            if (C.espWeapon) {
+                sprintf_s(buf, sizeof(buf), "arma %d", t.weapon);
+                dl->AddText(ImVec2(t.scrHead.x - 20.f, y1 + 2.f), colText, buf);
             }
 
             if (C.espDistance) {
-                char b[32];
-                sprintf_s(b, "%dm", (int)t.dist);
-                ImVec2 ts = ImGui::CalcTextSize(b);
-                dl->AddText(ImVec2(hx - ts.x / 2, fy + 3), IM_COL32(255, 255, 255, 230), b);
+                sprintf_s(buf, sizeof(buf), "%.0fm", (double)t.dist);
+                dl->AddText(ImVec2(t.scrHead.x - 16.f, y1 + C.espFontSize + 2.f), colText, buf);
             }
-        }
-        LeaveCriticalSection(&g_targetCs);
 
-        // ---- circulo de FOV do aimbot ----
-        if (C.aimbot && C.showFovCircle) {
-            float cx = io.DisplaySize.x * 0.5f;
-            float cy = sh * 0.5f;
-            ImU32 fc = C.aimKeyDown
-                ? IM_COL32(0, 255, 120, 220)
-                : IM_COL32(0, 200, 255, 130);
-            dl->AddCircle(ImVec2(cx, cy), C.aimFov, fc, 96, 1.5f);
+            if (C.espSnapline)
+                dl->AddLine(ImVec2(cx, cy), ImVec2(t.scrFeet.x, t.scrFeet.y), colBox, th);
+
+            drawn++;
         }
 
-        if (C.crosshair) {
-            float cx = io.DisplaySize.x / 2;
-            float cy = sh / 2;
-            dl->AddLine(ImVec2(cx - 8, cy), ImVec2(cx + 8, cy), IM_COL32(255, 255, 255, 180));
-            dl->AddLine(ImVec2(cx, cy - 8), ImVec2(cx, cy + 8), IM_COL32(255, 255, 255, 180));
+        SDK::UnlockTargets();
+        SDK::dbg_drawn = drawn;
+
+        if (drawn != s_lastDrawn) {
+            s_lastDrawn = drawn;
+            Log("[esp] drawn=%d n=%d | null/self=%d morto=%d npc=%d time=%d FORA_TELA=%d dist=%d altura=%d",
+                drawn, n, cSelf, cMorto, cNpc, cTime, cTela, cDist, cAltura);
         }
     }
-}
+
+} // namespace ESP

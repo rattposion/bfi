@@ -1,867 +1,1244 @@
-#include "sdk.h"
+// ============================================================================
+//  sdk.cpp — versao consolidada
+//  - SEH com chaves explicitas
+//  - GetPos/SetPos com cache de MethodInfo POR CLASSE
+//  - FindBoneContains converte Entity -> Transform
+//  - raiz de bone via humanMeshAnimator + fallback de altura (1.70m)
+//  - CameraObj prioriza a mCamera do local player
+//  - seqlock no g_viewProj
+//  - diagnostico de hierarquia e dump do AntiHack
+// ============================================================================
+#include <windows.h>
+#include <cstdio>
+#include <cstring>
+#include <cstdint>
+#include <cmath>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <mutex>
+
+#include "il2cpp.h"
+#include "il2cpp_api.h"
+#include "common.h"
+#include "memory.h"
 #include "config.h"
+#include "sdk.h"
+#include "hooks.h"
 
-Target g_targets[64];
-int    g_targetCount = 0;
-CRITICAL_SECTION g_targetCs;
+void Log(const char* fmt, ...);
+extern HMODULE g_hModule;
+const char* g_phase = "boot";
 
-Il2CppObject* g_localPlayer = nullptr;
-Il2CppObject* g_camera = nullptr;
-int           g_localTeam = -1;
-Vec3          g_localPos;
-bool          g_inGame = false;
+extern "C" {
+    Il2CppDomain* (*il2cpp_domain_get)() = nullptr;
+    const Il2CppAssembly** (*il2cpp_domain_get_assemblies)(const Il2CppDomain*, size_t*) = nullptr;
+    Il2CppImage* (*il2cpp_assembly_get_image)(const Il2CppAssembly*) = nullptr;
+    size_t(*il2cpp_image_get_class_count)(const Il2CppImage*) = nullptr;
+    Il2CppClass* (*il2cpp_image_get_class)(const Il2CppImage*, size_t) = nullptr;
+    const char* (*il2cpp_class_get_name)(const Il2CppClass*) = nullptr;
+    const char* (*il2cpp_class_get_namespace)(const Il2CppClass*) = nullptr;
+    Il2CppClass* (*il2cpp_class_get_parent)(const Il2CppClass*) = nullptr;
+    Il2CppClass* (*il2cpp_class_get_element_class)(const Il2CppClass*) = nullptr;
+    Il2CppImage* (*il2cpp_class_get_image)(const Il2CppClass*) = nullptr;
+    Il2CppType* (*il2cpp_class_get_type)(const Il2CppClass*) = nullptr;
+    Il2CppClass* (*il2cpp_class_from_type)(const Il2CppType*) = nullptr;
+    FieldInfo* (*il2cpp_class_get_field_from_name)(const Il2CppClass*, const char*) = nullptr;
+    FieldInfo* (*il2cpp_class_get_fields)(const Il2CppClass*, void**) = nullptr;
+    MethodInfo* (*il2cpp_class_get_method_from_name)(const Il2CppClass*, const char*, int) = nullptr;
+    const MethodInfo* (*il2cpp_class_get_methods)(const Il2CppClass*, void**) = nullptr;
+    size_t(*il2cpp_field_get_offset)(const FieldInfo*) = nullptr;
+    const char* (*il2cpp_field_get_name)(const FieldInfo*) = nullptr;
+    void (*il2cpp_field_static_get_value)(const FieldInfo*, void*) = nullptr;
+    const char* (*il2cpp_method_get_name)(const MethodInfo*) = nullptr;
+    uint32_t(*il2cpp_method_get_param_count)(const MethodInfo*) = nullptr;
+    Il2CppClass* (*il2cpp_object_get_class)(const Il2CppObject*) = nullptr;
+    Il2CppObject* (*il2cpp_object_new)(const Il2CppClass*) = nullptr;
+    void* (*il2cpp_object_unbox)(const Il2CppObject*) = nullptr;
+    Il2CppObject* (*il2cpp_runtime_invoke)(const MethodInfo*, void*, void**, Il2CppException**) = nullptr;
+    Il2CppString* (*il2cpp_string_new)(const char*) = nullptr;
+    const char* (*il2cpp_string_chars)(const Il2CppString*) = nullptr;
+    uint32_t(*il2cpp_array_length)(const Il2CppArray*) = nullptr;
+    Il2CppArray* (*il2cpp_array_new)(const Il2CppClass*, size_t) = nullptr;
+    Il2CppDomain* (*il2cpp_thread_attach)(const Il2CppDomain*) = nullptr;
+    Il2CppObject* (*il2cpp_type_get_object)(const Il2CppType*) = nullptr;
+}
+
+namespace IL2CPP_API {
+    static int g_resolved = 0, g_missing = 0;
+    bool Resolve() {
+        HMODULE ga = GetModuleHandleA("GameAssembly.dll");
+        if (!ga) { Log("[il2cpp] GameAssembly.dll nao carregada"); return false; }
+        struct Entry { const char* name; void** slot; };
+        static const Entry tbl[] = {
+            {"il2cpp_domain_get", (void**)&il2cpp_domain_get},
+            {"il2cpp_domain_get_assemblies", (void**)&il2cpp_domain_get_assemblies},
+            {"il2cpp_assembly_get_image", (void**)&il2cpp_assembly_get_image},
+            {"il2cpp_image_get_class_count", (void**)&il2cpp_image_get_class_count},
+            {"il2cpp_image_get_class", (void**)&il2cpp_image_get_class},
+            {"il2cpp_class_get_name", (void**)&il2cpp_class_get_name},
+            {"il2cpp_class_get_namespace", (void**)&il2cpp_class_get_namespace},
+            {"il2cpp_class_get_parent", (void**)&il2cpp_class_get_parent},
+            {"il2cpp_class_get_element_class", (void**)&il2cpp_class_get_element_class},
+            {"il2cpp_class_get_image", (void**)&il2cpp_class_get_image},
+            {"il2cpp_class_get_type", (void**)&il2cpp_class_get_type},
+            {"il2cpp_class_from_type", (void**)&il2cpp_class_from_type},
+            {"il2cpp_class_get_field_from_name", (void**)&il2cpp_class_get_field_from_name},
+            {"il2cpp_class_get_fields", (void**)&il2cpp_class_get_fields},
+            {"il2cpp_class_get_method_from_name", (void**)&il2cpp_class_get_method_from_name},
+            {"il2cpp_class_get_methods", (void**)&il2cpp_class_get_methods},
+            {"il2cpp_field_get_offset", (void**)&il2cpp_field_get_offset},
+            {"il2cpp_field_get_name", (void**)&il2cpp_field_get_name},
+            {"il2cpp_field_static_get_value", (void**)&il2cpp_field_static_get_value},
+            {"il2cpp_method_get_name", (void**)&il2cpp_method_get_name},
+            {"il2cpp_method_get_param_count", (void**)&il2cpp_method_get_param_count},
+            {"il2cpp_object_get_class", (void**)&il2cpp_object_get_class},
+            {"il2cpp_object_new", (void**)&il2cpp_object_new},
+            {"il2cpp_object_unbox", (void**)&il2cpp_object_unbox},
+            {"il2cpp_runtime_invoke", (void**)&il2cpp_runtime_invoke},
+            {"il2cpp_string_new", (void**)&il2cpp_string_new},
+            {"il2cpp_string_chars", (void**)&il2cpp_string_chars},
+            {"il2cpp_array_length", (void**)&il2cpp_array_length},
+            {"il2cpp_array_new", (void**)&il2cpp_array_new},
+            {"il2cpp_thread_attach", (void**)&il2cpp_thread_attach},
+            {"il2cpp_type_get_object", (void**)&il2cpp_type_get_object}
+        };
+        g_resolved = g_missing = 0;
+        for (size_t i = 0; i < sizeof(tbl) / sizeof(tbl[0]); ++i) {
+            FARPROC p = GetProcAddress(ga, tbl[i].name);
+            if (p) { *tbl[i].slot = (void*)p; ++g_resolved; }
+            else { *tbl[i].slot = nullptr; ++g_missing; Log("[il2cpp] faltando: %s", tbl[i].name); }
+        }
+        Log("[il2cpp] resolvidas %d, faltando %d", g_resolved, g_missing);
+        return g_resolved > 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  wrappers SEH — chaves explicitas
+// ---------------------------------------------------------------------------
+#define SE_BEGIN __try
+#define SE_END   __except (EXCEPTION_EXECUTE_HANDLER)
+
+static Il2CppDomain* se_domain_get() {
+    Il2CppDomain* r = nullptr;
+    SE_BEGIN{ if (il2cpp_domain_get) r = il2cpp_domain_get(); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static const Il2CppAssembly** se_domain_get_assemblies(Il2CppDomain* d, size_t* n) {
+    const Il2CppAssembly** r = nullptr;
+    SE_BEGIN{ if (il2cpp_domain_get_assemblies) r = il2cpp_domain_get_assemblies(d, n); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static Il2CppImage* se_assembly_get_image(const Il2CppAssembly* a) {
+    Il2CppImage* r = nullptr;
+    SE_BEGIN{ if (il2cpp_assembly_get_image) r = il2cpp_assembly_get_image(a); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static size_t se_image_class_count(Il2CppImage* img) {
+    size_t r = 0;
+    SE_BEGIN{ if (il2cpp_image_get_class_count) r = il2cpp_image_get_class_count(img); }
+    SE_END{ r = 0; }
+    return r;
+}
+static Il2CppClass* se_image_get_class(Il2CppImage* img, size_t i) {
+    Il2CppClass* r = nullptr;
+    SE_BEGIN{ if (il2cpp_image_get_class) r = il2cpp_image_get_class(img, i); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static const char* se_class_name(Il2CppClass* k) {
+    const char* r = nullptr;
+    SE_BEGIN{ if (il2cpp_class_get_name) r = il2cpp_class_get_name(k); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static const char* se_class_namespace(Il2CppClass* k) {
+    const char* r = nullptr;
+    SE_BEGIN{ if (il2cpp_class_get_namespace) r = il2cpp_class_get_namespace(k); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static Il2CppClass* se_class_parent(Il2CppClass* k) {
+    Il2CppClass* r = nullptr;
+    SE_BEGIN{ if (il2cpp_class_get_parent) r = il2cpp_class_get_parent(k); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static MethodInfo* se_class_get_method_from_name(Il2CppClass* k, const char* n, int a) {
+    MethodInfo* r = nullptr;
+    SE_BEGIN{ if (il2cpp_class_get_method_from_name) r = il2cpp_class_get_method_from_name(k, n, a); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static FieldInfo* se_class_get_field_from_name(Il2CppClass* k, const char* n) {
+    FieldInfo* r = nullptr;
+    SE_BEGIN{ if (il2cpp_class_get_field_from_name) r = il2cpp_class_get_field_from_name(k, n); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static FieldInfo* se_class_get_fields(Il2CppClass* k, void** iter) {
+    FieldInfo* r = nullptr;
+    SE_BEGIN{ if (il2cpp_class_get_fields) r = il2cpp_class_get_fields(k, iter); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static const char* se_field_name(FieldInfo* f) {
+    const char* r = nullptr;
+    SE_BEGIN{ if (il2cpp_field_get_name) r = il2cpp_field_get_name(f); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static size_t se_field_offset(FieldInfo* f) {
+    size_t r = 0;
+    SE_BEGIN{ if (il2cpp_field_get_offset) r = il2cpp_field_get_offset(f); }
+    SE_END{ r = 0; }
+    return r;
+}
+static void se_field_static_get_value(FieldInfo* f, void* out) {
+    SE_BEGIN{ if (il2cpp_field_static_get_value) il2cpp_field_static_get_value(f, out); }
+        SE_END{ }
+}
+static const char* se_method_name(const MethodInfo* m) {
+    const char* r = nullptr;
+    SE_BEGIN{ if (il2cpp_method_get_name) r = il2cpp_method_get_name(m); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static uint32_t se_method_param_count(const MethodInfo* m) {
+    uint32_t r = 0;
+    SE_BEGIN{ if (il2cpp_method_get_param_count) r = il2cpp_method_get_param_count(m); }
+    SE_END{ r = 0; }
+    return r;
+}
+static Il2CppClass* se_object_get_class(Il2CppObject* o) {
+    Il2CppClass* r = nullptr;
+    SE_BEGIN{ if (il2cpp_object_get_class) r = il2cpp_object_get_class(o); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static Il2CppObject* se_object_new(Il2CppClass* k) {
+    Il2CppObject* r = nullptr;
+    SE_BEGIN{ if (il2cpp_object_new) r = il2cpp_object_new(k); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static void* se_object_unbox(Il2CppObject* o) {
+    void* r = nullptr;
+    SE_BEGIN{ if (il2cpp_object_unbox) r = il2cpp_object_unbox(o); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static Il2CppObject* se_runtime_invoke(const MethodInfo* m, void* o, void** args) {
+    Il2CppObject* r = nullptr;
+    SE_BEGIN{ if (il2cpp_runtime_invoke) r = il2cpp_runtime_invoke(m, o, args, nullptr); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static Il2CppDomain* se_thread_attach(Il2CppDomain* d) {
+    Il2CppDomain* r = nullptr;
+    SE_BEGIN{ if (il2cpp_thread_attach) r = il2cpp_thread_attach(d); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static Il2CppObject* se_type_get_object(Il2CppType* t) {
+    Il2CppObject* r = nullptr;
+    SE_BEGIN{ if (il2cpp_type_get_object) r = il2cpp_type_get_object(t); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static Il2CppType* se_class_get_type(Il2CppClass* k) {
+    Il2CppType* r = nullptr;
+    SE_BEGIN{ if (il2cpp_class_get_type) r = il2cpp_class_get_type(k); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static uint32_t se_array_length(Il2CppArray* a) {
+    uint32_t r = 0;
+    SE_BEGIN{ if (il2cpp_array_length) r = il2cpp_array_length(a); }
+    SE_END{ r = 0; }
+    return r;
+}
+static const char* se_string_chars(Il2CppString* s) {
+    const char* r = nullptr;
+    SE_BEGIN{ if (il2cpp_string_chars) r = il2cpp_string_chars(s); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static bool se_read_bytes(void* src, void* dst, size_t len) {
+    SE_BEGIN{ memcpy(dst, src, len); }
+    SE_END{ return false; }
+    return true;
+}
+static bool se_is_exec(void* p) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!p || VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return false;
+    return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+static void* se_array_at(Il2CppArray* a, uint32_t i) {
+    void* r = nullptr;
+    SE_BEGIN{ r = *(void**)((uintptr_t)a + 0x20 + (size_t)i * sizeof(void*)); }
+    SE_END{ r = nullptr; }
+    return r;
+}
+static bool se_read_ptr(void* base, size_t off, void** out) {
+    *out = nullptr;
+    SE_BEGIN{ *out = *(void**)((uintptr_t)base + off); }
+    SE_END{ *out = nullptr; return false; }
+    return *out != nullptr;
+}
+static bool se_read_int(void* base, size_t off, int* out) {
+    *out = 0;
+    SE_BEGIN{ *out = *(int*)((uintptr_t)base + off); }
+    SE_END{ *out = 0; return false; }
+    return true;
+}
+static bool se_read_bool(void* base, size_t off) {
+    unsigned char b = 0;
+    SE_BEGIN{ b = *(unsigned char*)((uintptr_t)base + off); }
+    SE_END{ b = 0; }
+    return b != 0;
+}
+static float se_read_float(void* base, size_t off) {
+    float r = 0.f;
+    SE_BEGIN{ r = *(float*)((uintptr_t)base + off); }
+    SE_END{ r = 0.f; }
+    return r;
+}
+static bool se_read_vec3(void* base, size_t off, Vec3* out) {
+    SE_BEGIN{ memcpy(out, (void*)((uintptr_t)base + off), sizeof(Vec3)); }
+    SE_END{ return false; }
+    return true;
+}
 
 namespace SDK {
-    Il2CppClass* kEntity, * kPlayerScript, * kPlayer, * kNPC;
-    Il2CppClass* kTransform, * kComponent, * kCamera, * kScreen, * kCursor, * kPhysics, * kAntiHack, * kWeapon;
 
-    size_t O_health, O_healthValue, O_team, O_rotation, O_camTf, O_camField, O_alive, O_gunView, O_gunStats, O_name;
-    size_t O_curAmmo, O_maxAmmo, O_reloading, O_spread, O_fireRate, O_range, O_speed, O_vel, O_gunStatsOnView;
-    bool   O_healthIsFloat = false;
-    bool   O_rotationIsQuat = false;
+    // ======================= estado =======================
+    std::unordered_map<std::string, Il2CppClass*> g_classes;
+    std::mutex g_classesMx;
 
-    FieldInfo* F_gmInstance = nullptr;
-    const MethodInfo* M_getPlayerScript = nullptr;
-    const MethodInfo* M_get_instance = nullptr;
-    const MethodInfo* M_get_transform = nullptr, * M_get_position = nullptr, * M_set_position = nullptr;
-    const MethodInfo* M_get_childCount = nullptr, * M_GetChild = nullptr, * M_get_name = nullptr;
-    const MethodInfo* M_get_rotation = nullptr, * M_set_rotation = nullptr;
-    const MethodInfo* M_get_main = nullptr, * M_get_current = nullptr, * M_get_allCameras = nullptr;
-    const MethodInfo* M_WorldToScreen = nullptr, * M_get_proj = nullptr, * M_get_view = nullptr;
-    const MethodInfo* M_get_pw = nullptr, * M_get_ph = nullptr, * M_get_fov = nullptr, * M_set_fov = nullptr;
-    const MethodInfo* M_GetComponentType = nullptr;
-    const MethodInfo* M_get_width = nullptr, * M_get_height = nullptr;
-    const MethodInfo* M_set_lockState = nullptr, * M_set_visible = nullptr;
-    const MethodInfo* M_FireBullet = nullptr, * M_ComputeRecoil = nullptr, * M_hurt = nullptr;
-    const MethodInfo* M_localHurt = nullptr, * M_get_team = nullptr, * M_LateUpdate = nullptr, * M_shoot = nullptr;
-    const MethodInfo* M_get_forward = nullptr, * M_set_forward = nullptr, * M_LookAt = nullptr;
-    const MethodInfo* M_Raycast3 = nullptr, * M_Raycast4 = nullptr, * M_Linecast = nullptr, * M_hitDist = nullptr;
-    const MethodInfo* M_getHealth = nullptr, * M_getMaxHealth = nullptr, * M_getDisplayName = nullptr;
-    const MethodInfo* M_FindObjects = nullptr, * M_FindObjectsAll = nullptr;
+    Il2CppObject* g_camera = nullptr;
+    Il2CppObject* g_local = nullptr;
+    Il2CppObject* g_localPlayer = nullptr;
+    Il2CppObject* g_aimTarget = nullptr;
 
-    int dbg_scanCount = 0, dbg_reject = 0, dbg_adds = 0, dbg_drawn = 0;
+    Target g_targets[MAX_TARGETS];
+    int    g_targetCount = 0;
+    int    g_localTeam = 0;
+    int    dbg_drawn = 0;
+    Vec3   g_localPos{ 0.f, 0.f, 0.f };
+    CRITICAL_SECTION g_targetCs;
+    uint64_t g_frameId = 0;
 
-    static Il2CppImage* g_imgs[512];
-    static int  g_imgCount = 0;
-    static float g_sw = 0.f, g_sh = 0.f;
+    bool  g_viewProjOk = false;
+    float g_viewProj[16] = { 0 };
+    static volatile LONG g_vpSeq = 0;
 
-    float ScreenW() { return g_sw; }
-    float ScreenH() { return g_sh; }
+    // ======================= offsets =======================
+    uint32_t O_health = 0, O_alive = 0, O_team = 0, O_isLocal = 0, O_name = 0, O_weapon = 0;
+    uint32_t O_vel = 0, O_speed = 0, O_rot = 0, O_rotation = 0, O_cam = 0, O_camTf = 0;
+    uint32_t O_mCamera = 0, O_humanMeshAnimator = 0, O_humanMeshReferences = 0;
+    uint32_t O_stats = 0, O_gunView = 0, O_gunStats = 0, O_gunStatsOnView = 0;
+    uint32_t O_curAmmo = 0, O_maxAmmo = 0, O_reloading = 0, O_spread = 0, O_fireRate = 0, O_dmg = 0;
+    bool     O_rotationIsQuat = true;
 
-    // ------------------------------------------------------------------ helpers
-    static Il2CppObject* SafeInvoke(const MethodInfo* m, void* o, void** args) {
-        if (!m) return nullptr;
-        __try { return IL2CPP::Invoke(m, o, args); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    // ======================= classes =======================
+    Il2CppClass* kEntity = nullptr;
+    Il2CppClass* kPlayerScript = nullptr;
+    Il2CppClass* kPlayer = nullptr;
+    Il2CppClass* kNPC = nullptr;
+    Il2CppClass* kTransform = nullptr;
+    Il2CppClass* kCamera = nullptr;
+    Il2CppClass* kGunStats = nullptr;
+    Il2CppClass* kVector3 = nullptr;
+    Il2CppClass* kQuaternion = nullptr;
+    Il2CppClass* kAntiHack = nullptr;
+
+    // ======================= metodos =======================
+    MethodInfo* M_shoot = nullptr;
+    MethodInfo* M_recoil = nullptr;
+    MethodInfo* M_fireBullet = nullptr;
+    MethodInfo* M_FireBullet = nullptr;
+    MethodInfo* M_getTransform = nullptr;
+    MethodInfo* M_w2s = nullptr;
+    MethodInfo* M_lookRot = nullptr;
+    MethodInfo* M_set_position = nullptr;
+    MethodInfo* M_set_forward = nullptr;
+    MethodInfo* M_get_fov = nullptr;
+    MethodInfo* M_set_fov = nullptr;
+
+    static MethodInfo* M_get_transform = nullptr;
+    static MethodInfo* M_get_name = nullptr;
+    static MethodInfo* M_get_childCount = nullptr;
+    static MethodInfo* M_GetChild = nullptr;
+    static MethodInfo* M_GetComponent = nullptr;
+    static MethodInfo* M_camW2C = nullptr;
+    static MethodInfo* M_camProj = nullptr;
+    static Il2CppClass* kInt32 = nullptr;
+
+    static std::mutex g_tfMx;
+    static std::unordered_map<Il2CppObject*, Il2CppObject*> g_tfCache;
+    static std::unordered_map<Il2CppClass*, MethodInfo*>     g_getPosMx;
+
+    static const int kMaxTargets = MAX_TARGETS;
+
+    // ======================= cache de classes =======================
+    static void RegisterClass(const char* ns, const char* nm, Il2CppClass* k) {
+        if (!k || !nm || !nm[0]) return;
+        std::string key;
+        if (ns && ns[0]) { key.reserve(strlen(ns) + strlen(nm) + 2); key = ns; key += "."; key += nm; }
+        else key = nm;
+        std::lock_guard<std::mutex> lk(g_classesMx);
+        g_classes.emplace(key, k);
     }
-    static void* SafeUnbox(Il2CppObject* o) {
-        if (!o) return nullptr;
-        __try { return IL2CPP::object_unbox(o); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-    }
-    static bool SafeReadBool(void* o, size_t off, bool fb) {
-        if (!o || !off) return fb;
-        __try { return *(bool*)((uintptr_t)o + off); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return fb; }
-    }
-    static int SafeReadInt(void* o, size_t off, int fb) {
-        if (!o || !off) return fb;
-        __try { return *(int*)((uintptr_t)o + off); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return fb; }
-    }
-    static float SafeReadFloat(void* o, size_t off, float fb) {
-        if (!o || !off) return fb;
-        __try { return *(float*)((uintptr_t)o + off); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return fb; }
-    }
-    static Il2CppObject* SafeStaticGet(FieldInfo* field) {
-        if (!field) return nullptr;
-        void* v = nullptr;
-        __try { IL2CPP::field_static_get_value(field, &v); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-        return (Il2CppObject*)v;
-    }
-    static Il2CppClass* SafeClassFromType(const Il2CppType* t) {
-        if (!t || !IL2CPP::class_from_type) return nullptr;
-        __try { return IL2CPP::class_from_type(t); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-    }
-    static const char* SafeTypeName(const Il2CppType* t) {
-        if (!t) return nullptr;
-        __try { return IL2CPP::type_get_name(t); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-    }
-    static const MethodInfo* PickRaycast4(Il2CppClass* k) {
-        if (!k) return nullptr;
-        void* it = nullptr;
-        while (const MethodInfo* m = IL2CPP::class_get_methods(k, &it)) {
-            const char* nm = IL2CPP::method_get_name(m);
-            if (!nm || lstrcmpA(nm, "Raycast") != 0) continue;
-            if (IL2CPP::method_get_param_count(m) != 4) continue;
-            const char* rtn = IL2CPP::method_get_return_type
-                ? SafeTypeName(IL2CPP::method_get_return_type(m)) : nullptr;
-            if (!rtn || !strstr(rtn, "Boolean")) continue;
-            const char* tn = SafeTypeName(IL2CPP::method_get_param(m, 2));
-            if (!tn || !strstr(tn, "RaycastHit")) continue;
-            const char* pd = SafeTypeName(IL2CPP::method_get_param(m, 3));
-            if (!pd || !strstr(pd, "Single")) continue;
-            return m;
+
+    static void CacheImage(Il2CppImage* img) {
+        size_t count = se_image_class_count(img);
+        for (size_t i = 0; i < count; ++i) {
+            Il2CppClass* k = se_image_get_class(img, i);
+            if (!k) continue;
+            RegisterClass(se_class_namespace(k), se_class_name(k), k);
         }
-        return nullptr;
     }
 
-    static void CollectImages() {
+    void BuildCache() {
+        { std::lock_guard<std::mutex> lk(g_classesMx); g_classes.clear(); }
+        Il2CppDomain* dom = se_domain_get();
+        if (!dom) { Log("[sdk] cache: domain nulo"); return; }
         size_t n = 0;
-        Il2CppAssembly** as = IL2CPP::domain_get_assemblies(IL2CPP::domain_get(), &n);
-        if (!as) return;
-        if (n > 512) n = 512;
-        for (size_t i = 0; i < n && g_imgCount < 512; i++) {
-            Il2CppImage* im = IL2CPP::assembly_get_image(as[i]);
-            if (im) g_imgs[g_imgCount++] = im;
-        }
-        Log("assemblies=%d imagens=%d", (int)n, g_imgCount);
+        const Il2CppAssembly** asms = se_domain_get_assemblies(dom, &n);
+        if (!asms || n == 0) { Log("[sdk] cache: nenhum assembly"); return; }
+        Log("[sdk] cache: %d assemblies", (int)n);
+        for (size_t a = 0; a < n; ++a) CacheImage(se_assembly_get_image(asms[a]));
+        std::lock_guard<std::mutex> lk(g_classesMx);
+        Log("[sdk] cache: %d classes", (int)g_classes.size());
     }
 
-    static Il2CppClass* Cls(const char* name, const char* ns = "") {
-        for (int i = 0; i < g_imgCount; i++) {
-            Il2CppClass* c = IL2CPP::class_from_name(g_imgs[i], ns, name);
-            if (c) return c;
+    Il2CppClass* FindClass(const char* name, const char* ns) {
+        if (!name || !*name) return nullptr;
+        std::lock_guard<std::mutex> lk(g_classesMx);
+        auto it = g_classes.find(name);
+        if (it != g_classes.end()) return it->second;
+        if (ns && *ns) {
+            std::string key = ns; key += "."; key += name;
+            it = g_classes.find(key);
+            if (it != g_classes.end()) return it->second;
+        }
+        const size_t ln = strlen(name);
+        for (it = g_classes.begin(); it != g_classes.end(); ++it) {
+            const std::string& k = it->first;
+            if (k.size() >= ln && k.compare(k.size() - ln, ln, name) == 0) return it->second;
         }
         return nullptr;
     }
-    Il2CppClass* FindClass(const char* name, const char* ns) { return Cls(name, ns ? ns : ""); }
 
-    static const MethodInfo* M(Il2CppClass* c, const char* name, int argc) {
-        return c ? IL2CPP::class_get_method_from_name(c, name, argc) : nullptr;
+    int ScreenW() { return Hooks::g_viewW; }
+    int ScreenH() { return Hooks::g_viewH; }
+
+    Il2CppObject* SafeReadObjPub(void* base, unsigned int off) {
+        void* r = nullptr;
+        if (!se_read_ptr(base, (size_t)off, &r)) return nullptr;
+        return (Il2CppObject*)r;
     }
-    static const MethodInfo* MAny(Il2CppClass* c, std::initializer_list<const char*> names, int argc) {
-        for (auto n : names) {
-            const MethodInfo* m = M(c, n, argc);
-            if (m) return m;
+
+    // ======================= transform / posicao =======================
+    static Il2CppObject* ResolveGetTransform(Il2CppObject* obj) {
+        if (!obj) return nullptr;
+        Il2CppClass* k = se_object_get_class(obj);
+        if (!k) return nullptr;
+        if (!M_get_transform) M_get_transform = se_class_get_method_from_name(k, "get_transform", 0);
+        if (!M_get_transform) return nullptr;
+        return se_runtime_invoke(M_get_transform, obj, nullptr);
+    }
+
+    Il2CppObject* GetTransform(void* obj) { return ResolveGetTransform((Il2CppObject*)obj); }
+
+    static Il2CppObject* CachedTransform(Il2CppObject* e) {
+        if (!e) return nullptr;
+        std::lock_guard<std::mutex> lk(g_tfMx);
+        auto it = g_tfCache.find(e);
+        if (it != g_tfCache.end()) return it->second;
+        Il2CppObject* tr = ResolveGetTransform(e);
+        g_tfCache[e] = tr;
+        return tr;
+    }
+
+    static void ClearTfCache() {
+        std::lock_guard<std::mutex> lk(g_tfMx);
+        g_tfCache.clear();
+    }
+
+    static bool IsTransformClass(Il2CppClass* k) {
+        if (!k) return false;
+        for (Il2CppClass* c = k; c; c = se_class_parent(c)) {
+            const char* n = se_class_name(c);
+            if (n && strcmp(n, "Transform") == 0) return true;
         }
-        return nullptr;
-    }
-    static FieldInfo* FieldOf(Il2CppClass* c, std::initializer_list<const char*> names) {
-        if (!c) return nullptr;
-        for (auto n : names) {
-            FieldInfo* f = IL2CPP::class_get_field_from_name(c, n);
-            if (f) return f;
-        }
-        return nullptr;
-    }
-    static size_t Off(Il2CppClass* c, const char* what, std::initializer_list<const char*> names) {
-        FieldInfo* f = FieldOf(c, names);
-        size_t o = f ? IL2CPP::field_get_offset(f) : 0;
-        Log("  campo %-14s = 0x%X %s", what, (unsigned)o, f ? "" : "(NAO ACHADO)");
-        return o;
-    }
-    static bool IsBlacklisted(Il2CppClass* k) {
-        const char* n = SafeClassName(k);
-        if (!n) return true;
-        static const char* bad[] = { "Vehicle", "Bullet", "Projectile", "Pickup", "Grenade",
-                                     "Decal", "Tracer", "Camera", "Audio", "UI", "Manager" };
-        for (auto b : bad) if (strstr(n, b)) return true;
         return false;
     }
 
-    const char* SafeClassName(Il2CppClass* k) {
-        if (!k || !IL2CPP::class_get_name) return "?";
-        __try { return IL2CPP::class_get_name(k); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return "?"; }
+    static MethodInfo* GetPositionMethod(Il2CppClass* k) {
+        if (!k) return nullptr;
+        std::lock_guard<std::mutex> lk(g_tfMx);
+        auto it = g_getPosMx.find(k);
+        if (it != g_getPosMx.end()) return it->second;
+        MethodInfo* m = se_class_get_method_from_name(k, "get_position", 0);
+        g_getPosMx[k] = m;
+        return m;
     }
-    void* SafeReadObjPub(void* o, size_t off) {
-        if (!o || !off) return nullptr;
-        void* v = nullptr;
-        __try { v = *(void**)((uintptr_t)o + off); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+
+    Vec3 GetPos(Il2CppObject* obj) {
+        Vec3 out{ 0.f, 0.f, 0.f };
+        if (!obj) return out;
+
+        Il2CppClass* k = se_object_get_class(obj);
+        if (!k) return out;
+
+        Il2CppObject* node = obj;
+        if (!IsTransformClass(k)) {
+            node = CachedTransform(obj);
+            if (!node) {
+                static bool logged = false;
+                if (!logged) { logged = true; Log("[sdk] GetPos: %s sem transform", se_class_name(k)); }
+                return out;
+            }
+            k = se_object_get_class(node);
+            if (!k) return out;
+        }
+
+        MethodInfo* m = GetPositionMethod(k);
+        if (!m) return out;
+
+        Il2CppObject* boxed = se_runtime_invoke(m, node, nullptr);
+        if (!boxed) return out;
+        void* p = se_object_unbox(boxed);
+        if (p) memcpy(&out, p, sizeof(Vec3));
+        return out;
+    }
+
+    Vec3 GetPos(void* o) { return GetPos((Il2CppObject*)o); }
+
+    void SetPos(Il2CppObject* obj, Vec3 v) {
+        if (!obj) return;
+        Il2CppObject* node = obj;
+        Il2CppClass* k = se_object_get_class(node);
+        if (!k) return;
+        if (!IsTransformClass(k)) {
+            node = CachedTransform(obj);
+            if (!node) return;
+            k = se_object_get_class(node);
+            if (!k) return;
+        }
+        MethodInfo* sp = se_class_get_method_from_name(k, "set_position", 1);
+        if (!sp) return;
+        if (!kVector3) kVector3 = FindClass("Vector3", "UnityEngine");
+        if (!kVector3) return;
+        Il2CppObject* bv = se_object_new(kVector3);
+        if (!bv) return;
+        void* bp = se_object_unbox(bv);
+        if (!bp) return;
+        memcpy(bp, &v, sizeof(Vec3));
+        void* args[1]; args[0] = bv;
+        se_runtime_invoke(sp, node, args);
+    }
+
+    void SetPos(void* o, Vec3 v) { SetPos((Il2CppObject*)o, v); }
+
+    Vec3 GetVelocity(Il2CppObject* o) {
+        Vec3 v{ 0.f, 0.f, 0.f };
+        if (!o || !O_vel) return v;
+        se_read_vec3(o, O_vel, &v);
         return v;
     }
 
-    // --------------------------------------------------------------------- init
-    bool Init() {
-        InitializeCriticalSection(&g_targetCs);
-        CollectImages();
-        if (!g_imgCount) { Log("sem assemblies"); return false; }
+    Vec3 GetBonePos(void* bone) { return GetPos((Il2CppObject*)bone); }
 
-        kEntity = Cls("Entity");
-        kNPC = Cls("NPC");
-        kPlayerScript = Cls("PlayerScript");
-        kPlayer = kPlayerScript;                 // alias legado
-        kTransform = Cls("Transform", "UnityEngine");
-        kComponent = Cls("Component", "UnityEngine");
-        kCamera = Cls("Camera", "UnityEngine");
-        kScreen = Cls("Screen", "UnityEngine");
-        kCursor = Cls("Cursor", "UnityEngine");
-        kPhysics = Cls("Physics", "UnityEngine");
-        kAntiHack = Cls("PlayerAntiHack");
-        Il2CppClass* kGM = Cls("GameManager");
-        Il2CppClass* kObj = Cls("Object", "UnityEngine");
-        Il2CppClass* kGun = Cls("FirstPersonGunView");
-        Il2CppClass* kStats = Cls("GunStats");
+    bool IsA(Il2CppObject* o, Il2CppClass* c) {
+        if (!o || !c) return false;
+        for (Il2CppClass* k = se_object_get_class(o); k; k = se_class_parent(k))
+            if (k == c) return true;
+        return false;
+    }
 
-        Log("classes: entity=%p npc=%p player=%p cam=%p gun=%p stats=%p gm=%p antihack=%p",
-            (void*)kEntity, (void*)kNPC, (void*)kPlayerScript, (void*)kCamera,
-            (void*)kGun, (void*)kStats, (void*)kGM, (void*)kAntiHack);
+    static float ReadHealth(Il2CppObject* e) {
+        if (!e || !O_health) return 0.f;
+        float hp = se_read_float(e, O_health);
+        if (hp != hp || hp < 0.f || hp > 100000.f) {
+            int hpi = 0; se_read_int(e, O_health, &hpi); hp = (float)hpi;
+        }
+        return hp;
+    }
 
-        Il2CppClass* kScan = kEntity ? kEntity : kPlayerScript;
-        if (!kScan) { Log("nem Entity nem PlayerScript encontrados"); return false; }
-        Log("classe de scan = %s", SafeClassName(kScan));
+    float GetHealth(Il2CppObject* o) { return ReadHealth(o); }
+    float GetHealth(void* o) { return ReadHealth((Il2CppObject*)o); }
 
-        Il2CppClass* kP = kPlayerScript ? kPlayerScript : kScan;
+    bool IsEnemy(Il2CppObject* o) {
+        if (!o || !O_team) return true;
+        int team = 0; se_read_int(o, O_team, &team);
+        return team != g_localTeam;
+    }
 
-        Log("[1] campos");
-        // nomes confirmados pelo dump
-        O_health = Off(kP, "health", { "_health", "health", "hp", "currentHealth", "m_health" });
-        O_team = Off(kP, "team", { "mpTeamNumber", "team", "Team", "teamId", "_team" });
-        O_rotation = Off(kP, "rotation", { "rotation", "Rotation", "viewRotation" });
-        O_camTf = Off(kP, "camTf", { "cameraTransform", "camTransform", "camTf" });
-        O_gunStats = Off(kP, "gunStats", { "mpCurrentGunStats", "gunStats", "stats" });
-        O_name = Off(kP, "name", { "username", "playerName", "name" });
-        O_alive = Off(kP, "alive", { "shouldBeAlive" });
-        if (!O_alive) O_alive = Off(kP, "alive", { "isAlive", "alive" });
-        O_speed = Off(kP, "speed", { "speed", "moveSpeed", "walkSpeed" });
-        O_vel = Off(kP, "velocity", { "lastMoveVelocity", "velocity", "vel" });   // @0x634
-        O_gunView = Off(kP, "gunView", { "gunView" });
-        if (!O_gunView) O_gunView = O_gunStats;     // PlayerScript nao tem gunView
+    void GetNameBuf(Il2CppObject* o, char* out, int n) {
+        if (!out || n <= 0) return;
+        out[0] = 0;
+        if (!o || !O_name) return;
+        void* sp = nullptr;
+        if (!se_read_ptr(o, (size_t)O_name, &sp) || !sp) return;
+        const char* s = se_string_chars((Il2CppString*)sp);
+        if (s) strncpy_s(out, (size_t)n, s, _TRUNCATE);
+    }
 
-        if (O_health) {
-            const char* hn = IL2CPP::FieldTypeName(kP, "_health");
-            if (!hn) hn = IL2CPP::FieldTypeName(kP, "health");
-            if (hn) {
-                O_healthIsFloat = (strstr(hn, "Single") != nullptr);
-                Log("  tipo do health = %s (float=%d)", hn, O_healthIsFloat ? 1 : 0);
+    std::string GetName(Il2CppObject* o) {
+        char buf[64]{};
+        GetNameBuf(o, buf, sizeof(buf));
+        return std::string(buf);
+    }
+
+    Il2CppObject* GetGunStats(Il2CppObject* p) { return (p && O_gunStats) ? SafeReadObjPub(p, O_gunStats) : nullptr; }
+    Il2CppObject* GetWeapon(Il2CppObject* p) { return (p && O_weapon) ? SafeReadObjPub(p, O_weapon) : nullptr; }
+
+    // ======================= bones =======================
+    Il2CppObject* FindBoneContains(Il2CppObject* root, const char* sub, int budget) {
+        if (!root || !sub) return nullptr;
+
+        Il2CppClass* rk = se_object_get_class(root);
+        if (!rk) return nullptr;
+        if (!IsTransformClass(rk)) {
+            root = CachedTransform(root);
+            if (!root) return nullptr;
+        }
+
+        static Il2CppObject* stk[2048];
+        int top = 0;
+        stk[top++] = root;
+
+        while (top > 0 && budget-- > 0) {
+            Il2CppObject* cur = stk[--top];
+            if (!cur) continue;
+            Il2CppClass* k = se_object_get_class(cur);
+            if (!k) continue;
+
+            if (!M_get_name) M_get_name = se_class_get_method_from_name(k, "get_name", 0);
+            if (M_get_name) {
+                Il2CppObject* s = se_runtime_invoke(M_get_name, cur, nullptr);
+                const char* nm = s ? se_string_chars((Il2CppString*)s) : nullptr;
+                if (nm && strstr(nm, sub)) return cur;
+            }
+
+            if (!M_get_childCount) M_get_childCount = se_class_get_method_from_name(k, "get_childCount", 0);
+            if (!M_GetChild) M_GetChild = se_class_get_method_from_name(k, "GetChild", 1);
+            if (!M_get_childCount || !M_GetChild) continue;
+
+            int cc = 0;
+            Il2CppObject* b = se_runtime_invoke(M_get_childCount, cur, nullptr);
+            if (b) { void* p = se_object_unbox(b); if (p) cc = *(int*)p; }
+
+            if (!kInt32) kInt32 = FindClass("Int32", "System");
+            if (!kInt32) continue;
+
+            for (int i = 0; i < cc && top < 2048; ++i) {
+                Il2CppObject* bi = se_object_new(kInt32);
+                if (!bi) break;
+                void* bp = se_object_unbox(bi);
+                if (!bp) break;
+                *(int*)bp = i;
+                void* args[1]; args[0] = bi;
+                Il2CppObject* c = se_runtime_invoke(M_GetChild, cur, args);
+                if (c) stk[top++] = c;
             }
         }
-        if (O_rotation) {
-            const char* rn = IL2CPP::FieldTypeName(kP, "rotation");
-            if (rn) {
-                O_rotationIsQuat = (strstr(rn, "Quaternion") != nullptr);
-                Log("  tipo do rotation = %s (quat=%d)", rn, O_rotationIsQuat ? 1 : 0);
+        return nullptr;
+    }
+
+    static Il2CppObject* FindBoneAny(Il2CppObject* root, const char** names, int count) {
+        if (!root) return nullptr;
+        for (int i = 0; i < count; ++i) {
+            Il2CppObject* b = FindBoneContains(root, names[i], 4096);
+            if (b) return b;
+        }
+        return nullptr;
+    }
+
+    void LogHierarchy(Il2CppObject* root, int maxNodes) {
+        if (!root) { Log("[hier] root nulo"); return; }
+        static Il2CppObject* stk[512];
+        int top = 0; stk[top++] = root;
+        int visited = 0;
+
+        while (top > 0 && visited < maxNodes) {
+            Il2CppObject* cur = stk[--top];
+            if (!cur) continue;
+            Il2CppClass* k = se_object_get_class(cur);
+            if (!k) continue;
+
+            MethodInfo* gn = se_class_get_method_from_name(k, "get_name", 0);
+            const char* nm = nullptr;
+            if (gn) {
+                Il2CppObject* s = se_runtime_invoke(gn, cur, nullptr);
+                if (s) nm = se_string_chars((Il2CppString*)s);
             }
-        }
+            Log("[hier] %s", nm ? nm : "?");
 
-        Log("[2] campos por tipo");
-        {
-            void* it = nullptr;
-            while (FieldInfo* f = IL2CPP::class_get_fields(kP, &it)) {
-                const Il2CppType* ft = IL2CPP::field_get_type(f);
-                const char* tn = ft ? IL2CPP::type_get_name(ft) : nullptr;
-                const char* fn = IL2CPP::field_get_name(f);
-                if (!tn || !fn) continue;
-                if (!O_camField && strstr(tn, "UnityEngine.Camera")) O_camField = IL2CPP::field_get_offset(f);
-                if (!O_gunStats && strstr(tn, "gunStats"))            O_gunStats = IL2CPP::field_get_offset(f);
-                if (!kWeapon && (strstr(fn, "GunStats") || strstr(tn, "gunStats")))
-                    kWeapon = SafeClassFromType(ft);
+            int cc = 0;
+            MethodInfo* gc = se_class_get_method_from_name(k, "get_childCount", 0);
+            if (gc) {
+                Il2CppObject* b = se_runtime_invoke(gc, cur, nullptr);
+                if (b) { void* p = se_object_unbox(b); if (p) cc = *(int*)p; }
             }
-            Log("  camField=%d gunStats=0x%X alive=0x%X weaponCls=%s",
-                O_camField ? 1 : 0, (unsigned)O_gunStats, (unsigned)O_alive, SafeClassName(kWeapon));
-        }
 
-        Log("[3] gun stats");
-        {
-            Il2CppClass* statsCls = nullptr;
-            FieldInfo* gsf = kP ? IL2CPP::class_get_field_from_name(kP, "mpCurrentGunStats") : nullptr;
-            if (!gsf && kP) gsf = IL2CPP::class_get_field_from_name(kP, "gunStats");
-            if (!gsf && kP) gsf = IL2CPP::class_get_field_from_name(kP, "stats");
-            if (gsf) {
-                const Il2CppType* st = IL2CPP::field_get_type(gsf);
-                statsCls = st ? SafeClassFromType(st) : nullptr;
+            MethodInfo* gch = se_class_get_method_from_name(k, "GetChild", 1);
+            if (!gch) continue;
+            if (!kInt32) kInt32 = FindClass("Int32", "System");
+            if (!kInt32) continue;
+
+            for (int i = 0; i < cc && top < 512; ++i) {
+                Il2CppObject* bi = se_object_new(kInt32);
+                if (!bi) break;
+                void* bp = se_object_unbox(bi);
+                if (!bp) break;
+                *(int*)bp = i;
+                void* a[1]; a[0] = bi;
+                Il2CppObject* c = se_runtime_invoke(gch, cur, a);
+                if (c) stk[top++] = c;
             }
-            if (!statsCls) statsCls = kWeapon;
-            if (statsCls) {
-                Log("  statsCls=%s", SafeClassName(statsCls));
-                IL2CPP::DumpFields(statsCls, "gunstats");
-                O_curAmmo = Off(statsCls, "curAmmo", { "currentAmmo", "ammo", "ammoInClip", "clip", "bullets", "currentBullets" });
-                O_maxAmmo = Off(statsCls, "maxAmmo", { "maxAmmo", "magSize", "clipSize", "maxBullets", "magazineSize" });
-                O_reloading = Off(statsCls, "reloading", { "isReloading", "reloading", "_isReloading" });
-                O_spread = Off(statsCls, "spread", { "spread", "spreadAmount", "baseSpread", "currentSpread" });
-                O_fireRate = Off(statsCls, "fireRate", { "fireRate", "fireDelay", "rateOfFire", "shotDelay" });
-                O_range = Off(statsCls, "range", { "range", "maxRange", "bulletRange" });
-            }
-            else {
-                Log("  statsCls NAO resolvido");
-            }
-            if (kGun) O_gunStatsOnView = IL2CPP::OffsetOf(kGun, "gunStats");
-            Log("  O_gunStatsOnView=0x%X", (unsigned)O_gunStatsOnView);
+            ++visited;
+        }
+    }
+
+    // ======================= camera / view =======================
+    Il2CppObject* CameraObj() {
+        if (!kCamera) kCamera = FindClass("Camera", "UnityEngine");
+        if (!kCamera) return nullptr;
+
+        // 1) camera propria do local player
+        if (g_localPlayer && O_mCamera) {
+            Il2CppObject* c = SafeReadObjPub(g_localPlayer, O_mCamera);
+            if (c) return c;
         }
 
-        Log("[4] gamemanager");
-        M_get_instance = MAny(kGM, { "get_instance", "get_Instance" }, 0);
-        M_getPlayerScript = MAny(kGM, { "get_playerScript", "get_localPlayer", "get_LocalPlayer" }, 0);
-        F_gmInstance = kGM ? FieldOf(kGM, { "instance", "Instance", "singleton", "_instance" }) : nullptr;
-        Log("  gm=%s inst=%s player=%s", F_gmInstance ? "OK" : "-",
-            M_get_instance ? "OK" : "-", M_getPlayerScript ? "OK" : "-");
-
-        Log("[5] transform");
-        M_get_transform = M(kComponent, "get_transform", 0);
-        if (!M_get_transform) M_get_transform = M(kTransform, "get_transform", 0);
-        M_get_position = M(kTransform, "get_position", 0);
-        M_set_position = M(kTransform, "set_position", 1);
-        M_get_childCount = M(kTransform, "get_childCount", 0);
-        M_GetChild = M(kTransform, "GetChild", 1);
-        M_get_rotation = M(kTransform, "get_rotation", 0);
-        M_set_rotation = M(kTransform, "set_rotation", 1);
-        M_get_forward = M(kTransform, "get_forward", 0);
-        M_set_forward = M(kTransform, "set_forward", 1);
-        M_LookAt = M(kTransform, "LookAt", 1);
-        Log("  transform get=%s pos=%s set=%s child=%s", M_get_transform ? "OK" : "-",
-            M_get_position ? "OK" : "-", M_set_position ? "OK" : "-", M_GetChild ? "OK" : "-");
-
-        Log("[6] camera / object");
-        M_get_name = kObj ? M(kObj, "get_name", 0) : nullptr;
-        M_GetComponentType = kComponent ? M(kComponent, "GetComponent", 1) : nullptr;
-        M_get_main = kCamera ? M(kCamera, "get_main", 0) : nullptr;
-        M_get_current = kCamera ? M(kCamera, "get_current", 0) : nullptr;
-        M_get_allCameras = kCamera ? M(kCamera, "get_allCameras", 0) : nullptr;
-        M_WorldToScreen = kCamera ? M(kCamera, "WorldToScreenPoint", 1) : nullptr;
-        M_get_proj = kCamera ? M(kCamera, "get_projectionMatrix", 0) : nullptr;
-        M_get_view = kCamera ? M(kCamera, "get_worldToCameraMatrix", 0) : nullptr;
-        M_get_pw = kCamera ? M(kCamera, "get_pixelWidth", 0) : nullptr;
-        M_get_ph = kCamera ? M(kCamera, "get_pixelHeight", 0) : nullptr;
-        M_get_fov = kCamera ? M(kCamera, "get_fieldOfView", 0) : nullptr;
-        M_set_fov = kCamera ? M(kCamera, "set_fieldOfView", 1) : nullptr;
-        M_get_width = kScreen ? M(kScreen, "get_width", 0) : nullptr;
-        M_get_height = kScreen ? M(kScreen, "get_height", 0) : nullptr;
-        M_set_lockState = kCursor ? M(kCursor, "set_lockState", 1) : nullptr;
-        M_set_visible = kCursor ? M(kCursor, "set_visible", 1) : nullptr;
-        Log("  w2s=%s fov=%s cursor=%s", M_WorldToScreen ? "OK" : "-",
-            M_get_fov ? "OK" : "-", M_set_lockState ? "OK" : "-");
-
-        Log("[7] player / combate");
-        M_FireBullet = M(kP, "FireBullet", 7);
-        M_shoot = M(kP, "SemiAutoShoot", 0);
-        if (!M_shoot) M_shoot = M(kP, "mpPlayShootSound", 0);
-        if (!M_shoot) M_shoot = M(kP, "FireBullet", 7);
-        M_ComputeRecoil = kGun ? M(kGun, "ComputeShotRecoil", 4) : nullptr;   // argc = 4
-        if (!M_ComputeRecoil && kGun) M_ComputeRecoil = M(kGun, "ComputeShotRecoil", 0);
-        M_hurt = M(kP, "hurt", 7);
-        M_localHurt = M(kP, "localHurt", 5);
-        if (!M_localHurt) M_localHurt = M(kP, "damagePlayer", 5);
-        M_get_team = MAny(kP, { "get_mpTeamNumber", "get_teamNumber", "get_team" }, 0);
-        M_LateUpdate = M(kP, "LateUpdate", 0);
-        M_getDisplayName = M(kScan, "GetRawDisplayName", 0);
-        M_FindObjects = kObj ? M(kObj, "FindObjectsOfType", 1) : nullptr;
-        M_FindObjectsAll = kObj ? M(kObj, "FindObjectsOfTypeAll", 1) : nullptr;
-        M_Raycast3 = kPhysics ? M(kPhysics, "Raycast", 3) : nullptr;
-        M_Raycast4 = PickRaycast4(kPhysics);
-        M_Linecast = kPhysics ? M(kPhysics, "Linecast", 2) : nullptr;
-        if (Il2CppClass* kHit = Cls("RaycastHit", "UnityEngine"))
-            M_hitDist = M(kHit, "get_distance", 0);
-
-        M_getHealth = MAny(kP, { "get_mpHealth", "get_health", "get_Health" }, 0);
-        M_getMaxHealth = MAny(kP, { "get_mpMaxHealth", "get_maxHealth", "get_MaxHealth" }, 0);
-
-        Log("  fire=%s shoot=%s recoil=%s hurt=%s localHurt=%s late=%s find=%s hp=%s team=%s",
-            M_FireBullet ? "OK" : "-", M_shoot ? "OK" : "-", M_ComputeRecoil ? "OK" : "-",
-            M_hurt ? "OK" : "-", M_localHurt ? "OK" : "-", M_LateUpdate ? "OK" : "-",
-            M_FindObjects ? "OK" : "-", M_getHealth ? "OK" : "-", M_get_team ? "OK" : "-");
-
-        if (M_get_width) {
-            Il2CppObject* rw = SafeInvoke(M_get_width, nullptr, nullptr);
-            int* vw = rw ? (int*)SafeUnbox(rw) : nullptr;
-            if (vw) g_sw = (float)*vw;
-        }
-        if (M_get_height) {
-            Il2CppObject* rh = SafeInvoke(M_get_height, nullptr, nullptr);
-            int* vh = rh ? (int*)SafeUnbox(rh) : nullptr;
-            if (vh) g_sh = (float)*vh;
-        }
-        Log("  tela = %.0fx%.0f", g_sw, g_sh);
-
-        // =====================================================================
-        // AUTO-DUMP
-        // =====================================================================
-        Log("==================== DUMP DE VERIFICACAO ====================");
-        Log("classe de scan = %s   (player = %s)", SafeClassName(kScan), SafeClassName(kP));
-
-        Log("--- campos de %s ---", SafeClassName(kScan));
-        IL2CPP::DumpFields(kScan, "scan");
-        if (kP != kScan) {
-            Log("--- campos de %s ---", SafeClassName(kP));
-            IL2CPP::DumpFields(kP, "player");
-        }
-
-        Log("--- metodos de dano em %s ---", SafeClassName(kScan));
-        IL2CPP::DumpMethodsLike(kScan, "Damage");
-        IL2CPP::DumpMethodsLike(kScan, "Hurt");
-        IL2CPP::DumpMethodsLike(kScan, "Kill");
-
-        Log("--- metodos de dano em %s ---", SafeClassName(kP));
-        IL2CPP::DumpMethodsLike(kP, "hurt");
-        IL2CPP::DumpMethodsLike(kP, "Hurt");
-        IL2CPP::DumpMethodsLike(kP, "localHurt");
-        IL2CPP::DumpMethodsLike(kP, "Damage");
-
-        Log("--- metodos de tiro em %s ---", SafeClassName(kP));
-        IL2CPP::DumpMethodsLike(kP, "Fire");
-        IL2CPP::DumpMethodsLike(kP, "Shoot");
-        IL2CPP::DumpMethodsLike(kP, "shot");
-        if (kGun) {
-            Log("--- metodos de tiro em %s ---", SafeClassName(kGun));
-            IL2CPP::DumpMethodsLike(kGun, "Shoot");
-            IL2CPP::DumpMethodsLike(kGun, "Fire");
-            IL2CPP::DumpMethodsLike(kGun, "Recoil");
-        }
-
-        Log("--- probe de campos em %s ---", SafeClassName(kP));
-        {
-            const char* subs[] = { "peed", "eloc", "ove", "jump", "Jump", "Fly", "Grounded",
-                                   "Walk", "Run", "Sprint", "Crouch", "Gun", "eapon" };
-            void* it = nullptr;
-            int shown = 0;
-            while (FieldInfo* f = IL2CPP::class_get_fields(kP, &it)) {
-                const char* fn = IL2CPP::field_get_name(f);
-                if (!fn) continue;
-                for (int s = 0; s < 13; s++) {
-                    if (strstr(fn, subs[s])) {
-                        const Il2CppType* ft = IL2CPP::field_get_type(f);
-                        const char* tn = (ft && IL2CPP::type_get_name) ? IL2CPP::type_get_name(ft) : "?";
-                        Log("    %-28s : %-34s @0x%X", fn, tn ? tn : "?", (unsigned)IL2CPP::field_get_offset(f));
-                        shown++;
-                        break;
+        // 2) cameraTransform.GetComponent<Camera>()
+        if (g_localPlayer && O_camTf) {
+            Il2CppObject* tf = SafeReadObjPub(g_localPlayer, O_camTf);
+            if (tf) {
+                Il2CppClass* tk = se_object_get_class(tf);
+                if (tk) {
+                    if (!M_GetComponent) M_GetComponent = se_class_get_method_from_name(tk, "GetComponent", 1);
+                    if (M_GetComponent) {
+                        Il2CppType* t = se_class_get_type(kCamera);
+                        if (t) {
+                            Il2CppObject* to = se_type_get_object(t);
+                            if (to) {
+                                void* a[1]; a[0] = to;
+                                Il2CppObject* c = se_runtime_invoke(M_GetComponent, tf, a);
+                                if (c) return c;
+                            }
+                        }
                     }
                 }
-                if (shown > 70) break;
             }
-            Log("  (probe: %d campos)", shown);
         }
 
-        Log("--- campos criticos em %s ---", SafeClassName(kP));
-        const char* probes[] = { "health", "_health", "mpHealth", "mpTeamNumber", "username",
-                                 "shouldBeAlive", "forcedAlive", "isAlive", "rotation",
-                                 "mpCurrentGunStats", "cameraTransform", "isMine", "entityId" };
-        for (int i = 0; i < 13; i++) {
-            const char* tn = IL2CPP::FieldTypeName(kP, probes[i]);
-            if (tn) Log("    %-20s : %-40s @0x%X", probes[i], tn, (unsigned)IL2CPP::OffsetOf(kP, probes[i]));
+        // 3) globais
+        MethodInfo* m = se_class_get_method_from_name(kCamera, "get_main", 0);
+        if (m) { Il2CppObject* c = se_runtime_invoke(m, nullptr, nullptr); if (c) return c; }
+
+        m = se_class_get_method_from_name(kCamera, "get_current", 0);
+        if (m) { Il2CppObject* c = se_runtime_invoke(m, nullptr, nullptr); if (c) return c; }
+
+        m = se_class_get_method_from_name(kCamera, "get_allCameras", 0);
+        if (m) {
+            Il2CppArray* arr = (Il2CppArray*)se_runtime_invoke(m, nullptr, nullptr);
+            if (arr && se_array_length(arr) > 0) return (Il2CppObject*)se_array_at(arr, 0);
+        }
+        return nullptr;
+    }
+
+    Il2CppObject* GetCamera() { return g_camera; }
+
+    static bool ReadMatrix(Il2CppObject* obj, MethodInfo* m, float out[16]) {
+        if (!obj || !m) return false;
+        Il2CppObject* boxed = se_runtime_invoke(m, obj, nullptr);
+        if (!boxed) return false;
+        void* p = se_object_unbox(boxed);
+        if (!p) return false;
+        return se_read_bytes(p, out, 16 * sizeof(float));
+    }
+
+    void UpdateView() {
+        g_camera = CameraObj();
+        if (!g_camera) { g_viewProjOk = false; return; }
+
+        Il2CppClass* ck = se_object_get_class(g_camera);
+        if (!ck) { g_viewProjOk = false; return; }
+        if (!M_camW2C)  M_camW2C = se_class_get_method_from_name(ck, "get_worldToCameraMatrix", 0);
+        if (!M_camProj) M_camProj = se_class_get_method_from_name(ck, "get_projectionMatrix", 0);
+
+        float V[16] = {}, P[16] = {};
+        if (!ReadMatrix(g_camera, M_camW2C, V) || !ReadMatrix(g_camera, M_camProj, P)) {
+            g_viewProjOk = false; return;
         }
 
-        Log("==================== FIM DO DUMP ====================");
-        Log("sdk init done");
+        float vp[16] = {};
+        for (int c = 0; c < 4; ++c)
+            for (int r = 0; r < 4; ++r) {
+                float s = 0.f;
+                for (int k = 0; k < 4; ++k) s += P[k * 4 + r] * V[c * 4 + k];
+                vp[c * 4 + r] = s;
+            }
+
+        InterlockedIncrement(&g_vpSeq);
+        memcpy(g_viewProj, vp, sizeof(vp));
+        g_viewProjOk = true;
+        InterlockedIncrement(&g_vpSeq);
+    }
+
+    bool WorldToScreen(Vec3 w, Vec2& out) {
+        if (!g_viewProjOk) return false;
+
+        float m[16];
+        for (;;) {
+            LONG s1 = g_vpSeq;
+            if (s1 & 1) { YieldProcessor(); continue; }
+            memcpy(m, g_viewProj, sizeof(m));
+            if (g_vpSeq == s1) break;
+        }
+
+        float x = m[0] * w.x + m[4] * w.y + m[8] * w.z + m[12];
+        float y = m[1] * w.x + m[5] * w.y + m[9] * w.z + m[13];
+        float ww = m[3] * w.x + m[7] * w.y + m[11] * w.z + m[15];
+        if (ww <= 0.0001f) return false;
+
+        float inv = 1.f / ww;
+        out.x = ((x * inv) * 0.5f + 0.5f) * (float)Hooks::g_viewW;
+        out.y = (1.f - ((y * inv) * 0.5f + 0.5f)) * (float)Hooks::g_viewH;
+        return out.x == out.x && out.y == out.y;
+    }
+
+    bool VisibleLine(Vec3 a, Vec3 b) {
+        Vec2 t;
+        return WorldToScreen(a, t) && WorldToScreen(b, t);
+    }
+
+    void LockTargets() { EnterCriticalSection(&g_targetCs); }
+    void UnlockTargets() { LeaveCriticalSection(&g_targetCs); }
+
+    void* MethodPtr(MethodInfo* m) {
+        if (!m) return nullptr;
+        void* p0 = nullptr; void* p8 = nullptr;
+        se_read_ptr(m, 0, &p0);
+        se_read_ptr(m, 8, &p8);
+        if (p0 && se_is_exec(p0)) return p0;
+        if (p8 && se_is_exec(p8)) return p8;
+        return nullptr;
+    }
+
+    void DumpFields(Il2CppClass* k, const char* tag) {
+        if (!k) { Log("[dump] classe %s nula", tag ? tag : "?"); return; }
+        Log("[dump] ---- fields de %s ----", tag ? tag : "?");
+        void* iter = nullptr;
+        for (;;) {
+            FieldInfo* f = se_class_get_fields(k, &iter);
+            if (!f) break;
+            const char* n = se_field_name(f);
+            if (n) Log("[dump]   %-34s @ 0x%04X", n, (unsigned)se_field_offset(f));
+        }
+        Log("[dump] ---- fim ----");
+    }
+
+    void DumpFields(const char* className) { DumpFields(FindClass(className), className); }
+
+    // ======================= local player =======================
+    static Il2CppObject* FindLocalPlayer() {
+        static const char* classes[] = { "PlayerScript", "Entity", "GameManager", "Game", "HUD" };
+        static const char* fields[] = { "localPlayer", "LocalPlayer", "localEntity", "myPlayer",
+                                        "myEntity", "local", "player" };
+        for (size_t c = 0; c < sizeof(classes) / sizeof(classes[0]); ++c) {
+            Il2CppClass* k = FindClass(classes[c]); if (!k) continue;
+            for (size_t f = 0; f < sizeof(fields) / sizeof(fields[0]); ++f) {
+                FieldInfo* fi = se_class_get_field_from_name(k, fields[f]); if (!fi) continue;
+                Il2CppObject* v = nullptr;
+                se_field_static_get_value(fi, &v);
+                if (v) { Log("[sdk] localPlayer = %s.%s", classes[c], fields[f]); return v; }
+            }
+            MethodInfo* m = se_class_get_method_from_name(k, "get_localPlayer", 0);
+            if (!m) m = se_class_get_method_from_name(k, "get_LocalPlayer", 0);
+            if (m) {
+                Il2CppObject* v = se_runtime_invoke(m, nullptr, nullptr);
+                if (v) { Log("[sdk] localPlayer = %s::get_localPlayer", classes[c]); return v; }
+            }
+        }
+        return nullptr;
+    }
+
+    Il2CppObject* GetLocalPlayer() {
+        if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
+        return g_localPlayer;
+    }
+
+    // ======================= alvos =======================
+    static void SyncAliases(Target& t) {
+        t.obj = t.player;
+        t.feet = t.pos;
+        t.hp = t.health;
+        t.isLocal = false;
+        t.enemy = (t.team != g_localTeam);
+        t.lastSeen = GetTickCount64();
+        if (t.headBone) t.lastBoneScan = GetTickCount64();
+    }
+
+    void RefreshTargets() {
+        if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
+        if (g_localPlayer && O_team) { int tm = 0; if (se_read_int(g_localPlayer, O_team, &tm)) g_localTeam = tm; }
+
+        if (!kEntity) kEntity = FindClass("Entity");
+        if (!kEntity) { Log("[sdk] classe Entity nao encontrada"); return; }
+
+        Il2CppClass* oc = FindClass("Object", "UnityEngine");
+        if (!oc) { Log("[sdk] UnityEngine.Object nao encontrada"); return; }
+        MethodInfo* fot = se_class_get_method_from_name(oc, "FindObjectsOfType", 1);
+        if (!fot) { Log("[sdk] FindObjectsOfType nao encontrado"); return; }
+        Il2CppType* t = se_class_get_type(kEntity);
+        if (!t) { Log("[sdk] class_get_type falhou"); return; }
+        Il2CppObject* typeObj = se_type_get_object(t);
+        if (!typeObj) { Log("[sdk] type_get_object falhou"); return; }
+
+        void* args[1]; args[0] = typeObj;
+        Il2CppArray* arr = (Il2CppArray*)se_runtime_invoke(fot, nullptr, args);
+        if (!arr) { Log("[sdk] FindObjectsOfType retornou nulo"); return; }
+
+        uint32_t n = se_array_length(arr);
+
+        static const char* kHeads[] = { "Head", "head", "HEAD", "Bip01 Head",
+                                        "mixamorig:Head", "neck", "Bone_Head" };
+        static const char* kFeet[] = { "Foot", "foot", "Foot_L", "Bip01 L Foot",
+                                        "mixamorig:LeftFoot", "toe", "Bone_Foot" };
+        static bool hierLogged = false;
+
+        EnterCriticalSection(&g_targetCs);
+        int c = 0;
+        for (uint32_t i = 0; i < n && c < kMaxTargets; ++i) {
+            Il2CppObject* e = (Il2CppObject*)se_array_at(arr, i);
+            if (!e) continue;
+
+            if (O_isLocal && se_read_bool(e, O_isLocal)) {
+                if (!g_localPlayer) { g_localPlayer = e; g_local = e; Log("[sdk] localPlayer via isLocalPlayer"); }
+                continue;
+            }
+            if (e == g_localPlayer || e == g_local) continue;
+
+            Target& tgt = g_targets[c];
+            memset(&tgt, 0, sizeof(Target));
+
+            tgt.player = e;
+            tgt.obj = e;
+            tgt.alive = O_alive ? se_read_bool(e, O_alive) : true;
+            tgt.team = 0;
+            if (O_team) se_read_int(e, O_team, &tgt.team);
+            tgt.pos = GetPos(e);
+            tgt.health = ReadHealth(e);
+            tgt.hp = tgt.health;
+            tgt.weapon = 0;
+            if (O_weapon) se_read_int(e, O_weapon, &tgt.weapon);
+            GetNameBuf(e, tgt.name, sizeof(tgt.name));
+
+            Il2CppClass* ek = se_object_get_class(e);
+            const char* en = ek ? se_class_name(ek) : nullptr;
+            tgt.npc = (en && strstr(en, "NPC") != nullptr);
+
+            // ---- raiz dos bones: transform do entity; senao o animator do mesh ----
+            Il2CppObject* boneRoot = CachedTransform(e);
+            if (O_humanMeshAnimator) {
+                Il2CppObject* anim = SafeReadObjPub(e, O_humanMeshAnimator);
+                if (anim) {
+                    Il2CppObject* at = ResolveGetTransform(anim);
+                    if (at) boneRoot = at;
+                }
+            }
+
+            if (!hierLogged && boneRoot) {
+                hierLogged = true;
+                Log("[hier] ---- arvore do alvo ----");
+                LogHierarchy(boneRoot, 60);
+                Log("[hier] ---- fim ----");
+            }
+
+            tgt.headBone = FindBoneAny(boneRoot, kHeads, 7);
+            tgt.footBone = FindBoneAny(boneRoot, kFeet, 7);
+
+            // fallback: altura humana fixa -> ESP funciona sem osso
+            if (tgt.headBone) tgt.head = GetPos(tgt.headBone);
+            else              tgt.head = Vec3{ tgt.pos.x, tgt.pos.y + 1.70f, tgt.pos.z };
+
+            tgt.feet = tgt.footBone ? GetPos(tgt.footBone) : tgt.pos;
+
+            tgt.onScreen = false;
+            SyncAliases(tgt);
+            ++c;
+        }
+        g_targetCount = c;
+        LeaveCriticalSection(&g_targetCs);
+
+        static int lastLog = -1;
+        if (g_targetCount != lastLog) {
+            lastLog = g_targetCount;
+            Log("[sdk] scan: objetos=%u alvos=%d local=%p", n, g_targetCount, g_localPlayer);
+        }
+    }
+
+    void UpdateTargets() {
+        static DWORD lastRefresh = 0;
+        DWORD now = GetTickCount();
+        if (now - lastRefresh > 500) { lastRefresh = now; ClearTfCache(); RefreshTargets(); }
+
+        if (!g_localPlayer) return;
+        g_localPos = GetPos(g_localPlayer);
+
+        EnterCriticalSection(&g_targetCs);
+        int onScr = 0;
+        for (int i = 0; i < g_targetCount; ++i) {
+            Target& t = g_targets[i];
+            if (!t.player) continue;
+
+            t.alive = O_alive ? se_read_bool(t.player, O_alive) : true;
+            t.health = ReadHealth(t.player);
+            t.pos = GetPos(t.player);
+
+            if (t.headBone) t.head = GetPos(t.headBone);
+            else            t.head = Vec3{ t.pos.x, t.pos.y + 1.70f, t.pos.z };
+
+            t.feet = t.footBone ? GetPos(t.footBone) : t.pos;
+
+            float dx = t.head.x - g_localPos.x, dy = t.head.y - g_localPos.y, dz = t.head.z - g_localPos.z;
+            t.dist = sqrtf(dx * dx + dy * dy + dz * dz);
+
+            bool okH = WorldToScreen(t.head, t.scrHead);
+            bool okF = WorldToScreen(t.feet, t.scrFeet);
+            float h = t.scrFeet.y - t.scrHead.y;
+            t.onScreen = okH && okF && (h > 1.f)
+                && t.scrFeet.y > -64.f
+                && t.scrHead.y < (float)ScreenH() + 64.f;
+            if (t.onScreen) ++onScr;
+
+            SyncAliases(t);
+        }
+
+        static int dbgCnt = 0;
+        if (++dbgCnt % 200 == 0 && g_targetCount > 0) {
+            Target& t0 = g_targets[0];
+            float m[16];
+            memcpy(m, g_viewProj, sizeof(m));
+            float ww = m[3] * t0.head.x + m[7] * t0.head.y + m[11] * t0.head.z + m[15];
+            Log("[sdk] w2s: mundo=(%.1f,%.1f,%.1f) tela=(%.0f,%.0f) h=%.0f ok=%d w=%.3f cam=%p",
+                t0.head.x, t0.head.y, t0.head.z, t0.scrHead.x, t0.scrHead.y,
+                (t0.scrFeet.y - t0.scrHead.y), (int)t0.onScreen, ww, g_camera);
+        }
+        LeaveCriticalSection(&g_targetCs);
+
+        static int lastOnScr = -1;
+        if (onScr != lastOnScr) {
+            lastOnScr = onScr;
+            Log("[sdk] onScreen: %d de %d (viewOk=%d)", onScr, g_targetCount, (int)g_viewProjOk);
+        }
+    }
+
+    std::vector<Target> Snapshot() {
+        std::vector<Target> out;
+        EnterCriticalSection(&g_targetCs);
+        out.assign(g_targets, g_targets + g_targetCount);
+        LeaveCriticalSection(&g_targetCs);
+        return out;
+    }
+
+    static Il2CppObject* BoxVec3(Vec3 v) {
+        if (!kVector3) kVector3 = FindClass("Vector3", "UnityEngine");
+        if (!kVector3) return nullptr;
+        Il2CppObject* o = se_object_new(kVector3);
+        if (!o) return nullptr;
+        void* p = se_object_unbox(o);
+        if (p) memcpy(p, &v, sizeof(Vec3));
+        return o;
+    }
+
+    // ======================= aim =======================
+    bool AimLock(Il2CppObject* target, Quat& savedOriginal) {
+        if (!target || !g_localPlayer || !O_rotation || !O_rotationIsQuat) return false;
+
+        memcpy(&savedOriginal, (void*)((uintptr_t)g_localPlayer + O_rotation), sizeof(Quat));
+
+        Vec3 me = GetPos(g_localPlayer);
+        Il2CppObject* hb = FindBoneContains(target, "Head", 2048);
+        Vec3 tp = hb ? GetPos(hb) : GetPos(target);
+        Vec3 dir{ tp.x - me.x, tp.y - me.y, tp.z - me.z };
+
+        if (!kQuaternion) kQuaternion = FindClass("Quaternion", "UnityEngine");
+        if (!kVector3)    kVector3 = FindClass("Vector3", "UnityEngine");
+        if (!kQuaternion || !kVector3) return false;
+
+        if (!M_lookRot) M_lookRot = se_class_get_method_from_name(kQuaternion, "LookRotation", 1);
+        if (!M_lookRot) return false;
+
+        Il2CppObject* bv = BoxVec3(dir);
+        if (!bv) return false;
+        void* args[1]; args[0] = bv;
+        Il2CppObject* boxed = se_runtime_invoke(M_lookRot, nullptr, args);
+        if (!boxed) return false;
+        void* p = se_object_unbox(boxed);
+        if (!p) return false;
+
+        Quat q;
+        memcpy(&q, p, sizeof(Quat));
+        SafeWrite((uintptr_t)g_localPlayer + O_rotation, &q, sizeof(q));
         return true;
     }
 
-    // ------------------------------------------------------------------ getters
-    bool IsA(Il2CppObject* o, Il2CppClass* c) {
-        if (!o || !c || !o->klass) return false;
-        if (o->klass == c) return true;
-        if (IL2CPP::class_get_parent) {
-            Il2CppClass* k = o->klass;
-            for (int i = 0; k && i < 32; i++) {
-                Il2CppClass* par = IL2CPP::class_get_parent(k);
-                if (!par || par == k) break;
-                if (par == c) return true;
-                k = par;
-            }
-        }
-        const char* cn = SafeClassName(o->klass);
-        const char* tn = SafeClassName(c);
-        return cn && tn && strcmp(cn, tn) == 0;
+    void RestoreAim(Il2CppObject* p, const Quat& q) {
+        if (!p || !O_rotation || !O_rotationIsQuat) return;
+        SafeWrite((uintptr_t)p + O_rotation, (void*)&q, sizeof(q));
     }
 
-    Il2CppObject* GameManager() {
-        if (F_gmInstance) { if (Il2CppObject* gm = SafeStaticGet(F_gmInstance)) return gm; }
-        if (M_get_instance) return SafeInvoke(M_get_instance, nullptr, nullptr);
-        return nullptr;
-    }
-    Il2CppObject* LocalPlayer() {
-        Il2CppObject* gm = GameManager();
-        if (!gm || !M_getPlayerScript) return nullptr;
-        return SafeInvoke(M_getPlayerScript, (void*)gm, nullptr);
-    }
-    Il2CppObject* MainCamera() { return M_get_main ? SafeInvoke(M_get_main, nullptr, nullptr) : nullptr; }
-    Il2CppObject* GetTransform(Il2CppObject* o) { return (o && M_get_transform) ? SafeInvoke(M_get_transform, (void*)o, nullptr) : nullptr; }
+    void FireBulletAt(Vec3 pos) {
+        if (!M_FireBullet || !g_localPlayer) return;
+        Vec3 me = GetPos(g_localPlayer);
+        Vec3 dir{ pos.x - me.x, pos.y - me.y, pos.z - me.z };
+        float L = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+        if (L > 0.0001f) { dir.x /= L; dir.y /= L; dir.z /= L; }
 
-    Il2CppObject* GetComponentType(Il2CppObject* o, Il2CppClass* klass) {
-        if (!o || !klass || !M_GetComponentType || !IL2CPP::class_get_type || !IL2CPP::type_get_object) return nullptr;
-        const Il2CppType* tp = IL2CPP::class_get_type(klass);
-        if (!tp) return nullptr;
-        Il2CppObject* to = (Il2CppObject*)IL2CPP::type_get_object(tp);
-        if (!to) return nullptr;
-        void* a[1] = { (void*)to };
-        return SafeInvoke(M_GetComponentType, (void*)o, a);
+        uint32_t np = se_method_param_count(M_FireBullet);
+        if (np == 0) np = 1;
+        std::vector<Il2CppObject*> keep(np, nullptr);
+        std::vector<void*> args(np, nullptr);
+        for (uint32_t i = 0; i < np; ++i) { keep[i] = BoxVec3(dir); args[i] = keep[i]; }
+        se_runtime_invoke(M_FireBullet, g_localPlayer, args.data());
     }
 
-    Vec3 GetPos(Il2CppObject* t) {
-        if (!t || !M_get_position) return Vec3();
-        Il2CppObject* r = SafeInvoke(M_get_position, (void*)t, nullptr);
-        Vec3* v = r ? (Vec3*)SafeUnbox(r) : nullptr;
-        return v ? *v : Vec3();
-    }
-    Vec3 GetForward(Il2CppObject* t) {
-        if (!t || !M_get_forward) return Vec3(0, 0, 1);
-        Il2CppObject* r = SafeInvoke(M_get_forward, (void*)t, nullptr);
-        Vec3* v = r ? (Vec3*)SafeUnbox(r) : nullptr;
-        return v ? *v : Vec3(0, 0, 1);
-    }
-    Quat GetRot(Il2CppObject* t) {
-        Quat q{ 0, 0, 0, 1 };
-        if (!t || !M_get_rotation) return q;
-        Il2CppObject* r = SafeInvoke(M_get_rotation, (void*)t, nullptr);
-        Quat* v = r ? (Quat*)SafeUnbox(r) : nullptr;
-        return v ? *v : q;
-    }
-    bool SetRot(Il2CppObject* t, const Quat& q) {
-        if (!t || !M_set_rotation) return false;
-        Quat v = q;
-        void* a[1] = { &v };
-        return SafeInvoke(M_set_rotation, (void*)t, a) != nullptr;
+    // ======================= init / shutdown =======================
+    void Shutdown(void) {
+        g_phase = "sdk.shutdown";
+        Log("[sdk] Shutdown");
+        g_localPlayer = nullptr;
+        g_local = nullptr;
+        g_camera = nullptr;
+        g_aimTarget = nullptr;
+        g_targetCount = 0;
+        ClearTfCache();
     }
 
-    float InvokeFloat(const MethodInfo* m, Il2CppObject* o, float fb) {
-        if (!m || !o) return fb;
-        Il2CppObject* r = SafeInvoke(m, (void*)o, nullptr);
-        void* v = r ? SafeUnbox(r) : nullptr;
-        if (!v) return fb;
-        __try {
-            int32_t asInt = *(int32_t*)v;
-            float   asFlt = *(float*)v;
-            bool intOk = (asInt >= 0 && asInt <= 100000);
-            bool fltOk = (asFlt >= 0.f && asFlt <= 100000.f);
-            if (intOk && !fltOk) return (float)asInt;
-            if (fltOk && !intOk) return asFlt;
-            if (intOk && fltOk)  return (asInt <= 1000) ? (float)asInt : asFlt;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        return fb;
-    }
-
-    float GetHealthPct(Il2CppObject* p) {
-        if (!p) return 100.f;
-
-        float hp = -1.f, mx = 100.f;
-        if (M_getHealth)    hp = InvokeFloat(M_getHealth, p, -1.f);
-        if (M_getMaxHealth) mx = InvokeFloat(M_getMaxHealth, p, 100.f);
-        if (mx <= 1.f || mx > 100000.f) mx = 100.f;
-
-        if (hp < 0.f && O_health) {
-            if (O_healthIsFloat) hp = SafeReadFloat(p, O_health, -1.f);
-            else {
-                int v = 0;
-                if (O_healthValue) {
-                    void* raw = SafeReadObjPub(p, O_health);
-                    if (raw) v = SafeReadInt(raw, O_healthValue, 0);
-                }
-                if (v <= 0 || v > 100000) v = SafeReadInt(p, O_health, -1);
-                hp = (float)v;
-            }
-        }
-        if (hp < 0.f || hp > 100000.f) hp = 100.f;
-
-        float pct = hp * 100.f / mx;
-        if (pct < 0.f) pct = 0.f;
-        if (pct > 100.f) pct = 100.f;
-        return pct;
-    }
-
-    int GetHealth(Il2CppObject* p) { return (int)(GetHealthPct(p) + 0.5f); }
-
-    bool ReadAliveField(Il2CppObject* p, bool fb) {
-        if (!p || !O_alive) return fb;
-        return SafeReadBool(p, O_alive, fb);
-    }
-    bool IsAlive(Il2CppObject* p) {
-        if (!p) return false;
-        if (!ReadAliveField(p, true)) return false;
-        return GetHealthPct(p) > 0.5f;
-    }
-
-    int GetTeam(Il2CppObject* p) {
-        if (!p) return -1;
-        if (M_get_team) {
-            Il2CppObject* r = SafeInvoke(M_get_team, (void*)p, nullptr);
-            int* v = r ? (int*)SafeUnbox(r) : nullptr;
-            if (v) return *v;
-        }
-        return O_team ? SafeReadInt(p, O_team, -1) : -1;
-    }
-
-    // SEH-safe: sem std::string local
-    void GetNameBuf(Il2CppObject* p, char* out, int outSize) {
-        if (outSize < 2) return;
-        out[0] = 0;
-        if (!p) return;
-
-        if (M_getDisplayName) {
-            if (Il2CppObject* r = SafeInvoke(M_getDisplayName, (void*)p, nullptr)) {
-                IL2CPP::StrToUtf8(r, out, outSize);
-                if (out[0]) return;
-            }
-        }
-        if (M_get_name) {
-            if (Il2CppObject* r = SafeInvoke(M_get_name, (void*)p, nullptr)) {
-                IL2CPP::StrToUtf8(r, out, outSize);
-                if (out[0]) return;
-            }
-        }
-        if (O_name) {
-            if (void* s = SafeReadObjPub(p, O_name))
-                IL2CPP::StrToUtf8((Il2CppObject*)s, out, outSize);
-        }
-    }
-
-    std::string GetName(Il2CppObject* p) {
-        char buf[256];
-        GetNameBuf(p, buf, sizeof(buf));
-        return buf[0] ? std::string(buf) : std::string("?");
-    }
-
-    Il2CppObject* FindBoneExato(Il2CppObject* t, const char* nome, int depth) {
-        if (!t || depth > 8 || !M_GetChild || !M_get_childCount || !M_get_name) return nullptr;
-
-        Il2CppObject* nr = SafeInvoke(M_get_name, (void*)t, nullptr);
-        if (nr) {
-            std::string n = IL2CPP::ToStr((Il2CppString*)nr);
-            if (n == nome) return t;
-        }
-
-        Il2CppObject* cco = SafeInvoke(M_get_childCount, (void*)t, nullptr);
-        int* ccv = cco ? (int*)SafeUnbox(cco) : nullptr;
-        int cc = ccv ? *ccv : 0;
-        if (cc > 200) cc = 200;
-        for (int i = 0; i < cc; i++) {
-            void* a[1] = { (void*)&i };
-            Il2CppObject* c = SafeInvoke(M_GetChild, (void*)t, a);
-            if (Il2CppObject* r = FindBoneExato(c, nome, depth + 1)) return r;
-        }
-        return nullptr;
-    }
-
-    Il2CppObject* CamTfRaw() {
-        Il2CppObject* lp = g_localPlayer;
-        if (!lp || !O_camTf) return nullptr;
-        return (Il2CppObject*)SafeReadObjPub(lp, O_camTf);
-    }
-
-    Il2CppObject* CameraObj() {
-        Il2CppObject* lp = g_localPlayer;
-        if (lp) {
-            if (O_camField) { if (Il2CppObject* c = (Il2CppObject*)SafeReadObjPub(lp, O_camField)) return c; }
-            if (Il2CppObject* tf = CamTfRaw())
-                if (kCamera) if (Il2CppObject* c = GetComponentType(tf, kCamera)) return c;
-        }
-        if (Il2CppObject* c = MainCamera()) return c;
-        if (M_get_allCameras) {
-            Il2CppObject* arr = SafeInvoke(M_get_allCameras, nullptr, nullptr);
-            if (arr) {
-                int cnt = (int)ArrayLen(arr);
-                Il2CppObject** d = (Il2CppObject**)ArrayData(arr);
-                Il2CppObject* best = nullptr; float bd = 1e9f;
-                for (int i = 0; i < cnt; i++) {
-                    Il2CppObject* cc = d[i];
-                    if (!cc) continue;
-                    Il2CppObject* t = GetTransform(cc);
-                    if (!t) continue;
-                    float dd = GetPos(t).dist(g_localPos);
-                    if (dd < bd) { bd = dd; best = cc; }
-                }
-                if (best) return best;
-            }
-        }
-        return M_get_current ? SafeInvoke(M_get_current, nullptr, nullptr) : nullptr;
-    }
-
-    Vec3 LocalPos() {
-        Il2CppObject* lp = g_localPlayer;
-        if (!lp) return Vec3();
-        return GetPos(GetTransform(lp));
-    }
-
-    bool WorldToScreen(const Vec3& w, Vec2& out) {
-        if (!g_camera || !M_WorldToScreen) return false;
-        Vec3 p = w;
-        void* a[1] = { (void*)&p };
-        Il2CppObject* r = SafeInvoke(M_WorldToScreen, g_camera, a);
-        Vec3* v = r ? (Vec3*)SafeUnbox(r) : nullptr;
-        if (!v) return false;
-        out.x = v->x; out.y = v->y;
-        return v->z > 0.01f;
-    }
-
-    bool VisibleLine(const Vec3& from, const Vec3& to) {
-        if (!M_Linecast) return true;
-        Vec3 dir = to - from;
-        float d = dir.len();
-        if (d < 4.0f) return true;
-        Vec3 nrm(dir.x / d, dir.y / d, dir.z / d);
-        const float offStart = 1.2f, offEnd = 1.5f;
-        if (offStart + offEnd >= d - 0.5f) return true;
-        Vec3 start(from.x + nrm.x * offStart, from.y + nrm.y * offStart, from.z + nrm.z * offStart);
-        Vec3 end(to.x - nrm.x * offEnd, to.y - nrm.y * offEnd, to.z - nrm.z * offEnd);
-        void* a[2] = { (void*)&start, (void*)&end };
-        Il2CppObject* r = SafeInvoke(M_Linecast, nullptr, a);
-        bool* any = r ? (bool*)SafeUnbox(r) : nullptr;
-        return any ? !(*any) : true;
-    }
-
-    Il2CppObject* LocalGun() {
-        Il2CppObject* p = g_localPlayer;
-        return (p && O_gunView) ? (Il2CppObject*)SafeReadObjPub(p, O_gunView) : nullptr;
-    }
-} // namespace SDK
-
-// ============================================================================
-// AddTarget — MAIN THREAD
-// ============================================================================
-static void FillName(std::string& dst, Il2CppObject* p) {
-    char buf[256];
-    SDK::GetNameBuf(p, buf, sizeof(buf));
-    if (buf[0] && strcmp(buf, "?")) dst = buf;
-}
-
-void AddTarget(Il2CppObject* p, bool trust) {
-    if (!p || !p->klass) return;
-
-    Il2CppClass* kRef = SDK::kEntity ? SDK::kEntity : SDK::kPlayerScript;
-    if (!trust && kRef && !SDK::IsA(p, kRef)) { SDK::dbg_reject++; return; }
-    if (SDK::IsBlacklisted(p->klass)) { SDK::dbg_reject++; return; }
-
-    volatile int step = 0;
-    EnterCriticalSection(&g_targetCs);
-    __try {
-        step = 1;
-        int slot = -1;
-        for (int i = 0; i < g_targetCount; i++) if (g_targets[i].player == p) { slot = i; break; }
-        if (slot < 0 && g_targetCount < 64) slot = g_targetCount++;
-
-        if (slot >= 0) {
-            Target& t = g_targets[slot];
-
-            step = 2;
-            if (t.klass != (void*)p->klass || t.headBone == nullptr || t.footBone == nullptr) {
-                t.klass = (void*)p->klass;
-                t.headBone = nullptr; t.footBone = nullptr;
-                Il2CppObject* tf = SDK::GetTransform(p);
-                if (tf) {
-                    t.headBone = SDK::FindBoneExato(tf, "Head", 0);
-                    if (!t.headBone) t.headBone = SDK::FindBoneExato(tf, "head", 0);
-                    if (!t.headBone) t.headBone = SDK::FindBoneExato(tf, "neck", 0);
-                    t.footBone = SDK::FindBoneExato(tf, "Foot", 0);
-                    if (!t.footBone) t.footBone = SDK::FindBoneExato(tf, "foot", 0);
-                    if (!t.footBone) t.footBone = SDK::FindBoneExato(tf, "Ankle", 0);
-                    if (!t.footBone) t.footBone = SDK::FindBoneExato(tf, "Toe", 0);
-                }
-            }
-            t.player = p;
-
-            step = 3;
-            t.hpMax = 100.f;
-            t.hp = SDK::GetHealthPct(p);
-            t.health = (int)(t.hp + 0.5f);
-            t.alive = (t.hp > 0.5f);
-
-            step = 4;
-            Il2CppObject* tf = SDK::GetTransform(p);
-            if (tf) {
-                step = 5;
-                Vec3 base = SDK::GetPos(tf);
-                float H = C.espBodyH; if (H < 0.5f || H > 3.f) H = 1.70f;
-
-                Vec3 head, feet;
-                if (t.headBone && t.footBone) { head = SDK::GetPos(t.headBone); feet = SDK::GetPos(t.footBone); }
-                else if (t.headBone) { head = SDK::GetPos(t.headBone); feet = head - Vec3(0.f, H, 0.f); }
-                else if (t.footBone) { feet = SDK::GetPos(t.footBone); head = feet + Vec3(0.f, H, 0.f); }
-                else { head = base; feet = base - Vec3(0.f, H, 0.f); }
-
-                float wh = head.dist(feet);
-                if (wh < 0.6f || wh > 3.2f) feet = head - Vec3(0.f, H, 0.f);
-
-                t.head = head; t.feet = feet;
-
-                // ---- projeta AQUI (main thread) e cacheia pro render thread ----
-                {
-                    Vec2 sp, sf;
-                    if (SDK::WorldToScreen(head, sp) && SDK::WorldToScreen(feet, sf)) {
-                        t.scrHead = sp;
-                        t.scrFeet = sf;
-                        t.onScreen = true;
-                    }
-                    else {
-                        t.onScreen = false;
-                    }
-                }
-
-                step = 6;
-                t.team = SDK::GetTeam(p);
-                step = 7;
-                t.dist = g_localPos.dist(t.feet);
-                step = 8;
-                if (t.name.empty() || t.name == "?") FillName(t.name, p);
-
-                if (C.espWeapon && t.weapon.empty() && SDK::O_gunView) {
-                    if (Il2CppObject* gun = (Il2CppObject*)SDK::SafeReadObjPub(p, SDK::O_gunView)) {
-                        char wbuf[128];
-                        SDK::GetNameBuf(gun, wbuf, sizeof(wbuf));
-                        if (wbuf[0] && strcmp(wbuf, "?")) t.weapon = wbuf;
-                    }
-                }
-            }
-            step = 9;
-            t.seen = GetTickCount64();
-            SDK::dbg_adds++;
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        static ULONGLONG l = 0;
-        if (GetTickCount64() - l > 2000) {
-            l = GetTickCount64();
-            Log("!!! EXCECAO em AddTarget passo %d (p=%p)", (int)step, (void*)p);
-        }
-    }
-    LeaveCriticalSection(&g_targetCs);
-}
-
-void PruneTargets() {
-    uint64_t now = GetTickCount64();
-    EnterCriticalSection(&g_targetCs);
-    int w = 0;
-    for (int i = 0; i < g_targetCount; i++) {
-        if (now - g_targets[i].seen > 500) continue;
-        if (w != i) g_targets[w] = g_targets[i];
-        w++;
-    }
-    g_targetCount = w;
-    LeaveCriticalSection(&g_targetCs);
-}
-
-// ============================================================================
-// ScanAllTargets
-// ============================================================================
-void ScanAllTargets() {
-    if (!SDK::M_FindObjects || !IL2CPP::class_get_type || !IL2CPP::type_get_object) return;
-
-    auto scanClass = [](Il2CppClass* k) -> int {
+    static unsigned int FieldOff(Il2CppClass* k, const char* n) {
         if (!k) return 0;
-        const Il2CppType* tp = IL2CPP::class_get_type(k);
-        if (!tp) return 0;
-        Il2CppObject* to = (Il2CppObject*)IL2CPP::type_get_object(tp);
-        if (!to) return 0;
-        void* a[1] = { (void*)to };
-        Il2CppObject* arr = IL2CPP::Invoke(SDK::M_FindObjects, nullptr, a);
-        if (!arr) return 0;
-        int n = (int)ArrayLen(arr);
-        void** d = ArrayData(arr);
-        int added = 0;
-        for (int i = 0; i < n && i < 512; i++) {
-            Il2CppObject* o = (Il2CppObject*)d[i];
-            if (!o || o == g_localPlayer) continue;
-            if (!SDK::IsA(o, k)) continue;
-            AddTarget(o, true);
-            added++;
-        }
-        return added;
-        };
-
-    // Entity cobre PlayerScript e NPC -> sem scan duplicado
-    int total = 0;
-    if (SDK::kEntity)            total += scanClass(SDK::kEntity);
-    else if (SDK::kPlayerScript) total += scanClass(SDK::kPlayerScript);
-
-    if (g_localPlayer) AddTarget(g_localPlayer, true);
-
-    static int lastLogged = -1;
-    if (total != lastLogged) {
-        lastLogged = total;
-        Log("scan: %d objetos (alvos=%d)", total, g_targetCount);
+        FieldInfo* f = se_class_get_field_from_name(k, n);
+        return f ? (unsigned int)se_field_offset(f) : 0;
     }
-    SDK::dbg_scanCount = total;
-}
+
+    static void ResolveOffsets() {
+        if (kEntity) {
+            O_rotation = FieldOff(kEntity, "rotation");
+            O_camTf = FieldOff(kEntity, "cameraTransform");
+            O_vel = FieldOff(kEntity, "velocity");
+            O_name = FieldOff(kEntity, "username");
+            O_isLocal = FieldOff(kEntity, "isLocalPlayer");
+            if (!O_isLocal) O_isLocal = FieldOff(kEntity, "isMine");
+            if (!O_isLocal) O_isLocal = FieldOff(kEntity, "isOwner");
+        }
+        if (kPlayerScript) {
+            O_gunStats = FieldOff(kPlayerScript, "mpCurrentGunStats");
+            O_team = FieldOff(kPlayerScript, "mpTeamNumber");
+            O_weapon = FieldOff(kPlayerScript, "weapon");
+            O_speed = FieldOff(kPlayerScript, "lastMoveVelocity");
+            O_mCamera = FieldOff(kPlayerScript, "mCamera");
+            O_humanMeshAnimator = FieldOff(kPlayerScript, "humanMeshAnimator");
+            O_humanMeshReferences = FieldOff(kPlayerScript, "humanMeshReferences");
+            if (!O_isLocal)  O_isLocal = FieldOff(kPlayerScript, "isLocalPlayer");
+            if (!O_name)     O_name = FieldOff(kPlayerScript, "username");
+            if (!O_rotation) O_rotation = FieldOff(kPlayerScript, "rotation");
+        }
+
+        if (!O_rotation) O_rotation = 0x9B8;
+        if (!O_camTf)    O_camTf = 0x828;
+        if (!O_alive)    O_alive = 0x63C;
+        if (!O_health)   O_health = 0x108;
+        if (!O_gunStats) O_gunStats = 0x570;
+        if (!O_team)     O_team = 0x6D0;
+        if (!O_name)     O_name = 0xA68;
+        if (!O_weapon)   O_weapon = 0x1A8;
+        if (!O_mCamera)  O_mCamera = 0xAC8;
+        if (!O_humanMeshAnimator) O_humanMeshAnimator = 0xBC0;
+
+        O_rot = O_rotation;
+        O_cam = O_camTf;
+        O_rotationIsQuat = true;
+
+        Log("[sdk] offsets: rot=0x%X cam=0x%X team=0x%X alive=0x%X hp=0x%X name=0x%X wpn=0x%X isLocal=0x%X mCam=0x%X anim=0x%X",
+            O_rotation, O_camTf, O_team, O_alive, O_health, O_name, O_weapon, O_isLocal,
+            O_mCamera, O_humanMeshAnimator);
+    }
+
+    static void ResolveMethods() {
+        if (kPlayerScript) {
+            M_shoot = se_class_get_method_from_name(kPlayerScript, "SemiAutoShoot", 0);
+            if (!M_shoot) M_shoot = se_class_get_method_from_name(kPlayerScript, "Shoot", 0);
+            M_FireBullet = se_class_get_method_from_name(kPlayerScript, "FireBullet", 7);
+            M_fireBullet = M_FireBullet;
+        }
+        if (kTransform) {
+            M_set_position = se_class_get_method_from_name(kTransform, "set_position", 1);
+            M_set_forward = se_class_get_method_from_name(kTransform, "set_forward", 1);
+            M_getTransform = se_class_get_method_from_name(kTransform, "get_transform", 0);
+        }
+        if (kCamera) {
+            M_get_fov = se_class_get_method_from_name(kCamera, "get_fieldOfView", 0);
+            M_set_fov = se_class_get_method_from_name(kCamera, "set_fieldOfView", 1);
+        }
+        Log("[sdk] methods: shoot=%p fire=%p recoil=%p", M_shoot, M_FireBullet, M_recoil);
+    }
+
+    bool Init() {
+        g_phase = "sdk.init";
+        Log("[sdk] Init: ENTROU");
+        Log("==================================================");
+
+        if (!IL2CPP_API::Resolve()) { Log("[sdk] Init: Resolve FALHOU"); return false; }
+        Log("[sdk] Init: Resolve OK");
+
+        Il2CppDomain* dom = se_domain_get();
+        if (!dom) { Log("[sdk] Init: domain NULO"); return false; }
+        se_thread_attach(dom);
+        Log("[sdk] Init: domain+attach OK");
+
+        InitializeCriticalSection(&g_targetCs);
+
+        BuildCache();
+        Log("[sdk] Init: cache OK (%d classes)", (int)g_classes.size());
+
+        kEntity = FindClass("Entity");
+        kPlayerScript = FindClass("PlayerScript");
+        kPlayer = FindClass("Player");
+        kNPC = FindClass("NPC");
+        kTransform = FindClass("Transform", "UnityEngine");
+        kCamera = FindClass("Camera", "UnityEngine");
+        kGunStats = FindClass("GunStats");
+        kVector3 = FindClass("Vector3", "UnityEngine");
+        kQuaternion = FindClass("Quaternion", "UnityEngine");
+        kAntiHack = FindClass("AntiHack");
+        if (!kAntiHack) kAntiHack = FindClass("AntiCheat");
+
+        Log("[sdk] classes: entity=%p player=%p transform=%p camera=%p",
+            kEntity, kPlayerScript, kTransform, kCamera);
+
+        ResolveOffsets();
+        ResolveMethods();
+
+        DumpFields(kEntity, "Entity");
+        DumpFields(kPlayerScript, "PlayerScript");
+        DumpFields(kAntiHack, "AntiHack");
+
+        g_phase = "sdk.done";
+        Log("[sdk] Init: CONCLUIDO");
+        return true;
+    }
+
+} // namespace SDK

@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="Bullt.vcxproj" />
+  <Project Path="Bullt.vcxproj" Id="bd82279f-2fa7-41a8-af6c-27fd9bd4109e" />
 </Solution>

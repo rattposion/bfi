@@ -1,25 +1,122 @@
 #pragma once
-#include "il2cpp.h"
 
-template<typename T> inline T SafeRead(uintptr_t a) {
-    if (!a) return T{};
-    __try { return *(T*)a; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return T{}; }
+#include "common.h"
+#include <psapi.h>
+
+// =====================================================================
+//  memoria segura (nunca estoura o processo)
+// =====================================================================
+inline bool IsBadPtr(uintptr_t a) {
+    return a < 0x10000 || a > 0x7FFFFFFFFFFFULL;
 }
 
-// overload com fallback (usado por movement.cpp)
-template<typename T> inline T SafeRead(uintptr_t a, T fb) {
-    if (!a) return fb;
-    __try { return *(T*)a; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return fb; }
+template <typename T>
+inline T SafeRead(uintptr_t addr, T fallback) {
+    if (IsBadPtr(addr)) return fallback;
+    __try { return *(T*)addr; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return fallback; }
 }
 
-template<typename T> inline void SafeWrite(uintptr_t a, const T& v) {
-    if (!a) return;
-    __try { *(T*)a = v; }
+template <typename T>
+inline T SafeRead(uintptr_t addr) {
+    return SafeRead<T>(addr, T{});
+}
+
+template <typename T>
+inline void SafeWrite(uintptr_t addr, const T& val) {
+    if (IsBadPtr(addr)) return;
+    __try { *(T*)addr = val; }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-inline bool Valid(uintptr_t p) { return p > 0x10000 && p < 0x7FFFFFFFFFFF; }
+template <typename T>
+inline void SafeWrite(void* addr, const T& val) {
+    SafeWrite<T>((uintptr_t)addr, val);
+}
 
-#define FIELD(obj, off, T) (*(T*)((uintptr_t)(obj) + (off)))
+inline void SafeWrite(uintptr_t addr, const void* src, size_t n) {
+    if (IsBadPtr(addr) || !src) return;
+    __try { memcpy((void*)addr, src, n); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// =====================================================================
+//  modulos / pattern scan
+// =====================================================================
+inline uintptr_t ModuleBase(const char* name) {
+    return (uintptr_t)GetModuleHandleA(name);
+}
+
+inline size_t ModuleSize(const char* name) {
+    HMODULE h = GetModuleHandleA(name);
+    if (!h) return 0;
+    MODULEINFO mi{};
+    if (!GetModuleInformation(GetCurrentProcess(), h, &mi, sizeof(mi))) return 0;
+    return mi.SizeOfImage;
+}
+
+inline uintptr_t PatternScan(const char* mod, const char* pat, const char* mask) {
+    uintptr_t base = ModuleBase(mod);
+    size_t    size = ModuleSize(mod);
+    if (!base || !size) return 0;
+
+    size_t plen = strlen(mask);
+    if (!plen) return 0;
+
+    for (size_t i = 0; i + plen <= size; ++i) {
+        bool ok = true;
+        for (size_t j = 0; j < plen; ++j) {
+            if (mask[j] == 'x' && *(unsigned char*)(base + i + j) != (unsigned char)pat[j]) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return base + i;
+    }
+    return 0;
+}
+
+inline uintptr_t Scan(const char* mod, const char* sig) {
+    // sig no formato "48 8B 05 ?? ?? ?? ?? 48 85 C0"
+    unsigned char bytes[128] = {};
+    char          mask[128] = {};
+    size_t        n = 0;
+
+    const char* p = sig;
+    while (*p && n < 127) {
+        while (*p == ' ') ++p;
+        if (!*p) break;
+        if (*p == '?') {
+            bytes[n] = 0;
+            mask[n] = '?';
+            ++n;
+            while (*p && *p != ' ') ++p;
+        }
+        else {
+            bytes[n] = (unsigned char)strtoul(p, nullptr, 16);
+            mask[n] = 'x';
+            ++n;
+            while (*p && *p != ' ') ++p;
+        }
+    }
+    return PatternScan(mod, (const char*)bytes, mask);
+}
+
+// =====================================================================
+//  leitura/escrita crua
+// =====================================================================
+inline bool ReadMem(uintptr_t addr, void* out, size_t n) {
+    if (IsBadPtr(addr) || !out) return false;
+    __try { memcpy(out, (void*)addr, n); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+inline bool WriteMem(uintptr_t addr, const void* in, size_t n) {
+    if (IsBadPtr(addr) || !in) return false;
+    DWORD old = 0;
+    VirtualProtect((void*)addr, n, PAGE_EXECUTE_READWRITE, &old);
+    __try { memcpy((void*)addr, in, n); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    VirtualProtect((void*)addr, n, old, &old);
+    return true;
+}

@@ -1,108 +1,86 @@
-#include "common.h"
+// ============================================================================
+//  dllmain.cpp  -  versao com log de cada passo (diagnostico)
+// ============================================================================
+
+#include <windows.h>
+#include <cstdio>
+
 #include "il2cpp.h"
+#include "il2cpp_api.h"
+#include "common.h"
+#include "config.h"
 #include "sdk.h"
 #include "hooks.h"
-#include "features.h"
 
 HMODULE g_hModule = nullptr;
+bool    g_unload = false;
 
-namespace f {
-    std::atomic<bool> unloadReq{ false };
-}
+void Log(const char* fmt, ...);
+void LogInit();
 
-static LONG WINAPI LogCrash(EXCEPTION_POINTERS* ep) {
-    Log("!!!!!!!! EXCECAO !!!!!!!!");
-    Log("codigo   = 0x%08X", ep->ExceptionRecord->ExceptionCode);
-    Log("endereco = %p", ep->ExceptionRecord->ExceptionAddress);
-    HMODULE mod = nullptr;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        (LPCSTR)ep->ExceptionRecord->ExceptionAddress, &mod) && mod) {
-        char path[MAX_PATH]{};
-        GetModuleFileNameA(mod, path, MAX_PATH);
-        Log("modulo   = %s + 0x%llX", path,
-            (unsigned long long)((uintptr_t)ep->ExceptionRecord->ExceptionAddress - (uintptr_t)mod));
-    }
+// ---------------------------------------------------------------------------
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    Log("!!!!!!!! EXCECAO code=0x%08X addr=%p fase=%s",
+        ep->ExceptionRecord->ExceptionCode,
+        ep->ExceptionRecord->ExceptionAddress,
+        g_phase);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-static bool WaitModule(const char* name, int seconds) {
-    for (int i = 0; i < seconds * 10; i++) {
-        if (GetModuleHandleA(name)) return true;
-        Sleep(100);
-    }
-    return false;
-}
-
-static bool WaitDomain(int seconds) {
-    for (int i = 0; i < seconds * 10; i++) {
-        if (IL2CPP::domain_get && IL2CPP::domain_get()) return true;
-        Sleep(100);
-    }
-    return false;
-}
-
+// ---------------------------------------------------------------------------
 static DWORD WINAPI Main(LPVOID) {
     LogInit();
-    SetUnhandledExceptionFilter(LogCrash);
-    Log("=== nvapi64 iniciando ===");
 
-    if (!WaitModule("GameAssembly.dll", 60)) { Log("GameAssembly.dll nunca apareceu"); return 0; }
-    Log("GameAssembly OK, aguardando runtime...");
+    Log("================================================");
+    Log("[bfi] injetado. aguardando o jogo...");
+    Log("================================================");
 
-    if (!IL2CPP::Init()) { Log("IL2CPP::Init FALHOU"); return 0; }
+    SetUnhandledExceptionFilter(CrashFilter);
 
-    if (!WaitDomain(60)) { Log("domain il2cpp nunca ficou pronta"); return 0; }
-    Log("domain OK");
+    while (!GetModuleHandleA("GameAssembly.dll")) Sleep(100);
+    Log("[bfi] GameAssembly.dll = %p", GetModuleHandleA("GameAssembly.dll"));
 
-    Sleep(1500);   // deixa o Assembly-CSharp carregar antes de resolver
+    g_phase = "resolve";
+    if (!IL2CPP_API::Resolve()) { Log("[bfi] Resolve FALHOU"); return 0; }
+    Log("[bfi] API do il2cpp OK");
 
-    if (!SDK::Init()) { Log("SDK::Init FALHOU"); return 0; }
+    g_phase = "domain";
+    Il2CppDomain* dom = il2cpp_domain_get ? il2cpp_domain_get() : nullptr;
+    if (!dom) { Log("[bfi] domain NULO"); return 0; }
+    Log("[bfi] dominio il2cpp pronto");
 
-    ConfigIO::Init();
-    Log(">>> STAGE = %d", C.stage);
+    g_phase = "attach";
+    if (il2cpp_thread_attach) il2cpp_thread_attach(dom);
+    Log("[bfi] thread attach OK");
 
-    if (!Hooks::InstallSwap()) Log("swap falhou");
-    Hooks::g_sdkReady = true;
-    Hooks::g_hooksLive.store(true);
+    g_phase = "sdk";
+    Log("[bfi] >>> chamando SDK::Init...");
+    bool okSdk = SDK::Init();
+    Log("[bfi] <<< SDK::Init retornou %d", (int)okSdk);
 
-    if (C.stage >= 2) Hooks::InstallMainThread();
-    Hooks::InstallCursor();
+    g_phase = "hooks";
+    Log("[bfi] >>> chamando Hooks::Init...");
+    bool okHk = Hooks::Init();
+    Log("[bfi] <<< Hooks::Init retornou %d", (int)okHk);
 
-    if (C.stage >= 3) {
-        Hooks::InstallCombat();
-        AntiCheat::Install();          // A1
-    }
-
-    Log("=== TUDO PRONTO (stage %d) ===", C.stage);
-
-    // loop do worker: SO input — nada de il2cpp aqui
-    bool lastMenu = false, lastPanic = false, lastSave = false, lastUnload = false;
-    while (!f::unloadReq.load()) {
-        bool menu = (GetAsyncKeyState(C.menuKey) & 0x8000) != 0;
-        bool panic = (GetAsyncKeyState(C.panicKey) & 0x8000) != 0;
-        bool save = (GetAsyncKeyState(C.saveKey) & 0x8000) != 0;
-        bool unload = (GetAsyncKeyState(C.unloadKey) & 0x8000) != 0;
-
-        if (menu && !lastMenu) { C.menuOpen = !C.menuOpen; Log("menu=%d", C.menuOpen ? 1 : 0); }
-        if (panic && !lastPanic) { Misc::Panic(); }
-        if (save && !lastSave) { ConfigIO::Save(); Log("config salva"); }
-        if (unload && !lastUnload) { f::unloadReq.store(true); }
-
-        lastMenu = menu; lastPanic = panic; lastSave = save; lastUnload = unload;
-        Sleep(8);
-    }
-
-    Hooks::Shutdown();
-    ConfigIO::Save();
-    Log("=== descarregado ===");
+    g_phase = "done";
+    Log("[bfi] ===== pronto =====");
     return 0;
 }
 
+// ---------------------------------------------------------------------------
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hModule = h;
         DisableThreadLibraryCalls(h);
         CreateThread(nullptr, 0, Main, nullptr, 0, nullptr);
+    }
+    else if (reason == DLL_PROCESS_DETACH) {
+        g_unload = true;
+        if (g_phase && *g_phase) {
+            SDK::Shutdown();
+            Hooks::Shutdown();
+        }
     }
     return TRUE;
 }

@@ -1,63 +1,111 @@
+// ============================================================================
+//  visuals.cpp — overlay 2D (watermark, fps, crosshair, circulo de fov,
+//  hitmarker, info de alvo). Roda na thread de render, dentro do Misc::Draw.
+//
+//  NAO usa PHASE: quem manda no g_phase e a thread principal (anticheat.cpp).
+// ============================================================================
 #include "features.h"
+#include "sdk.h"
+#include "hooks.h"
+#include "common.h"
 
-namespace Visuals {
+#include <imgui.h>
+#include <cmath>
+#include <cstdio>
 
-    static void Radar() {
-        if (!C.radar || !g_localPlayer) return;
-        ImGuiIO& io = ImGui::GetIO();
-        const float R = 90.f;
-        ImVec2 c(io.DisplaySize.x - R - 20.f, R + 20.f);
-        auto* dl = ImGui::GetForegroundDrawList();
+// ---------------------------------------------------------------------------
+static inline ImU32 C4(const float c[4], float aMul = 1.f) {
+    return IM_COL32((int)(c[0] * 255.f), (int)(c[1] * 255.f),
+        (int)(c[2] * 255.f), (int)(c[3] * 255.f * aMul));
+}
 
-        dl->AddCircleFilled(c, R, IM_COL32(10, 10, 10, 140), 64);
-        dl->AddCircle(c, R, IM_COL32(0, 255, 180, 180), 64, 1.5f);
+static void DrawWatermark(ImDrawList* dl) {
+    char buf[128];
+    sprintf_s(buf, sizeof(buf), "bfi  |  alvos %d  |  desenhados %d",
+        SDK::g_targetCount, SDK::dbg_drawn);
+    dl->AddText(ImVec2(12.f, 10.f), IM_COL32(255, 255, 255, 230), buf);
+}
 
-        EnterCriticalSection(&g_targetCs);
-        for (int i = 0; i < g_targetCount; i++) {
-            Target& t = g_targets[i];
-            if (!t.player || t.player == g_localPlayer || !t.alive) continue;
-            if (C.teamCheck && g_localTeam >= 0 && t.team == g_localTeam) continue;
+static void DrawFps(ImDrawList* dl) {
+    static ULONGLONG last = 0;
+    static float fps = 0.f;
 
-            Vec3 d = t.feet - g_localPos;
-            float scale = R / 60.f;                       // 60m de raio
-            float px = d.x * scale, pz = d.z * scale;
-            float l = sqrtf(px * px + pz * pz);
-            if (l > R - 3.f) { px *= (R - 3.f) / l; pz *= (R - 3.f) / l; }
-
-            ImU32 col = ImGui::ColorConvertFloat4ToU32(
-                ImVec4(C.espColor[0], C.espColor[1], C.espColor[2], 1.f));
-            dl->AddCircleFilled(ImVec2(c.x + px, c.y - pz), 3.f, col, 12);
-        }
-        LeaveCriticalSection(&g_targetCs);
+    ULONGLONG now = GetTickCount64();
+    if (last) {
+        ULONGLONG dt = now - last;
+        if (dt > 0) fps = fps * 0.9f + (1000.f / (float)dt) * 0.1f;
     }
+    last = now;
 
-    static void Hitmarker() {
-        if (!C.hitmarker) return;
-        ULONGLONG dt = GetTickCount64() - f::lastHitTime.load();
-        if (dt > 250) return;
+    char buf[32];
+    sprintf_s(buf, sizeof(buf), "%.0f fps", (double)fps);
+    dl->AddText(ImVec2(12.f, 30.f), IM_COL32(180, 220, 180, 220), buf);
+}
 
-        float a = 1.f - (float)dt / 250.f;
-        ImGuiIO& io = ImGui::GetIO();
-        ImVec2 c(io.DisplaySize.x / 2, io.DisplaySize.y / 2);
-        ImU32 col = IM_COL32(255, 255, 255, (int)(255 * a));
-        auto* dl = ImGui::GetForegroundDrawList();
+static void DrawCrosshair(ImDrawList* dl, float cx, float cy) {
+    float s = C.crosshairSize;
+    float g = 2.f;
+    ImU32 c = C4(C.crosshairColor);
 
-        dl->AddLine(ImVec2(c.x - 10, c.y - 10), ImVec2(c.x - 4, c.y - 4), col, 2.f);
-        dl->AddLine(ImVec2(c.x + 10, c.y - 10), ImVec2(c.x + 4, c.y - 4), col, 2.f);
-        dl->AddLine(ImVec2(c.x - 10, c.y + 10), ImVec2(c.x - 4, c.y + 4), col, 2.f);
-        dl->AddLine(ImVec2(c.x + 10, c.y + 10), ImVec2(c.x + 4, c.y + 4), col, 2.f);
-    }
+    dl->AddLine(ImVec2(cx - s - g, cy), ImVec2(cx - g, cy), c, 1.5f);
+    dl->AddLine(ImVec2(cx + g, cy), ImVec2(cx + s + g, cy), c, 1.5f);
+    dl->AddLine(ImVec2(cx, cy - s - g), ImVec2(cx, cy - g), c, 1.5f);
+    dl->AddLine(ImVec2(cx, cy + g), ImVec2(cx, cy + s + g), c, 1.5f);
+}
+
+static void DrawFovCircle(ImDrawList* dl, float cx, float cy, float H) {
+    if (!C.showFovCircle) return;
+
+    float r = (float)tan(C.aimFov * 3.14159265f / 360.f) / 0.4142f * (H * 0.5f);
+    if (r < 3.f || r > H) return;
+
+    dl->AddCircle(ImVec2(cx, cy), r, C4(C.aimColor, 0.8f), 64, 1.5f);
+}
+
+static void DrawHitmarker(ImDrawList* dl, float cx, float cy) {
+    if (!C.hitmarker) return;
+
+    float now = (float)(GetTickCount64() / 1000.0);
+    float dt = now - C.lastHitTime;
+    if (dt < 0.f || dt > 0.25f) return;
+
+    float a = 1.f - dt / 0.25f;
+    float s = 8.f + dt * 20.f;
+    ImU32 c = IM_COL32(255, 255, 255, (int)(255.f * a));
+
+    dl->AddLine(ImVec2(cx - s, cy - s), ImVec2(cx - s * 0.4f, cy - s * 0.4f), c, 2.f);
+    dl->AddLine(ImVec2(cx + s, cy - s), ImVec2(cx + s * 0.4f, cy - s * 0.4f), c, 2.f);
+    dl->AddLine(ImVec2(cx - s, cy + s), ImVec2(cx - s * 0.4f, cy + s * 0.4f), c, 2.f);
+    dl->AddLine(ImVec2(cx + s, cy + s), ImVec2(cx + s * 0.4f, cy + s * 0.4f), c, 2.f);
+}
+
+static void DrawTargetInfo(ImDrawList* dl, float cx, float cy) {
+    if (!C.aimbot || !SDK::g_aimTarget) return;
+
+    char buf[64];
+    sprintf_s(buf, sizeof(buf), "alvo travado  |  fov %.1f", (double)C.aimFov);
+    dl->AddText(ImVec2(cx - 60.f, cy + 40.f), C4(C.aimColor), buf);
+}
+
+// ---------------------------------------------------------------------------
+//  entrada pelo render thread
+// ---------------------------------------------------------------------------
+namespace Misc {
 
     void Draw() {
-        if (C.watermark) {
-            ImGuiIO& io = ImGui::GetIO();
-            char b[192];
-            sprintf_s(b, "Venice BF | %.0f FPS | alvos: %d | aim:%d silent:%d magic:%d god:%d",
-                io.Framerate, g_targetCount, C.aimbot, C.silentAim, C.magicBullets, C.godmode);
-            ImGui::GetBackgroundDrawList()->AddText(ImVec2(12, 12), IM_COL32(0, 255, 180, 230), b);
-        }
-        Radar();
-        Hitmarker();
-        Misc::Draw();
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+
+        float W = (float)SDK::ScreenW();
+        float H = (float)SDK::ScreenH();
+        float cx = W * 0.5f;
+        float cy = H * 0.5f;
+
+        if (C.watermark) { DrawWatermark(dl); DrawFps(dl); }
+        if (C.crosshair) DrawCrosshair(dl, cx, cy);
+
+        DrawFovCircle(dl, cx, cy, H);
+        DrawHitmarker(dl, cx, cy);
+        DrawTargetInfo(dl, cx, cy);
     }
-}
+
+} // namespace Misc

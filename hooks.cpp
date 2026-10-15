@@ -1,329 +1,372 @@
+// ============================================================================
+//  hooks.cpp — versao final consolidada
+//  - dedupe por instancia (self) + por frame
+//  - AimLock salva o ORIGINAL, RestoreAim devolve
+//  - recoil com retorno (nao deixa XMM0 lixo)
+//  - sdkReady so apos viewProj valido
+//  - WndProc consome input com menu aberto
+//  - uninit unico do MinHook
+//  - todos os ticks ligados
+// ============================================================================
+#include <windows.h>
+#include <cstdio>
+#include <cstring>
+#include <atomic>
+#include <GL/gl.h>
+
+#include "MinHook.h"
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_opengl3.h"
+
+#include "il2cpp.h"
+#include "il2cpp_api.h"
+#include "common.h"
+#include "memory.h"
+#include "config.h"
+#include "sdk.h"
 #include "hooks.h"
 #include "features.h"
-#include "sdk.h"
-#include "config.h"
-
-#include "imgui.h"
-#include "backends/imgui_impl_opengl3.h"
-#include "backends/imgui_impl_win32.h"
-#include <GL/gl.h>
 
 #pragma comment(lib, "opengl32.lib")
 
-// ---------------------------------------------------------------------------
-// O <GL/gl.h> do Windows so cobre GL 1.1. FBO e GL 3.0 -> carrega via wglGetProcAddress.
-// ---------------------------------------------------------------------------
-#ifndef GL_FRAMEBUFFER
-#define GL_FRAMEBUFFER          0x8D40
-#endif
-#ifndef GL_FRAMEBUFFER_BINDING
-#define GL_FRAMEBUFFER_BINDING  0x8CA6
-#endif
-
-typedef void (APIENTRY* PFN_glBindFramebuffer_t)(GLenum target, GLuint framebuffer);
-static PFN_glBindFramebuffer_t p_glBindFramebuffer = nullptr;
-
 namespace Hooks {
 
-    std::atomic<bool> g_imguiReady{ false };
-    std::atomic<bool> g_hooksLive{ false };
-    std::atomic<int>  g_inPresent{ 0 };
-    bool g_sdkReady = false;
+    decltype(g_hooksLive) g_hooksLive = false;
+    decltype(g_sdkReady)  g_sdkReady = false;
+    decltype(g_viewW)     g_viewW = 1920;
+    decltype(g_viewH)     g_viewH = 1080;
 
-    static WNDPROC   g_wnd = nullptr;
-    static HWND      g_hwnd = nullptr;
-    static ULONGLONG g_lastPrune = 0;
-    static ULONGLONG g_lastApply = 0;
+    static bool g_mhInit = false;
+    static std::atomic<uint32_t> g_frameCounter{ 0 };
+    static uint32_t g_lastTickFrame = 0xFFFFFFFF;
 
-    static void* g_swapAddr = nullptr;
+    static bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
-    // ---------------------------------------------------------------- GL ext
-    static void LoadGLExt() {
-        if (p_glBindFramebuffer) return;
-        p_glBindFramebuffer = (PFN_glBindFramebuffer_t)wglGetProcAddress("glBindFramebuffer");
-        if (!p_glBindFramebuffer) {
-            HMODULE gl = GetModuleHandleA("opengl32.dll");
-            if (gl) p_glBindFramebuffer = (PFN_glBindFramebuffer_t)GetProcAddress(gl, "glBindFramebuffer");
+    static bool Edge(int vk) {
+        static bool prev[256] = {};
+        bool cur = KeyDown(vk);
+        bool r = cur && !prev[vk & 0xFF];
+        prev[vk & 0xFF] = cur;
+        return r;
+    }
+
+    static MethodInfo* FindMethodByArity(Il2CppClass* k, const char* name, uint32_t argc) {
+        if (!k || !name) return nullptr;
+        void* iter = nullptr;
+        for (;;) {
+            const MethodInfo* m = il2cpp_class_get_methods(k, &iter);
+            if (!m) break;
+            if (il2cpp_method_get_param_count(m) == argc &&
+                strcmp(il2cpp_method_get_name(m), name) == 0)
+                return (MethodInfo*)m;
         }
-        Log("glBindFramebuffer = %p", (void*)p_glBindFramebuffer);
+        return nullptr;
     }
 
-    // ========================================================================
-    // MAIN THREAD
-    // ========================================================================
-    void ApplyFeatures() {
-        if (!g_sdkReady || !g_hooksLive.load()) return;
-
-        ULONGLONG now = GetTickCount64();
-        if (now - g_lastApply < 16) return;      // ~60Hz
-        g_lastApply = now;
-
-        g_localPlayer = SDK::LocalPlayer();
-        g_localTeam = g_localPlayer ? SDK::GetTeam(g_localPlayer) : -1;
-        g_localPos = g_localPlayer ? SDK::GetPos(SDK::GetTransform(g_localPlayer)) : Vec3();
-        g_inGame = g_localPlayer != nullptr;
-        g_camera = SDK::CameraObj();
-
-        if (now - g_lastPrune > 250) { g_lastPrune = now; PruneTargets(); }
-
-        __try { ScanAllTargets(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-        __try { Weapons::Tick(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        __try { Combat::Tick(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        __try { Movement::Tick(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        __try { Aimbot::Tick(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        __try { Triggerbot::Tick(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        __try { Misc::Tick(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-        static ULONGLONG lastDbg = 0;
-        if (now - lastDbg > 3000) {
-            lastDbg = now;
-            int vivos = 0;
-            for (int i = 0; i < g_targetCount; i++) if (g_targets[i].alive) vivos++;
-            Log("dbg: local=%p cam=%p alvos=%d vivos=%d desenhados=%d scan=%d rej=%d",
-                (void*)g_localPlayer, (void*)g_camera, g_targetCount, vivos,
-                SDK::dbg_drawn, SDK::dbg_scanCount, SDK::dbg_reject);
+    static MethodInfo* FindMethodAny(Il2CppClass* k, const char* name) {
+        if (!k || !name) return nullptr;
+        void* iter = nullptr;
+        for (;;) {
+            const MethodInfo* m = il2cpp_class_get_methods(k, &iter);
+            if (!m) break;
+            if (strcmp(il2cpp_method_get_name(m), name) == 0) return (MethodInfo*)m;
         }
+        return nullptr;
     }
 
-    static void (*o_MainTick)(void*, const MethodInfo*) = nullptr;
-    static void hk_MainTick(void* self, const MethodInfo* m) {
-        __try { if (o_MainTick) o_MainTick(self, m); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        __try { ApplyFeatures(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    static void* FindMethodPtr(const char* klass, const char* method, uint32_t argc) {
+        Il2CppClass* k = SDK::FindClass(klass);
+        if (!k) return nullptr;
+        MethodInfo* m = FindMethodByArity(k, method, argc);
+        return m ? SDK::MethodPtr(m) : nullptr;
     }
 
-    // ========================================================================
-    // CURSOR
-    // ========================================================================
-    static void (*o_setLockState)(int, const MethodInfo*) = nullptr;
-    static void hk_setLockState(int mode, const MethodInfo* m) {
-        if (C.menuOpen) mode = 0;
-        if (o_setLockState) o_setLockState(mode, m);
+    // -----------------------------------------------------------------------
+    //  cursor
+    // -----------------------------------------------------------------------
+    typedef BOOL(WINAPI* tSetCursorPos)(int, int);
+    static tSetCursorPos o_setCursorPos = nullptr;
+
+    static BOOL WINAPI hk_SetCursorPos(int x, int y) {
+        if (C.menuOpen) return TRUE;
+        return o_setCursorPos ? o_setCursorPos(x, y) : TRUE;
     }
 
-    static void (*o_setVisible)(bool, const MethodInfo*) = nullptr;
-    static void hk_setVisible(bool v, const MethodInfo* m) {
-        if (C.menuOpen) v = true;
-        if (o_setVisible) o_setVisible(v, m);
+    bool InstallCursor() {
+        HMODULE u32 = GetModuleHandleA("user32.dll");
+        if (!u32) return false;
+        void* p = (void*)GetProcAddress(u32, "SetCursorPos");
+        if (!p) return false;
+        if (MH_CreateHook(p, &hk_SetCursorPos, (void**)&o_setCursorPos) != MH_OK) return false;
+        MH_EnableHook(p);
+        Log("[hooks] cursor hook OK");
+        return true;
     }
 
-    static void ForceCursorFree() {
-        if (!C.menuOpen) return;
-        if (o_setLockState) { int  v = 0;    o_setLockState(v, nullptr); }
-        if (o_setVisible) { bool v = true; o_setVisible(v, nullptr); }
-    }
+    // -----------------------------------------------------------------------
+    //  WNDPROC + render
+    // -----------------------------------------------------------------------
+    static HWND    g_hwnd = nullptr;
+    static WNDPROC o_wndProc = nullptr;
+    static bool    g_imguiInit = false;
+    static bool    g_frameLog = false;
 
-    // ========================================================================
-    // WNDPROC
-    // ========================================================================
-    static LRESULT CALLBACK hkWnd(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-        if (g_imguiReady.load()) {
+    static LRESULT CALLBACK hk_wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+        if (g_imguiInit) {
             ImGui_ImplWin32_WndProcHandler(h, msg, wp, lp);
             if (C.menuOpen) {
-                switch (msg) {
-                case WM_MOUSEMOVE:   case WM_LBUTTONDOWN: case WM_LBUTTONUP:
-                case WM_RBUTTONDOWN: case WM_RBUTTONUP:   case WM_MBUTTONDOWN:
-                case WM_MBUTTONUP:   case WM_MOUSEWHEEL:
-                    return 0;
-                }
+                ImGuiIO& io = ImGui::GetIO();
+                if (io.WantCaptureMouse || io.WantCaptureKeyboard) return TRUE;
             }
         }
-        return CallWindowProcW(g_wnd, h, msg, wp, lp);
+        return CallWindowProcA(o_wndProc, h, msg, wp, lp);
     }
 
-    // ========================================================================
-    // RENDER (render thread)
-    // ========================================================================
-    void RenderFrame() {
-        if (!g_imguiReady.load()) return;
+    typedef BOOL(WINAPI* tSwapBuffers)(HDC);
+    static tSwapBuffers o_swap = nullptr;
+
+    static void InitImGui(HWND hwnd) {
+        if (g_imguiInit) return;
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        io.IniFilename = nullptr;
+        ImGui::StyleColorsDark();
+        if (!ImGui_ImplWin32_Init(hwnd)) { Log("[hooks] ImGui_ImplWin32_Init FALHOU"); return; }
+        if (!ImGui_ImplOpenGL3_Init("#version 130")) { Log("[hooks] ImGui_ImplOpenGL3_Init FALHOU"); return; }
+        g_imguiInit = true;
+        Log("[hooks] ImGui inicializado (hwnd=%p)", hwnd);
+    }
+
+    static BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
+        g_frameCounter.fetch_add(1, std::memory_order_relaxed);
+
+        HWND hwnd = WindowFromDC(hdc);
+        if (!hwnd) hwnd = GetForegroundWindow();
+
+        if (hwnd && hwnd != g_hwnd) {
+            g_hwnd = hwnd;
+            WNDPROC old = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
+            if (old) o_wndProc = old;
+            Log("[hooks] wndproc instalado (hwnd=%p)", hwnd);
+            InitImGui(hwnd);
+        }
+
+        static ULONGLONG lastBeat = 0;
+        ULONGLONG nb = GetTickCount64();
+        if (nb - lastBeat > 2000) {
+            lastBeat = nb;
+            Log("[hooks] beat: menu=%d sdk=%d alvos=%d local=%p",
+                (int)C.menuOpen, (int)g_sdkReady, SDK::g_targetCount, SDK::g_localPlayer);
+        }
+
+        if (Edge(VK_INSERT)) C.menuOpen = !C.menuOpen;
+        if (C.aimKey) C.aimKeyDown = KeyDown(C.aimKey);
+
+        if (!g_imguiInit) return o_swap(hdc);
+
+        if (!g_frameLog) {
+            g_frameLog = true;
+            Log("[hooks] primeiro frame render OK (menuOpen=%d, sdkReady=%d)",
+                (int)C.menuOpen, (int)g_sdkReady);
+        }
+
+        RECT rc;
+        GetClientRect(g_hwnd, &rc);
+        g_viewW = (int)(rc.right - rc.left);
+        g_viewH = (int)(rc.bottom - rc.top);
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::GetIO().MouseDrawCursor = C.menuOpen;
-
-        // ---- salva estado GL ----------------------------------------------
-        const bool hasFbo = (p_glBindFramebuffer != nullptr);
-        GLint     fbo = 0, vp[4] = { 0 }, sc[4] = { 0 };
-        GLboolean hadScissor = glIsEnabled(GL_SCISSOR_TEST);
-        GLboolean cmask[4] = { GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE };
-
-        if (hasFbo) glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
-        glGetIntegerv(GL_VIEWPORT, vp);
-        glGetIntegerv(GL_SCISSOR_BOX, sc);
-        glGetBooleanv(GL_COLOR_WRITEMASK, cmask);
-
-        ImGuiIO& io = ImGui::GetIO();
-        if (hasFbo) p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glViewport(0, 0, (GLsizei)io.DisplaySize.x, (GLsizei)io.DisplaySize.y);
-        glDisable(GL_SCISSOR_TEST);
-        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-
-        // ---- desenho ------------------------------------------------------
-        __try { ESP::Draw(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        __try { Visuals::Draw(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        __try { MenuDraw(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        Menu::Render();
+        if (g_sdkReady) {
+            ESP::Draw();
+            Misc::Draw();
+        }
 
         ImGui::Render();
+        glViewport(0, 0, g_viewW, g_viewH);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        // ---- restaura -----------------------------------------------------
-        glColorMask(cmask[0], cmask[1], cmask[2], cmask[3]);
-        if (hasFbo) p_glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)fbo);
-        glViewport(vp[0], vp[1], vp[2], vp[3]);
-        glScissor(sc[0], sc[1], sc[2], sc[3]);
-        if (hadScissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+        return o_swap(hdc);
     }
 
-    // ========================================================================
-    // SWAP
-    // ========================================================================
-    static BOOL(WINAPI* o_wglSwap)(HDC) = nullptr;
-
-    static BOOL WINAPI hk_wglSwap(HDC hdc) {
-        g_inPresent.fetch_add(1);
-
-        if (!g_imguiReady.load()) {
-            g_hwnd = WindowFromDC(hdc);
-            if (g_hwnd) {
-                WNDPROC prev = (WNDPROC)SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)hkWnd);
-                if (prev) g_wnd = prev;
-
-                LoadGLExt();                       // contexto GL ja esta atual aqui
-
-                ImGui::CreateContext();
-                ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-                ImGui::StyleColorsDark();
-                ImGui_ImplWin32_Init(g_hwnd);
-                ImGui_ImplOpenGL3_Init("#version 130");
-
-                g_imguiReady.store(true);
-                Log("imgui inicializado");
-            }
-        }
-
-        __try { RenderFrame(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        __try { ForceCursorFree(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-        BOOL r = o_wglSwap(hdc);
-        g_inPresent.fetch_sub(1);
-        return r;
-    }
-
-    // ========================================================================
-    // INSTALL
-    // ========================================================================
     bool InstallSwap() {
-        if (MH_Initialize() != MH_OK) Log("MH_Initialize falhou");
-
         HMODULE gl = GetModuleHandleA("opengl32.dll");
-        for (int i = 0; i < 100 && !gl; i++) { Sleep(100); gl = GetModuleHandleA("opengl32.dll"); }
-        if (!gl) { Log("opengl32.dll NAO carregada"); return false; }
-
+        if (!gl) { Log("[hooks] opengl32.dll nao carregada"); return false; }
         void* p = (void*)GetProcAddress(gl, "wglSwapBuffers");
-        if (!p) { Log("wglSwapBuffers NAO achado"); return false; }
-
-        if (MH_CreateHook(p, hk_wglSwap, (LPVOID*)&o_wglSwap) != MH_OK) {
-            Log("MH_CreateHook(swap) falhou");
+        if (!p) { Log("[hooks] wglSwapBuffers NAO encontrado"); return false; }
+        if (MH_CreateHook(p, &hk_wglSwapBuffers, (void**)&o_swap) != MH_OK) {
+            Log("[hooks] MH_CreateHook(wglSwapBuffers) FALHOU");
             return false;
         }
-        g_swapAddr = p;
         MH_EnableHook(p);
-        Log("hook wglSwapBuffers OK");
+        Log("[hooks] wglSwapBuffers hook OK");
         return true;
+    }
+
+    // -----------------------------------------------------------------------
+    //  main thread
+    // -----------------------------------------------------------------------
+    typedef void(__fastcall* tLateUpdate)(void* self, void* method);
+    static tLateUpdate o_lateUpdate = nullptr;
+
+    static void __fastcall hk_lateUpdate(void* self, void* method) {
+        if (o_lateUpdate) o_lateUpdate(self, method);
+
+        // 1) filtro primario: so a instancia do local player
+        if (SDK::g_localPlayer && self != SDK::g_localPlayer) return;
+
+        // 2) backup: nunca mais de uma vez por frame
+        uint32_t f = g_frameCounter.load(std::memory_order_relaxed);
+        if (f == g_lastTickFrame) return;
+        g_lastTickFrame = f;
+
+        SDK::g_frameId = f;
+
+        SDK::UpdateView();
+        if (!SDK::g_viewProjOk) return;
+
+        g_sdkReady = true;
+
+        SDK::UpdateTargets();
+
+        if (C.aimbot) SDK::g_aimTarget = Aimbot::Best();
+        else          SDK::g_aimTarget = nullptr;
+
+        Misc::Tick();
+        Combat::Tick();
+        Aimbot::Tick();
+        Triggerbot::Tick();
+        Weapons::Tick();
+        Movement::Tick();
+        AntiCheat::Tick();
     }
 
     bool InstallMainThread() {
-        const MethodInfo* target = SDK::M_LateUpdate;
-        const char* who = "PlayerScript.LateUpdate";
+        static const char* classes[] = { "PlayerScript", "GameManager", "Game", "HUD", "UIManager",
+                                         "GameController", "Main", "ClientInstance" };
+        static const char* methods[] = { "LateUpdate", "Update", "FixedUpdate" };
 
-        if (!target || !target->methodPointer) {
-            static const char* classes[] = { "MainCamera", "SmoothCameraOrbit", "LeanTween", "GMVehicleLOD" };
-            static const char* methods[] = { "LateUpdate", "Update" };
-            target = nullptr;
-            for (int ci = 0; ci < 4 && !target; ci++) {
-                Il2CppClass* k = SDK::FindClass(classes[ci]);
-                if (!k) continue;
-                for (int mi = 0; mi < 2 && !target; mi++) {
-                    const MethodInfo* m = IL2CPP::class_get_method_from_name(k, methods[mi], 0);
-                    if (m && m->methodPointer) { target = m; who = classes[ci]; }
+        for (size_t c = 0; c < sizeof(classes) / sizeof(classes[0]); ++c) {
+            Il2CppClass* k = SDK::FindClass(classes[c]);
+            if (!k) continue;
+            for (size_t m = 0; m < sizeof(methods) / sizeof(methods[0]); ++m) {
+                void* ptr = FindMethodPtr(classes[c], methods[m], 0);
+                if (!ptr) continue;
+                if (MH_CreateHook(ptr, &hk_lateUpdate, (void**)&o_lateUpdate) == MH_OK) {
+                    MH_EnableHook(ptr);
+                    Log("[hooks] MAIN THREAD = %s::%s (%p)", classes[c], methods[m], ptr);
+                    return true;
                 }
             }
         }
-
-        if (!target || !target->methodPointer) { Log("main-thread NAO resolvido"); return false; }
-        Log("main-thread via %s", who);
-
-        if (MH_CreateHook((LPVOID)target->methodPointer, hk_MainTick, (LPVOID*)&o_MainTick) != MH_OK) {
-            Log("MH_CreateHook(main) falhou");
-            return false;
-        }
-        MH_EnableHook((LPVOID)target->methodPointer);
-        Log("hook main-thread OK");
-        return true;
+        Log("[hooks] main thread: NENHUM alvo encontrado");
+        return false;
     }
 
-    bool InstallCursor() {
+    // -----------------------------------------------------------------------
+    //  combate
+    // -----------------------------------------------------------------------
+    typedef void(__fastcall* tShoot)(void* self, const MethodInfo* m);
+    static tShoot o_shoot = nullptr;
+
+    static void __fastcall hk_shoot(void* self, const MethodInfo* m) {
+        Quat original{};
+        bool has = false;
+
+        if (C.aimbot && C.aimKeyDown && SDK::g_aimTarget &&
+            SDK::g_localPlayer && SDK::O_rotationIsQuat) {
+            // AimLock salva o ORIGINAL em `original` e aplica a mira
+            if (SDK::AimLock(SDK::g_aimTarget, original)) has = true;
+        }
+
+        if (o_shoot) o_shoot(self, m);
+
+        if (has && SDK::g_localPlayer) SDK::RestoreAim(SDK::g_localPlayer, original);
+    }
+
+    typedef Quat(__fastcall* tRecoil)(void* self, const MethodInfo* m,
+        void* a1, void* a2, void* a3, void* a4);
+    static tRecoil o_recoil = nullptr;
+
+    static Quat __fastcall hk_recoil(void* self, const MethodInfo* m,
+        void* a1, void* a2, void* a3, void* a4) {
+        const Quat zero{ 0.f, 0.f, 0.f, 1.f };
+        if (C.noRecoil) return zero;
+        return o_recoil ? o_recoil(self, m, a1, a2, a3, a4) : zero;
+    }
+
+    bool InstallCombat() {
         bool ok = false;
 
-        if (SDK::M_set_lockState && SDK::M_set_lockState->methodPointer) {
-            if (MH_CreateHook((LPVOID)SDK::M_set_lockState->methodPointer, hk_setLockState, (LPVOID*)&o_setLockState) == MH_OK)
-                MH_EnableHook((LPVOID)SDK::M_set_lockState->methodPointer);
-            ok = true;
+        if (SDK::M_shoot) {
+            void* p = SDK::MethodPtr(SDK::M_shoot);
+            if (p && MH_CreateHook(p, &hk_shoot, (void**)&o_shoot) == MH_OK) {
+                MH_EnableHook(p);
+                Log("[hooks] hook shoot OK");
+                ok = true;
+            }
         }
-        if (SDK::M_set_visible && SDK::M_set_visible->methodPointer) {
-            if (MH_CreateHook((LPVOID)SDK::M_set_visible->methodPointer, hk_setVisible, (LPVOID*)&o_setVisible) == MH_OK)
-                MH_EnableHook((LPVOID)SDK::M_set_visible->methodPointer);
-            ok = true;
+        else Log("[hooks] M_shoot nulo");
+
+        // recoil: aridade desconhecida -> varredura
+        if (!SDK::M_recoil) {
+            Il2CppClass* ps = SDK::FindClass("PlayerScript");
+            if (ps) {
+                for (uint32_t a = 0; a <= 6 && !SDK::M_recoil; ++a)
+                    SDK::M_recoil = FindMethodByArity(ps, "ComputeShotRecoil", a);
+                if (!SDK::M_recoil) SDK::M_recoil = FindMethodAny(ps, "ComputeShotRecoil");
+            }
         }
 
-        Log("hook cursor: lock=%s vis=%s",
-            (SDK::M_set_lockState && SDK::M_set_lockState->methodPointer) ? "OK" : "-",
-            (SDK::M_set_visible && SDK::M_set_visible->methodPointer) ? "OK" : "-");
+        if (SDK::M_recoil) {
+            Log("[hooks] recoil: params=%u", il2cpp_method_get_param_count(SDK::M_recoil));
+            void* p = SDK::MethodPtr(SDK::M_recoil);
+            if (p && MH_CreateHook(p, &hk_recoil, (void**)&o_recoil) == MH_OK) {
+                MH_EnableHook(p);
+                Log("[hooks] hook recoil OK");
+                ok = true;
+            }
+        }
+        else Log("[hooks] M_recoil nulo");
+
         return ok;
     }
 
-    bool InstallCombat() { return Combat::Install(); }
+    // -----------------------------------------------------------------------
+    bool Init() {
+        if (g_mhInit) return true;
+        if (MH_Initialize() != MH_OK) { Log("[hooks] MH_Initialize FALHOU"); return false; }
+        g_mhInit = true;
 
-    // ========================================================================
-    // SHUTDOWN
-    // ========================================================================
-    void Shutdown() {
-        Log("shutdown...");
-        g_hooksLive.store(false);
+        InstallSwap();
+        InstallMainThread();
+        InstallCursor();
+        InstallCombat();
+        AntiCheat::Install();
 
-        for (int i = 0; i < 40 && g_inPresent.load() > 0; i++) Sleep(50);
-
-        MH_DisableHook(MH_ALL_HOOKS);
-
-        if (g_imguiReady.load()) {
-            g_imguiReady.store(false);
-            Sleep(100);
-            ImGui_ImplOpenGL3_Shutdown();
-            ImGui_ImplWin32_Shutdown();
-            ImGui::DestroyContext();
-        }
-        if (g_hwnd && g_wnd) SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_wnd);
-
-        MH_Uninitialize();
-        Log("shutdown ok");
+        g_hooksLive = true;
+        Log("[hooks] instalados");
+        return true;
     }
 
-    void SaveConfig() { ConfigIO::Save(); }
+    void Shutdown() {
+        if (!g_mhInit) return;
+        g_sdkReady = false;
+        g_hooksLive = false;
+
+        if (o_wndProc && g_hwnd) {
+            SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)o_wndProc);
+            o_wndProc = nullptr;
+        }
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
+        g_mhInit = false;
+        Log("[hooks] Shutdown");
+    }
 
 } // namespace Hooks
