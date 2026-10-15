@@ -6,6 +6,10 @@
 
 HMODULE g_hModule = nullptr;
 
+namespace f {
+    std::atomic<bool> unloadReq{ false };
+}
+
 static LONG WINAPI LogCrash(EXCEPTION_POINTERS* ep) {
     Log("!!!!!!!! EXCECAO !!!!!!!!");
     Log("codigo   = 0x%08X", ep->ExceptionRecord->ExceptionCode);
@@ -21,32 +25,77 @@ static LONG WINAPI LogCrash(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+static bool WaitModule(const char* name, int seconds) {
+    for (int i = 0; i < seconds * 10; i++) {
+        if (GetModuleHandleA(name)) return true;
+        Sleep(100);
+    }
+    return false;
+}
+
+static bool WaitDomain(int seconds) {
+    for (int i = 0; i < seconds * 10; i++) {
+        if (IL2CPP::domain_get && IL2CPP::domain_get()) return true;
+        Sleep(100);
+    }
+    return false;
+}
+
 static DWORD WINAPI Main(LPVOID) {
     LogInit();
     SetUnhandledExceptionFilter(LogCrash);
     Log("=== nvapi64 iniciando ===");
 
-    while (!GetModuleHandleA("GameAssembly.dll")) Sleep(100);
-    Log("GameAssembly OK, aguardando...");
-    Sleep(3000);
+    if (!WaitModule("GameAssembly.dll", 60)) { Log("GameAssembly.dll nunca apareceu"); return 0; }
+    Log("GameAssembly OK, aguardando runtime...");
 
     if (!IL2CPP::Init()) { Log("IL2CPP::Init FALHOU"); return 0; }
+
+    if (!WaitDomain(60)) { Log("domain il2cpp nunca ficou pronta"); return 0; }
+    Log("domain OK");
+
+    Sleep(1500);   // deixa o Assembly-CSharp carregar antes de resolver
+
     if (!SDK::Init()) { Log("SDK::Init FALHOU"); return 0; }
 
     ConfigIO::Init();
     Log(">>> STAGE = %d", C.stage);
 
-    Hooks::InstallSwap();
+    if (!Hooks::InstallSwap()) Log("swap falhou");
     Hooks::g_sdkReady = true;
+    Hooks::g_hooksLive.store(true);
 
-    if (C.stage >= 2) Hooks::InstallLateUpdate();
+    if (C.stage >= 2) Hooks::InstallMainThread();
     Hooks::InstallCursor();
-    if (C.stage >= 3) { Combat::Install(); AntiCheat::Install(); }
 
-    Hooks::g_ready = true;
+    if (C.stage >= 3) {
+        Hooks::InstallCombat();
+        AntiCheat::Install();          // A1
+    }
+
     Log("=== TUDO PRONTO (stage %d) ===", C.stage);
 
-    while (true) Sleep(1000);
+    // loop do worker: SO input — nada de il2cpp aqui
+    bool lastMenu = false, lastPanic = false, lastSave = false, lastUnload = false;
+    while (!f::unloadReq.load()) {
+        bool menu = (GetAsyncKeyState(C.menuKey) & 0x8000) != 0;
+        bool panic = (GetAsyncKeyState(C.panicKey) & 0x8000) != 0;
+        bool save = (GetAsyncKeyState(C.saveKey) & 0x8000) != 0;
+        bool unload = (GetAsyncKeyState(C.unloadKey) & 0x8000) != 0;
+
+        if (menu && !lastMenu) { C.menuOpen = !C.menuOpen; Log("menu=%d", C.menuOpen ? 1 : 0); }
+        if (panic && !lastPanic) { Misc::Panic(); }
+        if (save && !lastSave) { ConfigIO::Save(); Log("config salva"); }
+        if (unload && !lastUnload) { f::unloadReq.store(true); }
+
+        lastMenu = menu; lastPanic = panic; lastSave = save; lastUnload = unload;
+        Sleep(8);
+    }
+
+    Hooks::Shutdown();
+    ConfigIO::Save();
+    Log("=== descarregado ===");
+    return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {

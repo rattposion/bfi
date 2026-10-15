@@ -11,20 +11,20 @@ namespace IL2CPP {
     Il2CppObject* (*type_get_object)(const Il2CppType*);
     const char* (*class_get_name)(Il2CppClass*);
     const char* (*class_get_namespace)(Il2CppClass*);
-    void* (*class_get_field_from_name)(Il2CppClass*, const char*);
-    void* (*class_get_fields)(Il2CppClass*, void**);
-    const char* (*field_get_name)(void*);
-    const Il2CppType* (*field_get_type)(void*);
-    size_t(*field_get_offset)(void*);
-    void (*field_static_get_value)(void*, void*);
+    FieldInfo* (*class_get_field_from_name)(Il2CppClass*, const char*);
+    FieldInfo* (*class_get_fields)(Il2CppClass*, void**);
+    const char* (*field_get_name)(FieldInfo*);
+    const Il2CppType* (*field_get_type)(FieldInfo*);
+    size_t(*field_get_offset)(FieldInfo*);
+    void           (*field_static_get_value)(FieldInfo*, void*);
     const MethodInfo* (*class_get_method_from_name)(Il2CppClass*, const char*, int);
     const MethodInfo* (*class_get_methods)(Il2CppClass*, void**);
     uint32_t(*method_get_param_count)(const MethodInfo*);
     const char* (*method_get_name)(const MethodInfo*);
     const Il2CppType* (*method_get_param)(const MethodInfo*, uint32_t);
     const Il2CppType* (*method_get_return_type)(const MethodInfo*);
-    const char* (*type_get_name)(const Il2CppType*);
-    Il2CppObject* (*runtime_invoke)(const MethodInfo*, void*, void**, Il2CppObject**);
+    char* (*type_get_name)(const Il2CppType*);
+    Il2CppObject* (*runtime_invoke)(const MethodInfo*, void*, void**, Il2CppException**);
     Il2CppDomain* (*thread_attach)(Il2CppDomain*);
     void* (*object_unbox)(Il2CppObject*);
     Il2CppString* (*string_new)(const char*);
@@ -33,13 +33,14 @@ namespace IL2CPP {
 
     static void EnsureAttached() {
         if (t_attached) return;
-        if (domain_get && thread_attach) thread_attach(domain_get());
         t_attached = true;
+        if (domain_get && thread_attach) thread_attach(domain_get());
     }
 
     bool Init() {
         HMODULE ga = GetModuleHandleA("GameAssembly.dll");
         if (!ga) { Log("GameAssembly.dll nao carregada"); return false; }
+
 #define R(f) f = (decltype(f))GetProcAddress(ga, "il2cpp_" #f)
         R(domain_get); R(domain_get_assemblies); R(assembly_get_image); R(class_from_name);
         R(class_get_parent); R(class_get_type); R(type_get_object);
@@ -50,38 +51,62 @@ namespace IL2CPP {
         R(method_get_param); R(method_get_return_type); R(type_get_name);
         R(runtime_invoke); R(thread_attach); R(object_unbox); R(string_new);
 #undef R
+        // nome real difere do macro
         class_from_type = (decltype(class_from_type))GetProcAddress(ga, "il2cpp_class_from_il2cpp_type");
 
-        bool ok = domain_get && class_from_name && runtime_invoke && class_get_field_from_name
+        bool ok = domain_get && domain_get_assemblies && assembly_get_image && class_from_name
+            && runtime_invoke && class_get_field_from_name && field_get_offset
             && class_get_methods && method_get_name && method_get_param
             && method_get_return_type && object_unbox && thread_attach
             && class_get_parent && class_get_type && type_get_object && class_get_fields
-            && class_from_type && field_get_type && field_get_name;
+            && class_from_type && field_get_type && field_get_name && type_get_name;
+
         Log("il2cpp init: %s", ok ? "OK" : "FALHOU");
         if (ok) EnsureAttached();
         return ok;
     }
 
-    std::string ToStr(Il2CppString* s) {
-        if (!s || s->length <= 0 || s->length > 512) return "";
-        std::string o; o.reserve(s->length);
-        for (int i = 0; i < s->length; i++) o.push_back((char)(s->chars[i] & 0xFF));
-        return o;
+    // ------------------------------------------------------------------ strings
+    void StrToUtf8(Il2CppObject* s, char* out, int outSize) {
+        if (outSize < 2) return;
+        out[0] = 0;
+        if (!s) return;
+        __try {
+            int len = *(int*)((uintptr_t)s + 0x10);
+            if (len <= 0) return;
+            if (len > outSize - 1) len = outSize - 1;
+            const wchar_t* src = (const wchar_t*)((uintptr_t)s + 0x14);
+            int n = WideCharToMultiByte(CP_UTF8, 0, src, len, out, outSize - 1, nullptr, nullptr);
+            out[n > 0 ? n : 0] = 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; }
     }
 
+    std::string ToStr(Il2CppString* s) {
+        if (!s) return "";
+        char buf[256];
+        StrToUtf8((Il2CppObject*)s, buf, sizeof(buf));
+        return std::string(buf);
+    }
+
+    // ------------------------------------------------------------------ invoke
     Il2CppObject* Invoke(const MethodInfo* m, void* obj, void** args) {
         if (!m || !m->methodPointer) return nullptr;
         EnsureAttached();
-        Il2CppObject* exc = nullptr;
-        __try { return runtime_invoke(m, obj, args, &exc); }
+        Il2CppException* exc = nullptr;
+        __try {
+            Il2CppObject* r = runtime_invoke(m, obj, args, &exc);
+            return exc ? nullptr : r;          // <- CORRIGIDO: excecao = resultado invalido
+        }
         __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
     }
 
-    const MethodInfo* FindOverload(Il2CppClass* cls, const char* name, std::initializer_list<const char*> types) {
+    // ------------------------------------------------------------------ search
+    const MethodInfo* FindOverload(Il2CppClass* cls, const char* name,
+        std::initializer_list<const char*> types) {
         if (!cls || !class_get_methods || !method_get_name) return nullptr;
         void* it = nullptr;
-        const MethodInfo* m = nullptr;
-        while ((m = class_get_methods(cls, &it))) {
+        while (const MethodInfo* m = class_get_methods(cls, &it)) {
             const char* mn = method_get_name(m);
             if (!mn || strcmp(mn, name)) continue;
             uint32_t pc = method_get_param_count ? method_get_param_count(m) : 0;
@@ -101,8 +126,7 @@ namespace IL2CPP {
     const MethodInfo* FindMethodByName(Il2CppClass* cls, const char* name, int paramCount) {
         if (!cls || !class_get_methods || !method_get_name) return nullptr;
         void* it = nullptr;
-        const MethodInfo* m = nullptr;
-        while ((m = class_get_methods(cls, &it))) {
+        while (const MethodInfo* m = class_get_methods(cls, &it)) {
             const char* mn = method_get_name(m);
             if (!mn || strcmp(mn, name)) continue;
             uint32_t pc = method_get_param_count ? method_get_param_count(m) : 0;
@@ -111,12 +135,66 @@ namespace IL2CPP {
         return nullptr;
     }
 
+    Il2CppClass* FindClassAny(const char* ns, const char* name) {
+        if (!domain_get || !domain_get_assemblies) return nullptr;
+        const Il2CppDomain* dom = domain_get();
+        if (!dom) return nullptr;
+        size_t count = 0;
+        Il2CppAssembly** asms = domain_get_assemblies((Il2CppDomain*)dom, &count);
+        if (!asms) return nullptr;
+        for (size_t i = 0; i < count; ++i) {
+            Il2CppImage* img = assembly_get_image(asms[i]);
+            if (!img) continue;
+            Il2CppClass* k = class_from_name(img, ns, name);
+            if (k) return k;
+        }
+        return nullptr;
+    }
+
+    uintptr_t OffsetOf(Il2CppClass* klass, const char* fname) {
+        if (!klass) return 0;
+        FieldInfo* f = class_get_field_from_name(klass, fname);
+        return f ? (uintptr_t)field_get_offset(f) : 0;
+    }
+
+    Il2CppClass* ClassOfField(Il2CppClass* owner, const char* fname) {
+        if (!owner) return nullptr;
+        FieldInfo* f = class_get_field_from_name(owner, fname);
+        if (!f) return nullptr;
+        const Il2CppType* t = field_get_type(f);
+        return t ? class_from_type(t) : nullptr;
+    }
+
+    void* StaticFieldPtr(Il2CppClass* klass, const char* name) {
+        if (!klass || !class_get_field_from_name || !field_static_get_value) return nullptr;
+        FieldInfo* f = class_get_field_from_name(klass, name);
+        if (!f) return nullptr;
+        void* out = nullptr;
+        field_static_get_value(f, &out);
+        return out;
+    }
+
+    const char* FieldTypeName(Il2CppClass* klass, const char* fname) {
+        if (!klass) return nullptr;
+        FieldInfo* f = class_get_field_from_name(klass, fname);
+        if (!f) return nullptr;
+        const Il2CppType* t = field_get_type(f);
+        if (!t || !type_get_name) return nullptr;
+        __try { return type_get_name(t); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    }
+
+    bool FieldIs(Il2CppClass* klass, const char* fname, const char* typeSubstr) {
+        const char* tn = FieldTypeName(klass, fname);
+        return tn && strstr(tn, typeSubstr) != nullptr;
+    }
+
+    // ------------------------------------------------------------------- dumps
     void DumpMethods(Il2CppClass* c, const char* name) {
         if (!c) { Log("  dump %s: SEM CLASSE", name); return; }
         void* it = nullptr;
-        const MethodInfo* m = nullptr;
         int found = 0;
-        while ((m = class_get_methods(c, &it))) {
+        while (const MethodInfo* m = class_get_methods(c, &it)) {
             const char* mn = method_get_name(m);
             if (!mn || strcmp(mn, name)) continue;
             char buf[256] = { 0 };
@@ -135,13 +213,12 @@ namespace IL2CPP {
     void DumpMethodsLike(Il2CppClass* c, const char* sub) {
         if (!c) return;
         void* it = nullptr;
-        const MethodInfo* m = nullptr;
         int n = 0;
-        while ((m = class_get_methods(c, &it))) {
+        while (const MethodInfo* m = class_get_methods(c, &it)) {
             const char* mn = method_get_name(m);
             if (!mn || !strstr(mn, sub)) continue;
             Log("  ~%s: %s(%u)", sub, mn, method_get_param_count(m));
-            if (++n > 25) break;
+            if (++n > 30) break;
         }
         if (!n) Log("  ~%s: nada", sub);
     }
@@ -149,14 +226,13 @@ namespace IL2CPP {
     void DumpFields(Il2CppClass* c, const char* label) {
         if (!c) { Log("  [%s] SEM CLASSE", label); return; }
         void* it = nullptr;
-        void* f = nullptr;
         int n = 0;
-        while ((f = class_get_fields(c, &it))) {
+        while (FieldInfo* f = class_get_fields(c, &it)) {
             const char* fn = field_get_name ? field_get_name(f) : "?";
             const Il2CppType* ft = field_get_type ? field_get_type(f) : nullptr;
             const char* tn = (ft && type_get_name) ? type_get_name(ft) : "?";
-            Log("  [%s] %s : %s", label, fn ? fn : "?", tn ? tn : "?");
-            if (++n > 250) break;
+            Log("  [%s] %s : %s @0x%X", label, fn ? fn : "?", tn ? tn : "?", (unsigned)field_get_offset(f));
+            if (++n > 600) break;
         }
         Log("  [%s] total %d campos", label, n);
     }

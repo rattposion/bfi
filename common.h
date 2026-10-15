@@ -15,16 +15,14 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include <cmath>
 #include <algorithm>
 #include <initializer_list>
 
 #include "imgui.h"
-#include "imgui_impl_win32.h"
-#include "imgui_impl_opengl3.h"
 #include "MinHook.h"
 
-// sua versao do imgui pode nao declarar isso no header:
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 extern HMODULE g_hModule;
@@ -37,9 +35,11 @@ struct Vec3 {
     Vec3 operator+(const Vec3& o) const { return Vec3(x + o.x, y + o.y, z + o.z); }
     Vec3 operator-(const Vec3& o) const { return Vec3(x - o.x, y - o.y, z - o.z); }
     Vec3 operator*(float s) const { return Vec3(x * s, y * s, z * s); }
-    float len() const { return sqrtf(x * x + y * y + z * z); }
+    float len()  const { return sqrtf(x * x + y * y + z * z); }
     float dist(const Vec3& o) const { return (*this - o).len(); }
+    bool  zero() const { return x == 0.f && y == 0.f && z == 0.f; }
 };
+struct Quat { float x, y, z, w; };
 
 void LogInit();
 void Log(const char* fmt, ...);
