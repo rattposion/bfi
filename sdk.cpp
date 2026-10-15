@@ -1,6 +1,5 @@
 // ============================================================================
-//  sdk.cpp — desembrulha SyncVar do FishNet (health/team/username),
-//  corrige head/feet, dump de hierarquia.
+//  sdk.cpp — UTF-16->UTF-8 (corrige nome E bones), SyncVar, raiz de osso certa
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -115,6 +114,29 @@ namespace IL2CPP_API {
 #define SE_BEGIN __try
 #define SE_END   __except (EXCEPTION_EXECUTE_HANDLER)
 
+// ---------------------------------------------------------------------------
+//  IL2CPP guarda string em UTF-16. il2cpp_string_chars devolve o buffer cru
+//  como char*, entao strlen para no 1o byte zero -> "Player" vira "P".
+//  Esta conversao resolve nomes E a busca de ossos.
+// ---------------------------------------------------------------------------
+static void StrToUtf8(Il2CppString* s, char* out, int outSize) {
+    if (!out || outSize < 2) return;
+    out[0] = 0;
+    if (!s) return;
+    SE_BEGIN{
+        int len = *(int*)((uintptr_t)s + 0x10);
+        if (len <= 0) { out[0] = 0; }
+        else {
+            int maxc = outSize - 1;
+            if (len > maxc) len = maxc;
+            const wchar_t* src = (const wchar_t*)((uintptr_t)s + 0x14);
+            int n = WideCharToMultiByte(CP_UTF8, 0, src, len, out, maxc, nullptr, nullptr);
+            out[(n > 0 && n < outSize) ? n : 0] = 0;
+        }
+    }
+    SE_END{ out[0] = 0; }
+}
+
 static Il2CppDomain* se_domain_get() {
     Il2CppDomain* r = nullptr;
     SE_BEGIN{ if (il2cpp_domain_get) r = il2cpp_domain_get(); } SE_END{ r = nullptr; }
@@ -216,11 +238,6 @@ static Il2CppObject* se_type_get_object(Il2CppType* t) {
 static Il2CppType* se_class_get_type(Il2CppClass* k) {
     Il2CppType* r = nullptr;
     SE_BEGIN{ if (il2cpp_class_get_type) r = il2cpp_class_get_type(k); } SE_END{ r = nullptr; }
-    return r;
-}
-static const char* se_string_chars(Il2CppString* s) {
-    const char* r = nullptr;
-    SE_BEGIN{ if (il2cpp_string_chars) r = il2cpp_string_chars(s); } SE_END{ r = nullptr; }
     return r;
 }
 static bool se_read_bytes(void* src, void* dst, size_t len) {
@@ -335,8 +352,8 @@ namespace SDK {
     static const int kMaxTargets = MAX_TARGETS;
 
     // ======================= pick de campo =======================
-    uint32_t PickFieldOff(Il2CppClass* k, std::initializer_list<const char*> names,
-        const char* typeSub) {
+    static uint32_t FindTypedField(Il2CppClass* k, std::initializer_list<const char*> names,
+        const char* typeSub, const char** outName = nullptr) {
         if (!k) return 0;
         for (Il2CppClass* c = k; c; c = se_class_parent(c)) {
             for (const char* n : names) {
@@ -347,11 +364,17 @@ namespace SDK {
                     const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
                     if (!tn || !strstr(tn, typeSub)) continue;
                 }
+                if (outName) *outName = n;
                 uint32_t o = (uint32_t)se_field_offset(f);
                 if (o) return o;
             }
         }
         return 0;
+    }
+
+    uint32_t PickFieldOff(Il2CppClass* k, std::initializer_list<const char*> names,
+        const char* typeSub) {
+        return FindTypedField(k, names, typeSub);
     }
 
     static const char* FieldTypeOf(Il2CppClass* k, const char* name) {
@@ -363,11 +386,26 @@ namespace SDK {
     }
 
     // ======================= SyncVar (FishNet) =======================
-    // _health / mpTeamNumber / username sao SyncVar<T> (objeto). O valor real
-    // esta no campo interno. Isto devolve o endereco do valor interno, ou 0.
     struct SyncCacheEntry { Il2CppClass* cls; uint32_t off; };
     static SyncCacheEntry g_syncCache[16];
     static int g_syncCacheN = 0;
+    static bool g_syncDumped = false;
+
+    static void DumpSyncVarFields(Il2CppClass* k) {
+        Log("[sync] ---- fields de %s ----", se_class_name(k));
+        void* it = nullptr;
+        int n = 0;
+        for (;;) {
+            FieldInfo* f = se_class_get_fields(k, &it);
+            if (!f) break;
+            const char* fn = se_field_name(f);
+            const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+            Log("[sync]   %-22s : %s @0x%X", fn ? fn : "?", tn ? tn : "?", (unsigned)se_field_offset(f));
+            if (++n > 40) break;
+        }
+        Log("[sync] ---- fim ----");
+    }
 
     static uintptr_t SyncVarValueAddr(Il2CppObject* holder, uint32_t off, const char* typeSub) {
         if (!holder || !off) return 0;
@@ -387,16 +425,17 @@ namespace SDK {
             if (g_syncCache[i].cls == k) { foff = g_syncCache[i].off; break; }
 
         if (!foff) {
-            foff = PickFieldOff(k, { "_value", "value", "Value", "<Value>k__BackingField",
-                                     "m_Value", "_currentValue", "currentValue" }, typeSub);
+            const char* fname = "?";
+            foff = FindTypedField(k, { "_value", "value", "Value", "<Value>k__BackingField",
+                                       "m_Value", "_currentValue", "currentValue" }, typeSub, &fname);
             if (!foff)
-                foff = PickFieldOff(k, { "_value", "value", "Value", "<Value>k__BackingField" });
+                foff = FindTypedField(k, { "_value", "value", "Value", "<Value>k__BackingField" }, nullptr, &fname);
+
             if (g_syncCacheN < 16) {
-                g_syncCache[g_syncCacheN].cls = k;
-                g_syncCache[g_syncCacheN].off = foff;
-                ++g_syncCacheN;
+                g_syncCache[g_syncCacheN].cls = k; g_syncCache[g_syncCacheN].off = foff; ++g_syncCacheN;
             }
-            Log("[sync] %s -> campo 0x%X (%s)", kn, foff, typeSub);
+            Log("[sync] %s -> %s @0x%X (%s)", kn, fname, foff, typeSub);
+            if (!g_syncDumped) { g_syncDumped = true; DumpSyncVarFields(k); }
         }
         if (!foff) return 0;
         return (uintptr_t)obj + foff;
@@ -417,23 +456,34 @@ namespace SDK {
 
     static int ReadTeam(Il2CppObject* e) {
         if (!e || !O_team) return 0;
-        uintptr_t a = SyncVarValueAddr(e, O_team, "Int32");
-        if (a) return SafeRead<int>(a, 0);
-        return SafeRead<int>((uintptr_t)e + O_team, 0);
+        uintptr_t a = SyncVarValueAddr(e, O_team, "Byte");
+        if (!a) a = SyncVarValueAddr(e, O_team, "Int32");
+        if (a) {
+            unsigned char b = SafeRead<unsigned char>(a, 0);
+            return (int)b;
+        }
+        return SafeRead<int>((uintptr_t)e + O_team, 0) & 0xFF;
     }
 
-    static const char* ReadStringField(Il2CppObject* o, uint32_t off) {
-        if (!o || !off) return nullptr;
+    static bool ReadStringField(Il2CppObject* o, uint32_t off, char* out, int n) {
+        if (!o || !off || !out || n <= 0) return false;
+        out[0] = 0;
+
         void* p = nullptr;
-        if (!se_read_ptr(o, (size_t)off, &p) || !p) return nullptr;
+        if (!se_read_ptr(o, (size_t)off, &p) || !p) return false;
 
         uintptr_t a = SyncVarValueAddr(o, off, "String");
+        Il2CppString* str = nullptr;
         if (a) {
             void* sp = nullptr;
-            if (!se_read_ptr((void*)a, 0, &sp) || !sp) return nullptr;
-            return se_string_chars((Il2CppString*)sp);
+            if (!se_read_ptr((void*)a, 0, &sp) || !sp) return false;
+            str = (Il2CppString*)sp;
         }
-        return se_string_chars((Il2CppString*)p);
+        else {
+            str = (Il2CppString*)p;
+        }
+        StrToUtf8(str, out, n);
+        return out[0] != 0;
     }
 
     // ======================= cache de classes =======================
@@ -702,15 +752,17 @@ namespace SDK {
         out[0] = 0;
         if (!o) return;
 
-        if (O_name) {
-            const char* s = ReadStringField(o, O_name);
-            if (PlausibleName(s)) { strncpy_s(out, (size_t)n, s, _TRUNCATE); return; }
+        char buf[64];
+
+        if (O_name && ReadStringField(o, O_name, buf, sizeof(buf)) && PlausibleName(buf)) {
+            strncpy_s(out, (size_t)n, buf, _TRUNCATE);
+            return;
         }
         for (uint32_t off : g_strOffs) {
-            const char* s = ReadStringField(o, off);
-            if (!PlausibleName(s)) continue;
-            if (!g_pickedNameOff) { g_pickedNameOff = off; Log("[sdk] campo de nome = 0x%X (\"%s\")", off, s); }
-            strncpy_s(out, (size_t)n, s, _TRUNCATE);
+            if (!ReadStringField(o, off, buf, sizeof(buf))) continue;
+            if (!PlausibleName(buf)) continue;
+            if (!g_pickedNameOff) { g_pickedNameOff = off; Log("[sdk] campo de nome = 0x%X (\"%s\")", off, buf); }
+            strncpy_s(out, (size_t)n, buf, _TRUNCATE);
             return;
         }
     }
@@ -732,6 +784,7 @@ namespace SDK {
         Log("[str] ---- campos String de %s ----", se_class_name(k));
         void* iter = nullptr;
         int n = 0;
+        char buf[96];
         for (;;) {
             FieldInfo* f = se_class_get_fields(k, &iter);
             if (!f) break;
@@ -742,8 +795,10 @@ namespace SDK {
             if (!tn || !strstr(tn, "String")) continue;
             uint32_t off = (uint32_t)se_field_offset(f);
             if (!off) continue;
-            const char* s = ReadStringField(inst, off);
-            Log("[str]   %s @0x%X = \"%s\"", fn, off, s ? s : "(null)");
+            if (ReadStringField(inst, off, buf, sizeof(buf)))
+                Log("[str]   %s @0x%X = \"%s\"", fn, off, buf);
+            else
+                Log("[str]   %s @0x%X = (vazio)", fn, off);
             if (++n > 25) break;
         }
         Log("[str] ---- fim ----");
@@ -762,13 +817,12 @@ namespace SDK {
             Il2CppClass* k = se_object_get_class(cur);
             if (!k) continue;
 
+            char nm[128] = "?";
             MethodInfo* gn = se_class_get_method_from_name(k, "get_name", 0);
-            const char* nm = nullptr;
             if (gn) {
                 Il2CppObject* s = se_runtime_invoke(gn, cur, nullptr);
-                if (s) nm = se_string_chars((Il2CppString*)s);
+                if (s) StrToUtf8((Il2CppString*)s, nm, sizeof(nm));
             }
-            Log("[hier] %s", nm ? nm : "?");
 
             int cc = 0;
             MethodInfo* gc = se_class_get_method_from_name(k, "get_childCount", 0);
@@ -776,6 +830,9 @@ namespace SDK {
                 Il2CppObject* b = se_runtime_invoke(gc, cur, nullptr);
                 if (b) { void* p = se_object_unbox(b); if (p) cc = *(int*)p; }
             }
+
+            Log("[hier] %-40s filhos=%d", nm, cc);
+
             MethodInfo* gch = se_class_get_method_from_name(k, "GetChild", 1);
             if (!gch) continue;
             if (!kInt32) kInt32 = FindClass("Int32", "System");
@@ -819,8 +876,11 @@ namespace SDK {
             if (!M_get_name) M_get_name = se_class_get_method_from_name(k, "get_name", 0);
             if (M_get_name) {
                 Il2CppObject* s = se_runtime_invoke(M_get_name, cur, nullptr);
-                const char* nm = s ? se_string_chars((Il2CppString*)s) : nullptr;
-                if (nm && strstr(nm, sub)) return cur;
+                if (s) {
+                    char nm[128];
+                    StrToUtf8((Il2CppString*)s, nm, sizeof(nm));
+                    if (nm[0] && strstr(nm, sub)) return cur;
+                }
             }
 
             if (!M_get_childCount) M_get_childCount = se_class_get_method_from_name(k, "get_childCount", 0);
@@ -1047,7 +1107,6 @@ namespace SDK {
     }
 
     // ======================= alvos =======================
-    // NAO sobrescrever feet/head aqui
     static void SyncAliases(Target& t) {
         t.obj = t.player;
         t.hp = t.health;
@@ -1175,32 +1234,33 @@ namespace SDK {
                 const char* en = ek ? se_class_name(ek) : nullptr;
                 tgt.npc = (en && strstr(en, "NPC") != nullptr);
 
-                Il2CppObject* boneRoot = CachedTransform(e);
+                // raiz de bones: transform do proprio player (primario)
+                Il2CppObject* playerTf = CachedTransform(e);
+                Il2CppObject* animTf = nullptr;
                 if (O_humanMeshAnimator) {
                     Il2CppObject* anim = SafeReadObjPub(e, O_humanMeshAnimator);
-                    if (anim) {
-                        Il2CppObject* at = ResolveGetTransform(anim);
-                        if (at) boneRoot = at;
-                    }
-                }
-                if (O_humanMeshReferences) {
-                    Il2CppObject* refs = SafeReadObjPub(e, O_humanMeshReferences);
-                    if (refs) {
-                        Il2CppObject* rt = ResolveGetTransform(refs);
-                        if (rt && !boneRoot) boneRoot = rt;
-                    }
+                    if (anim) animTf = ResolveGetTransform(anim);
                 }
 
                 static bool hierDumped = false;
-                if (!hierDumped && boneRoot) {
+                if (!hierDumped) {
                     hierDumped = true;
-                    Log("[hier] ---- raiz de bones do alvo ----");
-                    LogHierarchy(boneRoot, 120);
+                    Log("[hier] ---- player transform ----");
+                    LogHierarchy(playerTf, 80);
+                    if (animTf && animTf != playerTf) {
+                        Log("[hier] ---- animator transform ----");
+                        LogHierarchy(animTf, 80);
+                    }
                     Log("[hier] ---- fim ----");
                 }
 
-                tgt.headBone = FindBoneAny(boneRoot, kHeads, 7);
-                tgt.footBone = FindBoneAny(boneRoot, kFeet, 7);
+                tgt.headBone = FindBoneAny(playerTf, kHeads, 7);
+                tgt.footBone = FindBoneAny(playerTf, kFeet, 7);
+                if ((!tgt.headBone || !tgt.footBone) && animTf && animTf != playerTf) {
+                    if (!tgt.headBone) tgt.headBone = FindBoneAny(animTf, kHeads, 7);
+                    if (!tgt.footBone) tgt.footBone = FindBoneAny(animTf, kFeet, 7);
+                }
+
                 ResolveHeadFeet(tgt);
 
                 tgt.onScreen = false;
@@ -1381,12 +1441,12 @@ namespace SDK {
         O_cam = O_camTf;
         O_rotationIsQuat = true;
 
-        Log("[sdk] offsets: hp=0x%X(%s) name=0x%X(%s) team=0x%X(%s) rot=0x%X(%s) camTf=0x%X anim=0x%X refs=0x%X",
+        Log("[sdk] offsets: hp=0x%X(%s) name=0x%X(%s) team=0x%X(%s) rot=0x%X(%s) camTf=0x%X anim=0x%X",
             O_health, FieldTypeOf(kPlayerScript, "_health"),
             O_name, FieldTypeOf(kPlayerScript, "username"),
             O_team, FieldTypeOf(kPlayerScript, "mpTeamNumber"),
             O_rotation, FieldTypeOf(kPlayerScript, "rotation"),
-            O_camTf, O_humanMeshAnimator, O_humanMeshReferences);
+            O_camTf, O_humanMeshAnimator);
     }
 
     static void ResolveMethods() {
