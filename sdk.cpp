@@ -1,6 +1,6 @@
 // ============================================================================
-//  sdk.cpp — scan PlayerScript+Entity, aim pela cameraTransform, nome auto,
-//  vivo por _health, refresh 200ms.
+//  sdk.cpp — desembrulha SyncVar do FishNet (health/team/username),
+//  corrige head/feet, dump de hierarquia.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -329,12 +329,12 @@ namespace SDK {
     static std::unordered_map<Il2CppObject*, Il2CppObject*> g_tfCache;
     static std::unordered_map<Il2CppClass*, MethodInfo*>     g_getPosMx;
 
-    static std::vector<uint32_t> g_strOffs;      // campos string do PlayerScript
+    static std::vector<uint32_t> g_strOffs;
     static uint32_t g_pickedNameOff = 0;
 
     static const int kMaxTargets = MAX_TARGETS;
 
-    // ======================= pick de campo por nome + tipo =======================
+    // ======================= pick de campo =======================
     uint32_t PickFieldOff(Il2CppClass* k, std::initializer_list<const char*> names,
         const char* typeSub) {
         if (!k) return 0;
@@ -360,6 +360,80 @@ namespace SDK {
         const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
         const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
         return tn ? tn : "?";
+    }
+
+    // ======================= SyncVar (FishNet) =======================
+    // _health / mpTeamNumber / username sao SyncVar<T> (objeto). O valor real
+    // esta no campo interno. Isto devolve o endereco do valor interno, ou 0.
+    struct SyncCacheEntry { Il2CppClass* cls; uint32_t off; };
+    static SyncCacheEntry g_syncCache[16];
+    static int g_syncCacheN = 0;
+
+    static uintptr_t SyncVarValueAddr(Il2CppObject* holder, uint32_t off, const char* typeSub) {
+        if (!holder || !off) return 0;
+
+        void* p = nullptr;
+        if (!se_read_ptr(holder, (size_t)off, &p) || !p) return 0;
+
+        Il2CppObject* obj = (Il2CppObject*)p;
+        Il2CppClass* k = se_object_get_class(obj);
+        if (!k) return 0;
+
+        const char* kn = se_class_name(k);
+        if (!kn || !strstr(kn, "SyncVar")) return 0;
+
+        uint32_t foff = 0;
+        for (int i = 0; i < g_syncCacheN; ++i)
+            if (g_syncCache[i].cls == k) { foff = g_syncCache[i].off; break; }
+
+        if (!foff) {
+            foff = PickFieldOff(k, { "_value", "value", "Value", "<Value>k__BackingField",
+                                     "m_Value", "_currentValue", "currentValue" }, typeSub);
+            if (!foff)
+                foff = PickFieldOff(k, { "_value", "value", "Value", "<Value>k__BackingField" });
+            if (g_syncCacheN < 16) {
+                g_syncCache[g_syncCacheN].cls = k;
+                g_syncCache[g_syncCacheN].off = foff;
+                ++g_syncCacheN;
+            }
+            Log("[sync] %s -> campo 0x%X (%s)", kn, foff, typeSub);
+        }
+        if (!foff) return 0;
+        return (uintptr_t)obj + foff;
+    }
+
+    static float ReadHealth(Il2CppObject* e) {
+        if (!e || !O_health) return 100.f;
+
+        float hp;
+        uintptr_t a = SyncVarValueAddr(e, O_health, "Single");
+        if (a) hp = SafeRead<float>(a, 100.f);
+        else   hp = se_read_float(e, O_health);
+
+        if (!(hp >= 0.f && hp <= 100000.f)) return 100.f;
+        if (hp > 0.f && hp <= 1.5f) hp *= 100.f;
+        return hp;
+    }
+
+    static int ReadTeam(Il2CppObject* e) {
+        if (!e || !O_team) return 0;
+        uintptr_t a = SyncVarValueAddr(e, O_team, "Int32");
+        if (a) return SafeRead<int>(a, 0);
+        return SafeRead<int>((uintptr_t)e + O_team, 0);
+    }
+
+    static const char* ReadStringField(Il2CppObject* o, uint32_t off) {
+        if (!o || !off) return nullptr;
+        void* p = nullptr;
+        if (!se_read_ptr(o, (size_t)off, &p) || !p) return nullptr;
+
+        uintptr_t a = SyncVarValueAddr(o, off, "String");
+        if (a) {
+            void* sp = nullptr;
+            if (!se_read_ptr((void*)a, 0, &sp) || !sp) return nullptr;
+            return se_string_chars((Il2CppString*)sp);
+        }
+        return se_string_chars((Il2CppString*)p);
     }
 
     // ======================= cache de classes =======================
@@ -516,7 +590,7 @@ namespace SDK {
         se_runtime_invoke(sp, node, args);
     }
 
-    // ======================= rotacao da camera =======================
+    // ======================= rotacao =======================
     Il2CppObject* CamTfObj() {
         if (!g_localPlayer || !O_camTf) return nullptr;
         return (Il2CppObject*)SafeReadObjPub(g_localPlayer, O_camTf);
@@ -528,11 +602,10 @@ namespace SDK {
         if (!kQuaternion) return out;
         if (!M_lookRot) M_lookRot = se_class_get_method_from_name(kQuaternion, "LookRotation", 1);
         if (!M_lookRot) return out;
-
-        Il2CppObject* bv = nullptr;
         if (!kVector3) kVector3 = FindClass("Vector3", "UnityEngine");
         if (!kVector3) return out;
-        bv = se_object_new(kVector3);
+
+        Il2CppObject* bv = se_object_new(kVector3);
         if (!bv) return out;
         void* bp = se_object_unbox(bv);
         if (!bp) return out;
@@ -587,29 +660,15 @@ namespace SDK {
         return false;
     }
 
-    static float ReadHealth(Il2CppObject* e) {
-        if (!e || !O_health) return 100.f;
-        float hp = se_read_float(e, O_health);
-        if (!(hp >= 0.f && hp <= 100000.f)) {
-            int hpi = 0; se_read_int(e, O_health, &hpi);
-            if (hpi >= 0 && hpi <= 100000) hp = (float)hpi;
-        }
-        if (!(hp >= 0.f && hp <= 100000.f)) return 100.f;
-        if (hp > 1.5f && hp <= 150.f) return hp;        // escala 0..100
-        if (hp >= 0.f && hp <= 1.5f) return hp * 100.f; // escala 0..1
-        return hp;
-    }
-
     float GetHealth(Il2CppObject* o) { return ReadHealth(o); }
 
     bool IsEnemy(Il2CppObject* o) {
         if (!o) return false;
         if (!O_team) return true;
-        int team = 0; se_read_int(o, O_team, &team);
-        return team != g_localTeam;
+        return ReadTeam(o) != g_localTeam;
     }
 
-    // ======================= nome automatico =======================
+    // ======================= nome =======================
     static void BuildStringOffsets() {
         g_strOffs.clear();
         if (!kPlayerScript) return;
@@ -643,20 +702,12 @@ namespace SDK {
         out[0] = 0;
         if (!o) return;
 
-        // 1) offset explicito, se resolver
         if (O_name) {
-            void* sp = nullptr;
-            if (se_read_ptr(o, (size_t)O_name, &sp) && sp) {
-                const char* s = se_string_chars((Il2CppString*)sp);
-                if (PlausibleName(s)) { strncpy_s(out, (size_t)n, s, _TRUNCATE); return; }
-            }
+            const char* s = ReadStringField(o, O_name);
+            if (PlausibleName(s)) { strncpy_s(out, (size_t)n, s, _TRUNCATE); return; }
         }
-
-        // 2) varre os campos string do PlayerScript
         for (uint32_t off : g_strOffs) {
-            void* sp = nullptr;
-            if (!se_read_ptr(o, off, &sp) || !sp) continue;
-            const char* s = se_string_chars((Il2CppString*)sp);
+            const char* s = ReadStringField(o, off);
             if (!PlausibleName(s)) continue;
             if (!g_pickedNameOff) { g_pickedNameOff = off; Log("[sdk] campo de nome = 0x%X (\"%s\")", off, s); }
             strncpy_s(out, (size_t)n, s, _TRUNCATE);
@@ -691,38 +742,57 @@ namespace SDK {
             if (!tn || !strstr(tn, "String")) continue;
             uint32_t off = (uint32_t)se_field_offset(f);
             if (!off) continue;
-            void* sp = nullptr;
-            if (!se_read_ptr(inst, off, &sp) || !sp) { Log("[str]   %s @0x%X = (null)", fn, off); continue; }
-            const char* s = se_string_chars((Il2CppString*)sp);
-            Log("[str]   %s @0x%X = \"%s\"", fn, off, s ? s : "?");
+            const char* s = ReadStringField(inst, off);
+            Log("[str]   %s @0x%X = \"%s\"", fn, off, s ? s : "(null)");
             if (++n > 25) break;
         }
         Log("[str] ---- fim ----");
     }
 
-    static void DumpFloatFields(Il2CppObject* inst) {
-        if (!inst) return;
-        Il2CppClass* k = se_object_get_class(inst);
-        if (!k) return;
-        Log("[flt] ---- campos float de %s ----", se_class_name(k));
-        void* iter = nullptr;
-        int n = 0;
-        for (;;) {
-            FieldInfo* f = se_class_get_fields(k, &iter);
-            if (!f) break;
-            const char* fn = se_field_name(f);
-            if (!fn) continue;
-            const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
-            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-            if (!tn || !strstr(tn, "Single")) continue;
-            uint32_t off = (uint32_t)se_field_offset(f);
-            if (!off) continue;
-            float v = se_read_float(inst, off);
-            if (!(v >= -1000.f && v <= 100000.f)) continue;
-            Log("[flt]   %s @0x%X = %.3f", fn, off, (double)v);
-            if (++n > 30) break;
+    static void LogHierarchy(Il2CppObject* root, int maxNodes) {
+        if (!root) { Log("[hier] raiz nula"); return; }
+        static Il2CppObject* stk[1024];
+        int top = 0;
+        stk[top++] = root;
+        int visited = 0;
+
+        while (top > 0 && visited < maxNodes) {
+            Il2CppObject* cur = stk[--top];
+            if (!cur) continue;
+            Il2CppClass* k = se_object_get_class(cur);
+            if (!k) continue;
+
+            MethodInfo* gn = se_class_get_method_from_name(k, "get_name", 0);
+            const char* nm = nullptr;
+            if (gn) {
+                Il2CppObject* s = se_runtime_invoke(gn, cur, nullptr);
+                if (s) nm = se_string_chars((Il2CppString*)s);
+            }
+            Log("[hier] %s", nm ? nm : "?");
+
+            int cc = 0;
+            MethodInfo* gc = se_class_get_method_from_name(k, "get_childCount", 0);
+            if (gc) {
+                Il2CppObject* b = se_runtime_invoke(gc, cur, nullptr);
+                if (b) { void* p = se_object_unbox(b); if (p) cc = *(int*)p; }
+            }
+            MethodInfo* gch = se_class_get_method_from_name(k, "GetChild", 1);
+            if (!gch) continue;
+            if (!kInt32) kInt32 = FindClass("Int32", "System");
+            if (!kInt32) continue;
+
+            for (int i = 0; i < cc && top < 1024; ++i) {
+                Il2CppObject* bi = se_object_new(kInt32);
+                if (!bi) break;
+                void* bp = se_object_unbox(bi);
+                if (!bp) break;
+                *(int*)bp = i;
+                void* a[1]; a[0] = bi;
+                Il2CppObject* c = se_runtime_invoke(gch, cur, a);
+                if (c) stk[top++] = c;
+            }
+            ++visited;
         }
-        Log("[flt] ---- fim ----");
     }
 
     // ======================= bones =======================
@@ -796,12 +866,10 @@ namespace SDK {
             Il2CppObject* c = se_runtime_invoke(m, nullptr, nullptr);
             if (c) return c;
         }
-
         if (g_localPlayer && O_mCamera) {
             Il2CppObject* c = SafeReadObjPub(g_localPlayer, O_mCamera);
             if (c && IsA(c, kCamera)) return c;
         }
-
         if (g_localPlayer && O_camTf) {
             Il2CppObject* tf = SafeReadObjPub(g_localPlayer, O_camTf);
             if (tf) {
@@ -822,12 +890,10 @@ namespace SDK {
                 }
             }
         }
-
         if (MethodInfo* m = se_class_get_method_from_name(kCamera, "get_current", 0)) {
             Il2CppObject* c = se_runtime_invoke(m, nullptr, nullptr);
             if (c) return c;
         }
-
         if (MethodInfo* m = se_class_get_method_from_name(kCamera, "get_allCameras", 0)) {
             Il2CppArray* arr = (Il2CppArray*)se_runtime_invoke(m, nullptr, nullptr);
             if (arr && il2cpp_array_length && il2cpp_array_length(arr) > 0)
@@ -981,9 +1047,9 @@ namespace SDK {
     }
 
     // ======================= alvos =======================
+    // NAO sobrescrever feet/head aqui
     static void SyncAliases(Target& t) {
         t.obj = t.player;
-        t.feet = t.pos;
         t.hp = t.health;
         t.enemy = (O_team == 0) ? true : (t.team != g_localTeam);
         t.lastSeen = GetTickCount64();
@@ -1036,7 +1102,7 @@ namespace SDK {
         if (!e || g_localPlayer) return;
         g_localPlayer = e;
         g_local = e;
-        if (O_team) { int tm = 0; if (se_read_int(e, O_team, &tm)) g_localTeam = tm; }
+        g_localTeam = ReadTeam(e);
         Log("[sdk] localPlayer encontrado no scan (%p) team=%d", e, g_localTeam);
     }
 
@@ -1049,9 +1115,9 @@ namespace SDK {
         if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
 
         Il2CppClass* oc = FindClass("Object", "UnityEngine");
-        if (!oc) { Log("[sdk] UnityEngine.Object nao encontrada"); return; }
+        if (!oc) return;
         MethodInfo* fot = se_class_get_method_from_name(oc, "FindObjectsOfType", 1);
-        if (!fot) { Log("[sdk] FindObjectsOfType nao encontrado"); return; }
+        if (!fot) return;
 
         Il2CppClass* scans[2] = {
             kPlayerScript ? kPlayerScript : FindClass("PlayerScript"),
@@ -1100,9 +1166,7 @@ namespace SDK {
                 tgt.health = ReadHealth(e);
                 tgt.hp = tgt.health;
                 tgt.alive = (tgt.health > 0.5f);
-                if (O_alive && O_health == 0) tgt.alive = se_read_bool(e, O_alive);
-
-                if (O_team) se_read_int(e, O_team, &tgt.team);
+                tgt.team = ReadTeam(e);
                 tgt.pos = GetPos(e);
                 if (O_weapon) se_read_int(e, O_weapon, &tgt.weapon);
                 GetNameBuf(e, tgt.name, sizeof(tgt.name));
@@ -1118,6 +1182,21 @@ namespace SDK {
                         Il2CppObject* at = ResolveGetTransform(anim);
                         if (at) boneRoot = at;
                     }
+                }
+                if (O_humanMeshReferences) {
+                    Il2CppObject* refs = SafeReadObjPub(e, O_humanMeshReferences);
+                    if (refs) {
+                        Il2CppObject* rt = ResolveGetTransform(refs);
+                        if (rt && !boneRoot) boneRoot = rt;
+                    }
+                }
+
+                static bool hierDumped = false;
+                if (!hierDumped && boneRoot) {
+                    hierDumped = true;
+                    Log("[hier] ---- raiz de bones do alvo ----");
+                    LogHierarchy(boneRoot, 120);
+                    Log("[hier] ---- fim ----");
                 }
 
                 tgt.headBone = FindBoneAny(boneRoot, kHeads, 7);
@@ -1144,11 +1223,10 @@ namespace SDK {
         if (!dumped && g_targetCount > 0) {
             dumped = true;
             Target& t = g_targets[0];
-            Log("[diag] alvo=%p pos=(%.2f,%.2f,%.2f) head=(%.2f,%.2f,%.2f) feet=(%.2f,%.2f,%.2f) hb=%p fb=%p hp=%.1f nome=\"%s\"",
+            Log("[diag] alvo=%p pos=(%.2f,%.2f,%.2f) head=(%.2f,%.2f,%.2f) feet=(%.2f,%.2f,%.2f) hb=%p fb=%p hp=%.1f team=%d nome=\"%s\"",
                 t.player, t.pos.x, t.pos.y, t.pos.z, t.head.x, t.head.y, t.head.z,
-                t.feet.x, t.feet.y, t.feet.z, t.headBone, t.footBone, t.health, t.name);
+                t.feet.x, t.feet.y, t.feet.z, t.headBone, t.footBone, t.health, t.team, t.name);
             DumpStringFields(t.player);
-            DumpFloatFields(t.player);
         }
     }
 
@@ -1167,8 +1245,6 @@ namespace SDK {
 
             t.health = ReadHealth(t.player);
             t.alive = (t.health > 0.5f);
-            if (O_alive && O_health == 0) t.alive = se_read_bool(t.player, O_alive);
-
             t.pos = GetPos(t.player);
             ResolveHeadFeet(t);
 
@@ -1206,7 +1282,6 @@ namespace SDK {
     }
 
     // ======================= aim =======================
-    // agora salva/aplica a rotacao da CAMERA (que e o que define a mira)
     bool AimLock(Il2CppObject* target, Quat& savedOriginal) {
         Il2CppObject* camTf = CamTfObj();
         if (!target || !camTf) return false;
@@ -1230,10 +1305,9 @@ namespace SDK {
         return true;
     }
 
-    void RestoreAim(Il2CppObject* /*p*/, const Quat& q) {
+    void RestoreAim(Il2CppObject*, const Quat& q) {
         Il2CppObject* camTf = CamTfObj();
-        if (!camTf) return;
-        SetRot(camTf, q);
+        if (camTf) SetRot(camTf, q);
     }
 
     void FireBulletAt(Vec3 pos) {
@@ -1254,7 +1328,6 @@ namespace SDK {
     // ======================= init / shutdown =======================
     void Shutdown() {
         g_phase = "sdk.shutdown";
-        Log("[sdk] Shutdown");
         g_localPlayer = nullptr;
         g_local = nullptr;
         g_camera = nullptr;
@@ -1265,29 +1338,29 @@ namespace SDK {
 
     static void ResolveOffsets() {
         if (kEntity) {
-            O_health = PickFieldOff(kEntity, { "_health", "health", "hp", "Health", "mHealth", "currentHealth", "life" }, "Single");
-            O_alive = PickFieldOff(kEntity, { "shouldBeAlive", "alive", "isAlive", "mAlive", "IsAlive" }, "Boolean");
+            O_health = PickFieldOff(kEntity, { "_health", "health", "hp" });
+            O_alive = PickFieldOff(kEntity, { "shouldBeAlive", "alive", "isAlive" });
             O_isLocal = PickFieldOff(kEntity, { "isMine", "isLocalPlayer", "isOwner" }, "Boolean");
             O_rotation = PickFieldOff(kEntity, { "rotation" });
             O_camTf = PickFieldOff(kEntity, { "cameraTransform" });
-            O_vel = PickFieldOff(kEntity, { "velocity", "movingVelocity" });
-            O_name = PickFieldOff(kEntity, { "username", "playerName", "name", "nickName", "mName" }, "String");
+            O_vel = PickFieldOff(kEntity, { "movingVelocity", "velocity" });
+            O_name = PickFieldOff(kEntity, { "username", "playerName", "name" });
         }
         if (kPlayerScript) {
-            if (!O_health) O_health = PickFieldOff(kPlayerScript, { "_health", "health", "hp", "mHealth" }, "Single");
-            if (!O_alive)  O_alive = PickFieldOff(kPlayerScript, { "shouldBeAlive", "alive", "isAlive" }, "Boolean");
+            if (!O_health) O_health = PickFieldOff(kPlayerScript, { "_health", "health", "hp" });
+            if (!O_alive)  O_alive = PickFieldOff(kPlayerScript, { "shouldBeAlive", "alive", "isAlive" });
             if (!O_isLocal) O_isLocal = PickFieldOff(kPlayerScript, { "isMine", "isLocalPlayer" }, "Boolean");
             if (!O_rotation) O_rotation = PickFieldOff(kPlayerScript, { "rotation" });
-            if (!O_name) O_name = PickFieldOff(kPlayerScript, { "username", "playerName", "name", "nickName", "mName" }, "String");
+            if (!O_name) O_name = PickFieldOff(kPlayerScript, { "username", "playerName", "name" });
 
             O_localPlayerScript = PickFieldOff(kPlayerScript, { "localPlayerScript" });
-            O_gunStats = PickFieldOff(kPlayerScript, { "mpCurrentGunStats", "gunStats", "mGunStats" });
-            O_gunView = PickFieldOff(kPlayerScript, { "fpsGunView", "gunView", "mGunView", "currentGunView" });
-            O_gunStatsOnView = PickFieldOff(kPlayerScript, { "gunStatsOnView", "mGunStatsOnView", "statsOnView" });
-            O_team = PickFieldOff(kPlayerScript, { "mpTeamNumber", "team", "teamNumber", "mTeam" });
-            O_weapon = PickFieldOff(kPlayerScript, { "weapon", "currentWeapon", "mWeapon" });
-            O_speed = PickFieldOff(kPlayerScript, { "movementSpeedMultiplier", "lastMoveVelocity", "speed", "moveSpeed" });
-            O_mCamera = PickFieldOff(kPlayerScript, { "mCamera", "camera", "cam" });
+            O_gunStats = PickFieldOff(kPlayerScript, { "mpCurrentGunStats", "gunStats" });
+            O_gunView = PickFieldOff(kPlayerScript, { "fpsGunView", "gunView" });
+            O_gunStatsOnView = PickFieldOff(kPlayerScript, { "gunStatsOnView", "statsOnView" });
+            O_team = PickFieldOff(kPlayerScript, { "mpTeamNumber", "team", "teamNumber" });
+            O_weapon = PickFieldOff(kPlayerScript, { "weapon", "currentWeapon" });
+            O_speed = PickFieldOff(kPlayerScript, { "movementSpeedMultiplier", "lastMoveVelocity" });
+            O_mCamera = PickFieldOff(kPlayerScript, { "mCamera", "camera" });
             O_humanMeshAnimator = PickFieldOff(kPlayerScript, { "humanMeshAnimator", "meshAnimator", "animator" });
             O_humanMeshReferences = PickFieldOff(kPlayerScript, { "humanMeshReferences", "meshReferences" });
         }
@@ -1302,15 +1375,18 @@ namespace SDK {
         if (!O_weapon)   O_weapon = 0x1A8;
         if (!O_mCamera)  O_mCamera = 0xAC8;
         if (!O_humanMeshAnimator) O_humanMeshAnimator = 0xBC0;
+        if (!O_humanMeshReferences) O_humanMeshReferences = 0xA40;
 
         O_rot = O_rotation;
         O_cam = O_camTf;
         O_rotationIsQuat = true;
 
-        Log("[sdk] offsets: hp=0x%X(%s) alive=0x%X name=0x%X team=0x%X rot=0x%X(%s) camTf=0x%X mCam=0x%X anim=0x%X lps=0x%X",
-            O_health, FieldTypeOf(kPlayerScript, "_health"), O_alive, O_name, O_team,
-            O_rotation, FieldTypeOf(kPlayerScript, "rotation"), O_camTf, O_mCamera, O_humanMeshAnimator,
-            O_localPlayerScript);
+        Log("[sdk] offsets: hp=0x%X(%s) name=0x%X(%s) team=0x%X(%s) rot=0x%X(%s) camTf=0x%X anim=0x%X refs=0x%X",
+            O_health, FieldTypeOf(kPlayerScript, "_health"),
+            O_name, FieldTypeOf(kPlayerScript, "username"),
+            O_team, FieldTypeOf(kPlayerScript, "mpTeamNumber"),
+            O_rotation, FieldTypeOf(kPlayerScript, "rotation"),
+            O_camTf, O_humanMeshAnimator, O_humanMeshReferences);
     }
 
     static void ResolveMethods() {
@@ -1319,7 +1395,6 @@ namespace SDK {
             if (!M_shoot) M_shoot = se_class_get_method_from_name(kPlayerScript, "Shoot", 0);
             M_FireBullet = se_class_get_method_from_name(kPlayerScript, "FireBullet", 7);
             M_fireBullet = M_FireBullet;
-            M_recoil = se_class_get_method_from_name(kPlayerScript, "ComputeShotRecoil", 0);
         }
         if (kTransform) {
             M_set_position = se_class_get_method_from_name(kTransform, "set_position", 1);
@@ -1329,7 +1404,7 @@ namespace SDK {
             M_get_fov = se_class_get_method_from_name(kCamera, "get_fieldOfView", 0);
             M_set_fov = se_class_get_method_from_name(kCamera, "set_fieldOfView", 1);
         }
-        Log("[sdk] methods: shoot=%p fire=%p recoil=%p", M_shoot, M_FireBullet, M_recoil);
+        Log("[sdk] methods: shoot=%p fire=%p", M_shoot, M_FireBullet);
     }
 
     bool Init() {
@@ -1343,7 +1418,6 @@ namespace SDK {
         se_thread_attach(dom);
 
         InitializeCriticalSection(&g_targetCs);
-
         BuildCache();
 
         kEntity = FindClass("Entity");
@@ -1358,16 +1432,9 @@ namespace SDK {
         kAntiHack = FindClass("AntiHack");
         if (!kAntiHack) kAntiHack = FindClass("AntiCheat");
 
-        Log("[sdk] classes: entity=%p playerScript=%p transform=%p camera=%p",
-            kEntity, kPlayerScript, kTransform, kCamera);
-
         ResolveOffsets();
         ResolveMethods();
         BuildStringOffsets();
-
-        DumpFields(kEntity, "Entity");
-        DumpFields(kPlayerScript, "PlayerScript");
-        DumpFields(kAntiHack, "AntiHack");
 
         g_phase = "sdk.done";
         Log("[sdk] Init: CONCLUIDO");
