@@ -1,5 +1,6 @@
 // ============================================================================
-//  sdk.cpp — UTF-16->UTF-8 (corrige nome E bones), SyncVar, raiz de osso certa
+//  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, value types como ponteiro cru
+//  + line of sight real via Physics.Raycast
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -114,11 +115,6 @@ namespace IL2CPP_API {
 #define SE_BEGIN __try
 #define SE_END   __except (EXCEPTION_EXECUTE_HANDLER)
 
-// ---------------------------------------------------------------------------
-//  IL2CPP guarda string em UTF-16. il2cpp_string_chars devolve o buffer cru
-//  como char*, entao strlen para no 1o byte zero -> "Player" vira "P".
-//  Esta conversao resolve nomes E a busca de ossos.
-// ---------------------------------------------------------------------------
 static void StrToUtf8(Il2CppString* s, char* out, int outSize) {
     if (!out || outSize < 2) return;
     out[0] = 0;
@@ -310,6 +306,9 @@ namespace SDK {
     static uint32_t O_localPlayerScript = 0;
     bool     O_rotationIsQuat = true;
 
+    static bool g_rotIsSyncVar = false;
+    static Quat g_savedPlayerRot{ 0.f, 0.f, 0.f, 1.f };
+
     Il2CppClass* kEntity = nullptr;
     Il2CppClass* kPlayerScript = nullptr;
     Il2CppClass* kPlayer = nullptr;
@@ -340,7 +339,13 @@ namespace SDK {
     static MethodInfo* M_GetComponent = nullptr;
     static MethodInfo* M_camW2C = nullptr;
     static MethodInfo* M_camProj = nullptr;
-    static Il2CppClass* kInt32 = nullptr;
+
+    // line of sight
+    static Il2CppClass* kPhysics = nullptr;
+    static MethodInfo* M_raycast = nullptr;
+    static uint32_t     O_hitDist = 0;
+    static uint8_t      g_losState[MAX_TARGETS];
+    static uint64_t     g_losFrame = (uint64_t)-1;
 
     static std::mutex g_tfMx;
     static std::unordered_map<Il2CppObject*, Il2CppObject*> g_tfCache;
@@ -629,21 +634,19 @@ namespace SDK {
         }
         MethodInfo* sp = se_class_get_method_from_name(k, "set_position", 1);
         if (!sp) return;
-        if (!kVector3) kVector3 = FindClass("Vector3", "UnityEngine");
-        if (!kVector3) return;
-        Il2CppObject* bv = se_object_new(kVector3);
-        if (!bv) return;
-        void* bp = se_object_unbox(bv);
-        if (!bp) return;
-        memcpy(bp, &v, sizeof(Vec3));
-        void* args[1]; args[0] = bv;
+
+        Vec3 vv = v;
+        void* args[1]; args[0] = &vv;
         se_runtime_invoke(sp, node, args);
     }
 
     // ======================= rotacao =======================
     Il2CppObject* CamTfObj() {
         if (!g_localPlayer || !O_camTf) return nullptr;
-        return (Il2CppObject*)SafeReadObjPub(g_localPlayer, O_camTf);
+        Il2CppObject* tf = (Il2CppObject*)SafeReadObjPub(g_localPlayer, O_camTf);
+        if (!tf) return nullptr;
+        if (kTransform && !IsA(tf, kTransform)) return nullptr;
+        return tf;
     }
 
     Quat LookRot(Vec3 dir) {
@@ -652,16 +655,9 @@ namespace SDK {
         if (!kQuaternion) return out;
         if (!M_lookRot) M_lookRot = se_class_get_method_from_name(kQuaternion, "LookRotation", 1);
         if (!M_lookRot) return out;
-        if (!kVector3) kVector3 = FindClass("Vector3", "UnityEngine");
-        if (!kVector3) return out;
 
-        Il2CppObject* bv = se_object_new(kVector3);
-        if (!bv) return out;
-        void* bp = se_object_unbox(bv);
-        if (!bp) return out;
-        memcpy(bp, &dir, sizeof(Vec3));
-
-        void* a[1]; a[0] = bv;
+        Vec3 d = dir;
+        void* a[1]; a[0] = &d;
         Il2CppObject* r = se_runtime_invoke(M_lookRot, nullptr, a);
         if (!r) return out;
         void* p = se_object_unbox(r);
@@ -692,6 +688,26 @@ namespace SDK {
         void* a[1]; a[0] = &q;
         se_runtime_invoke(sr, tf, a);
         return true;
+    }
+
+    void SetPlayerRot(Il2CppObject* p, const Quat& q) {
+        if (!p || !O_rotation) return;
+        if (g_rotIsSyncVar) {
+            uintptr_t a = SyncVarValueAddr(p, O_rotation, "Quaternion");
+            if (a) { SafeWrite(a, (const void*)&q, sizeof(Quat)); return; }
+        }
+        SafeWrite((uintptr_t)p + O_rotation, (const void*)&q, sizeof(Quat));
+    }
+
+    Quat GetPlayerRot(Il2CppObject* p) {
+        Quat q{ 0.f, 0.f, 0.f, 1.f };
+        if (!p || !O_rotation) return q;
+        if (g_rotIsSyncVar) {
+            uintptr_t a = SyncVarValueAddr(p, O_rotation, "Quaternion");
+            if (a) { se_read_bytes((void*)a, &q, sizeof(Quat)); return q; }
+        }
+        se_read_bytes((void*)((uintptr_t)p + O_rotation), &q, sizeof(Quat));
+        return q;
     }
 
     Vec3 GetVelocity(Il2CppObject* o) {
@@ -835,17 +851,11 @@ namespace SDK {
 
             MethodInfo* gch = se_class_get_method_from_name(k, "GetChild", 1);
             if (!gch) continue;
-            if (!kInt32) kInt32 = FindClass("Int32", "System");
-            if (!kInt32) continue;
 
             for (int i = 0; i < cc && top < 1024; ++i) {
-                Il2CppObject* bi = se_object_new(kInt32);
-                if (!bi) break;
-                void* bp = se_object_unbox(bi);
-                if (!bp) break;
-                *(int*)bp = i;
-                void* a[1]; a[0] = bi;
-                Il2CppObject* c = se_runtime_invoke(gch, cur, a);
+                int idx = i;
+                void* args[1]; args[0] = &idx;
+                Il2CppObject* c = se_runtime_invoke(gch, cur, args);
                 if (c) stk[top++] = c;
             }
             ++visited;
@@ -891,16 +901,9 @@ namespace SDK {
             Il2CppObject* b = se_runtime_invoke(M_get_childCount, cur, nullptr);
             if (b) { void* p = se_object_unbox(b); if (p) cc = *(int*)p; }
 
-            if (!kInt32) kInt32 = FindClass("Int32", "System");
-            if (!kInt32) continue;
-
             for (int i = 0; i < cc && top < 2048; ++i) {
-                Il2CppObject* bi = se_object_new(kInt32);
-                if (!bi) break;
-                void* bp = se_object_unbox(bi);
-                if (!bp) break;
-                *(int*)bp = i;
-                void* args[1]; args[0] = bi;
+                int idx = i;
+                void* args[1]; args[0] = &idx;
                 Il2CppObject* c = se_runtime_invoke(M_GetChild, cur, args);
                 if (c) stk[top++] = c;
             }
@@ -1024,13 +1027,159 @@ namespace SDK {
     }
 
     bool VisibleLine(Vec3 a, Vec3 b) {
-        Vec2 sa, sb;
-        if (!WorldToScreen(a, sa) || !WorldToScreen(b, sb)) return false;
+        Vec2 sb;
+        if (!WorldToScreen(b, sb)) return false;
+
+        Vec3 a2 = a + (b - a) * 0.01f;
+        Vec2 sa;
+        if (!WorldToScreen(a2, sa)) {
+            sa.x = (float)Hooks::g_viewW * 0.5f;
+            sa.y = (float)Hooks::g_viewH * 0.5f;
+        }
+
         const float W = (float)Hooks::g_viewW, H = (float)Hooks::g_viewH;
         auto inside = [&](const Vec2& p) {
             return p.x > -W * 0.25f && p.x < W * 1.25f && p.y > -H * 0.25f && p.y < H * 1.25f;
             };
         return inside(sa) && inside(sb);
+    }
+
+    // ======================= LINE OF SIGHT (Physics.Raycast) =======================
+    static MethodInfo* FindRaycast4() {
+        if (!kPhysics) kPhysics = FindClass("Physics", "UnityEngine");
+        if (!kPhysics) return nullptr;
+        void* it = nullptr;
+        for (;;) {
+            const MethodInfo* m = il2cpp_class_get_methods(kPhysics, &it);
+            if (!m) break;
+            if (strcmp(il2cpp_method_get_name(m), "Raycast") != 0) continue;
+            if (il2cpp_method_get_param_count(m) != 4) continue;
+
+            const Il2CppType* p0 = il2cpp_method_get_param(m, 0);
+            const Il2CppType* p1 = il2cpp_method_get_param(m, 1);
+            const Il2CppType* p2 = il2cpp_method_get_param(m, 2);
+            const Il2CppType* p3 = il2cpp_method_get_param(m, 3);
+            if (!p0 || !p1 || !p2 || !p3) continue;
+            const char* n0 = il2cpp_type_get_name(p0);
+            const char* n1 = il2cpp_type_get_name(p1);
+            const char* n2 = il2cpp_type_get_name(p2);
+            const char* n3 = il2cpp_type_get_name(p3);
+            if (!n0 || !n1 || !n2 || !n3) continue;
+            if (!strstr(n0, "Vector3")) continue;
+            if (!strstr(n1, "Vector3")) continue;
+            if (!strstr(n2, "RaycastHit")) continue;
+            if (!strstr(n3, "Single")) continue;
+            return (MethodInfo*)m;
+        }
+        return nullptr;
+    }
+
+    static uint32_t HitDistOffset() {
+        if (O_hitDist) return O_hitDist;
+        Il2CppClass* k = FindClass("RaycastHit", "UnityEngine");
+        if (k) {
+            FieldInfo* f = se_class_get_field_from_name(k, "m_Distance");
+            if (!f) f = se_class_get_field_from_name(k, "distance");
+            if (f) O_hitDist = (uint32_t)se_field_offset(f);
+        }
+        if (!O_hitDist) O_hitDist = 0x1C;
+        Log("[los] Physics=%p Raycast=%p hitDistOff=0x%X", kPhysics, M_raycast, O_hitDist);
+        return O_hitDist;
+    }
+
+    // true = caminho livre ate o alvo | false = tem parede no meio
+    bool HasLineOfSight(Vec3 eye, Vec3 aim) {
+        if (!M_raycast) M_raycast = FindRaycast4();
+        if (!M_raycast) return true;
+        if (!O_hitDist) HitDistOffset();
+
+        Vec3 d = aim - eye;
+        float dist = d.len();
+        if (dist < 0.05f) return true;
+        Vec3 dir{ d.x / dist, d.y / dist, d.z / dist };
+
+        alignas(16) unsigned char hitBuf[128];
+        float travelled = 0.35f;
+
+        for (int iter = 0; iter < 3; ++iter) {
+            float len = dist - travelled;
+            if (len < 0.05f) return true;
+
+            memset(hitBuf, 0, sizeof(hitBuf));
+            Vec3 sv = eye + dir * travelled;
+            Vec3 dv = dir;
+            float lv = len;
+            void* args[4];
+            args[0] = &sv;
+            args[1] = &dv;
+            args[2] = (void*)hitBuf;
+            args[3] = &lv;
+
+            Il2CppObject* r = se_runtime_invoke(M_raycast, nullptr, args);
+            if (!r) return true;
+            void* pb = se_object_unbox(r);
+            if (!pb || *(unsigned char*)pb == 0) return true;
+
+            float hitDist = 0.f;
+            se_read_bytes(hitBuf + O_hitDist, &hitDist, sizeof(float));
+
+            if (hitDist < 0.30f) { travelled += hitDist + 0.05f; continue; }
+            return hitDist >= (len - 0.5f);
+        }
+        return true;
+    }
+
+    bool TargetVisible(int idx, Vec3 eye, Vec3 aim) {
+        if (idx < 0 || idx >= MAX_TARGETS) return HasLineOfSight(eye, aim);
+
+        if (g_losFrame != g_frameId) {
+            g_losFrame = g_frameId;
+            memset(g_losState, 0xFF, sizeof(g_losState));
+        }
+        uint8_t st = g_losState[idx];
+        if (st != 0xFF) return st != 0;
+
+        bool vis = HasLineOfSight(eye, aim);
+        g_losState[idx] = vis ? 1 : 0;
+        return vis;
+    }
+
+    // teste cru: devolve se bateu e a distancia do hit (sem tolerancia)
+    bool RaycastTest(Vec3 from, Vec3 to, float& outHitDist) {
+        outHitDist = -1.f;
+        if (!M_raycast) M_raycast = FindRaycast4();
+        if (!M_raycast) return false;
+        if (!O_hitDist) HitDistOffset();
+
+        Vec3 d = to - from;
+        float len = d.len();
+        if (len < 0.01f) return false;
+        Vec3 dir{ d.x / len, d.y / len, d.z / len };
+
+        alignas(16) unsigned char hitBuf[128];
+        memset(hitBuf, 0, sizeof(hitBuf));
+        Vec3 sv = from, dv = dir; float lv = len;
+        void* args[4] = { &sv, &dv, (void*)hitBuf, &lv };
+
+        Il2CppObject* r = se_runtime_invoke(M_raycast, nullptr, args);
+        if (!r) return false;
+        void* pb = se_object_unbox(r);
+        if (!pb) return false;
+        if (*(unsigned char*)pb == 0) return false;
+        se_read_bytes(hitBuf + O_hitDist, &outHitDist, sizeof(float));
+        return true;
+    }
+
+    // P[5] = cot(fovY/2) -> converte graus em pixels
+    float CameraCotHalfFovY() {
+        if (!g_camera) return 1.732f;
+        Il2CppClass* ck = se_object_get_class(g_camera);
+        if (!ck) return 1.732f;
+        if (!M_camProj) M_camProj = se_class_get_method_from_name(ck, "get_projectionMatrix", 0);
+        float P[16] = {};
+        if (!ReadMatrix(g_camera, M_camProj, P)) return 1.732f;
+        if (P[5] <= 0.0001f) return 1.732f;
+        return P[5];
     }
 
     Vec3 TargetAimPos(Il2CppObject* p, int boneMode) {
@@ -1234,7 +1383,6 @@ namespace SDK {
                 const char* en = ek ? se_class_name(ek) : nullptr;
                 tgt.npc = (en && strstr(en, "NPC") != nullptr);
 
-                // raiz de bones: transform do proprio player (primario)
                 Il2CppObject* playerTf = CachedTransform(e);
                 Il2CppObject* animTf = nullptr;
                 if (O_humanMeshAnimator) {
@@ -1331,22 +1479,13 @@ namespace SDK {
         return out;
     }
 
-    static Il2CppObject* BoxVec3(Vec3 v) {
-        if (!kVector3) kVector3 = FindClass("Vector3", "UnityEngine");
-        if (!kVector3) return nullptr;
-        Il2CppObject* o = se_object_new(kVector3);
-        if (!o) return nullptr;
-        void* p = se_object_unbox(o);
-        if (p) memcpy(p, &v, sizeof(Vec3));
-        return o;
-    }
-
     // ======================= aim =======================
     bool AimLock(Il2CppObject* target, Quat& savedOriginal) {
         Il2CppObject* camTf = CamTfObj();
         if (!target || !camTf) return false;
 
         if (!GetRot(camTf, savedOriginal)) return false;
+        g_savedPlayerRot = GetPlayerRot(g_localPlayer);
 
         Vec3 me = GetPos(camTf);
         Vec3 tp = TargetAimPos(target, C.aimBone);
@@ -1358,30 +1497,59 @@ namespace SDK {
 
         Quat q = LookRot(dir);
         if (!SetRot(camTf, q)) return false;
-
-        if (g_localPlayer && O_rotation && O_rotationIsQuat)
-            SafeWrite((uintptr_t)g_localPlayer + O_rotation, (void*)&q, sizeof(q));
-
+        if (g_localPlayer) SetPlayerRot(g_localPlayer, q);
         return true;
     }
 
     void RestoreAim(Il2CppObject*, const Quat& q) {
         Il2CppObject* camTf = CamTfObj();
         if (camTf) SetRot(camTf, q);
+        if (g_localPlayer) SetPlayerRot(g_localPlayer, g_savedPlayerRot);
+    }
+
+    bool FireBulletReady() {
+        if (!M_FireBullet) return false;
+        uint32_t np = il2cpp_method_get_param_count ? il2cpp_method_get_param_count(M_FireBullet) : 0;
+        if (np == 0) return false;
+        for (uint32_t i = 0; i < np; ++i) {
+            const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
+            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+            if (!tn) return false;
+            if (strstr(tn, "Vector3") || strstr(tn, "Single") || strstr(tn, "Int32") ||
+                strstr(tn, "Boolean") || strstr(tn, "Double") || strstr(tn, "Int64")) continue;
+            return false;
+        }
+        return true;
     }
 
     void FireBulletAt(Vec3 pos) {
         if (!M_FireBullet || !g_localPlayer) return;
+
         Vec3 me = GetPos(g_localPlayer);
         Vec3 dir{ pos.x - me.x, pos.y - me.y, pos.z - me.z };
-        float L = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-        if (L > 0.0001f) { dir.x /= L; dir.y /= L; dir.z /= L; }
+        float L = dir.len();
+        if (L > 0.0001f) dir = dir * (1.f / L);
 
         uint32_t np = il2cpp_method_get_param_count ? il2cpp_method_get_param_count(M_FireBullet) : 0;
         if (np == 0) np = 1;
-        std::vector<Il2CppObject*> keep(np, nullptr);
-        std::vector<void*> args(np, nullptr);
-        for (uint32_t i = 0; i < np; ++i) { keep[i] = BoxVec3(dir); args[i] = keep[i]; }
+
+        std::vector<Vec3>   vbuf(np);
+        std::vector<float>  fbuf(np, 0.f);
+        std::vector<int>    ibuf(np, 0);
+        std::vector<double> dbuf(np, 0.0);
+        std::vector<unsigned char> bbuf(np, 0);
+        std::vector<void*>  args(np, nullptr);
+
+        for (uint32_t i = 0; i < np; ++i) {
+            const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
+            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+            if (tn && strstr(tn, "Vector3")) { vbuf[i] = dir; args[i] = &vbuf[i]; }
+            else if (tn && strstr(tn, "Single"))  args[i] = &fbuf[i];
+            else if (tn && strstr(tn, "Int32"))   args[i] = &ibuf[i];
+            else if (tn && strstr(tn, "Double"))  args[i] = &dbuf[i];
+            else if (tn && strstr(tn, "Boolean")) args[i] = &bbuf[i];
+            else args[i] = nullptr;
+        }
         se_runtime_invoke(M_FireBullet, g_localPlayer, args.data());
     }
 
@@ -1402,7 +1570,8 @@ namespace SDK {
             O_alive = PickFieldOff(kEntity, { "shouldBeAlive", "alive", "isAlive" });
             O_isLocal = PickFieldOff(kEntity, { "isMine", "isLocalPlayer", "isOwner" }, "Boolean");
             O_rotation = PickFieldOff(kEntity, { "rotation" });
-            O_camTf = PickFieldOff(kEntity, { "cameraTransform" });
+            O_camTf = PickFieldOff(kEntity, { "cameraTransform", "camTransform" }, "Transform");
+            if (!O_camTf) O_camTf = PickFieldOff(kEntity, { "cameraTransform", "camTransform" });
             O_vel = PickFieldOff(kEntity, { "movingVelocity", "velocity" });
             O_name = PickFieldOff(kEntity, { "username", "playerName", "name" });
         }
@@ -1411,6 +1580,8 @@ namespace SDK {
             if (!O_alive)  O_alive = PickFieldOff(kPlayerScript, { "shouldBeAlive", "alive", "isAlive" });
             if (!O_isLocal) O_isLocal = PickFieldOff(kPlayerScript, { "isMine", "isLocalPlayer" }, "Boolean");
             if (!O_rotation) O_rotation = PickFieldOff(kPlayerScript, { "rotation" });
+            if (!O_camTf) O_camTf = PickFieldOff(kPlayerScript, { "cameraTransform", "camTransform", "mCameraTransform" }, "Transform");
+            if (!O_camTf) O_camTf = PickFieldOff(kPlayerScript, { "cameraTransform", "camTransform", "mCameraTransform" });
             if (!O_name) O_name = PickFieldOff(kPlayerScript, { "username", "playerName", "name" });
 
             O_localPlayerScript = PickFieldOff(kPlayerScript, { "localPlayerScript" });
@@ -1441,12 +1612,19 @@ namespace SDK {
         O_cam = O_camTf;
         O_rotationIsQuat = true;
 
-        Log("[sdk] offsets: hp=0x%X(%s) name=0x%X(%s) team=0x%X(%s) rot=0x%X(%s) camTf=0x%X anim=0x%X",
+        {
+            const char* rtE = FieldTypeOf(kEntity, "rotation");
+            const char* rtP = FieldTypeOf(kPlayerScript, "rotation");
+            g_rotIsSyncVar = (rtE && strstr(rtE, "SyncVar")) || (rtP && strstr(rtP, "SyncVar"));
+        }
+
+        Log("[sdk] offsets: hp=0x%X(%s) name=0x%X(%s) team=0x%X(%s) rot=0x%X(%s) camTf=0x%X(%s) anim=0x%X syncRot=%d",
             O_health, FieldTypeOf(kPlayerScript, "_health"),
             O_name, FieldTypeOf(kPlayerScript, "username"),
             O_team, FieldTypeOf(kPlayerScript, "mpTeamNumber"),
             O_rotation, FieldTypeOf(kPlayerScript, "rotation"),
-            O_camTf, O_humanMeshAnimator);
+            O_camTf, FieldTypeOf(kPlayerScript, "cameraTransform"),
+            O_humanMeshAnimator, (int)g_rotIsSyncVar);
     }
 
     static void ResolveMethods() {
@@ -1463,6 +1641,16 @@ namespace SDK {
         if (kCamera) {
             M_get_fov = se_class_get_method_from_name(kCamera, "get_fieldOfView", 0);
             M_set_fov = se_class_get_method_from_name(kCamera, "set_fieldOfView", 1);
+        }
+
+        if (M_FireBullet) {
+            uint32_t np = il2cpp_method_get_param_count ? il2cpp_method_get_param_count(M_FireBullet) : 0;
+            Log("[sdk] FireBullet: %u params ready=%d", np, (int)FireBulletReady());
+            for (uint32_t i = 0; i < np; ++i) {
+                const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
+                Log("[sdk]   param%d = %s", i, tn ? tn : "?");
+            }
         }
         Log("[sdk] methods: shoot=%p fire=%p", M_shoot, M_FireBullet);
     }
@@ -1492,9 +1680,15 @@ namespace SDK {
         kAntiHack = FindClass("AntiHack");
         if (!kAntiHack) kAntiHack = FindClass("AntiCheat");
 
+        memset(g_losState, 0xFF, sizeof(g_losState));
+
         ResolveOffsets();
         ResolveMethods();
         BuildStringOffsets();
+
+        M_raycast = FindRaycast4();
+        if (M_raycast) HitDistOffset();
+        Log("[los] Raycast=%p hitDist=0x%X", M_raycast, O_hitDist);
 
         g_phase = "sdk.done";
         Log("[sdk] Init: CONCLUIDO");
@@ -1502,3 +1696,4 @@ namespace SDK {
     }
 
 } // namespace SDK
+// ==== FIM DO ARQUIVO ====

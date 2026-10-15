@@ -127,18 +127,27 @@ namespace SDK {
     bool  VisibleLine(Vec3 a, Vec3 b);
     Vec3  TargetAimPos(Il2CppObject* p, int boneMode);
 
-    // ---- NOVO: camera transform + rotacao ----
+    // ---- linha de visao real (Physics.Raycast) ----
+    bool  HasLineOfSight(Vec3 eye, Vec3 aim);          // true = caminho livre
+    bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);  // idem, com cache por frame
+    bool  RaycastTest(Vec3 from, Vec3 to, float& outHitDist);
+    float CameraCotHalfFovY();
+
+    // ---- camera transform + rotacao ----
     Il2CppObject* CamTfObj();
     Quat  LookRot(Vec3 dir);
     bool  GetRot(Il2CppObject* tf, Quat& out);
     bool  SetRot(Il2CppObject* tf, Quat q);
+    void  SetPlayerRot(Il2CppObject* p, const Quat& q);
+    Quat  GetPlayerRot(Il2CppObject* p);
 
     Il2CppObject* GetGunStats(Il2CppObject* player);
     Il2CppObject* GetWeapon(Il2CppObject* player);
 
     bool  AimLock(Il2CppObject* p, Quat& savedOriginal);
     void  RestoreAim(Il2CppObject* p, const Quat& q);
-    void  FireBulletAt(Vec3 dir);
+    bool  FireBulletReady();
+    void  FireBulletAt(Vec3 pos);
 
     void  DumpFields(const char* className);
     void  DumpFields(Il2CppClass* k, const char* tag);
@@ -169,6 +178,10 @@ using SDK::FindClass;
 using SDK::GetTransform;
 using SDK::SafeReadObjPub;
 using SDK::VisibleLine;
+using SDK::HasLineOfSight;
+using SDK::TargetVisible;
+using SDK::RaycastTest;
+using SDK::CameraCotHalfFovY;
 using SDK::LockTargets;
 using SDK::UnlockTargets;
 using SDK::FindBoneContains;
@@ -190,3 +203,7 @@ using SDK::CamTfObj;
 using SDK::LookRot;
 using SDK::GetRot;
 using SDK::SetRot;
+using SDK::SetPlayerRot;
+using SDK::GetPlayerRot;
+using SDK::FireBulletReady;
+using SDK::FireBulletAt;

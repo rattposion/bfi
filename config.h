@@ -37,8 +37,8 @@ struct Config {
     bool  fps = false;
 
     bool  aimbot = false;
-    int   aimKey = VK_RBUTTON;          // <-- era VK_XBUTTON2 (mouse5)
-    float aimFov = 8.f;
+    int   aimKey = VK_RBUTTON;
+    float aimFov = 15.f;                 // GRAUS (convertido pra pixels no aimbot)
     float aimSmooth = 5.f;
     int   aimBone = 0;
     int   aimMode = 0;

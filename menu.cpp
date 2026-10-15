@@ -87,7 +87,7 @@ namespace Menu {
                 ImGui::Checkbox("Magic bullets", &C.magicBullets);
 
                 ImGui::Separator();
-                ImGui::SliderFloat("FOV", &C.aimFov, 1.f, 180.f, "%.0f");
+                ImGui::SliderFloat("FOV (graus)", &C.aimFov, 1.f, 90.f, "%.0f");
                 ImGui::SliderFloat("Smooth", &C.aimSmooth, 1.f, 20.f, "%.1f");
                 ImGui::Combo("Osso", &C.aimBone, "Cabeca\0Pescoco\0Peito\0");
                 ImGui::Combo("Modo", &C.aimMode, "Mais perto da mira\0Menor vida\0Mais perto\0");
@@ -180,7 +180,7 @@ namespace Menu {
                 KeyBind("Tecla do menu", &C.menuKey);
                 KeyBind("Tecla panic", &C.panicKey);
                 KeyBind("Tecla salvar", &C.saveKey);
-                KeyBind("Tecla descarregar", &C.unloadKey);
+                KeyBind("Tecla desacarregar", &C.unloadKey);
                 ImGui::EndTabItem();
             }
 

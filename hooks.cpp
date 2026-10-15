@@ -1,6 +1,8 @@
 // ============================================================================
 //  hooks.cpp — hooks + orquestracao de teclas.
 //  hk_lateUpdate chama SO Combat::Tick (sem tick duplicado).
+//  Filtro "self == g_localPlayer" so vale se o hook caiu numa classe
+//  por-instancia-de-player; se cair num singleton, roda 1x por frame.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -35,6 +37,9 @@ namespace Hooks {
     static bool g_mhInit = false;
     static std::atomic<uint32_t> g_frameCounter{ 0 };
     static uint32_t g_lastTickFrame = 0xFFFFFFFF;
+
+    // o metodo hookado e uma instancia de player?
+    static std::atomic<bool> g_mainIsPlayerClass{ false };
 
     static bool KeyDown(int vk) { return vk ? (GetAsyncKeyState(vk) & 0x8000) != 0 : false; }
 
@@ -217,7 +222,9 @@ namespace Hooks {
     static void __fastcall hk_lateUpdate(void* self, void* method) {
         if (o_lateUpdate) o_lateUpdate(self, method);
 
-        if (SDK::g_localPlayer && self != SDK::g_localPlayer) return;
+        // so filtra por instancia se o hook for numa classe de player.
+        if (g_mainIsPlayerClass.load() && SDK::g_localPlayer && self != SDK::g_localPlayer)
+            return;
 
         uint32_t f = g_frameCounter.load(std::memory_order_relaxed);
         if (f == g_lastTickFrame) return;
@@ -240,7 +247,14 @@ namespace Hooks {
                 if (!ptr) continue;
                 if (MH_CreateHook(ptr, &hk_lateUpdate, (void**)&o_lateUpdate) == MH_OK) {
                     MH_EnableHook(ptr);
-                    Log("[hooks] MAIN THREAD = %s::%s (%p)", classes[c], methods[m], ptr);
+
+                    bool isPlayer = (strcmp(classes[c], "PlayerScript") == 0 ||
+                        strcmp(classes[c], "Entity") == 0 ||
+                        strcmp(classes[c], "Player") == 0);
+                    g_mainIsPlayerClass = isPlayer;
+
+                    Log("[hooks] MAIN THREAD = %s::%s (%p) filtroPorInstancia=%d",
+                        classes[c], methods[m], ptr, (int)isPlayer);
                     return true;
                 }
             }
@@ -250,24 +264,53 @@ namespace Hooks {
     }
 
     // -----------------------------------------------------------------------
-    //  combate
+    //  combate — hooka TODOS os metodos de tiro conhecidos
     // -----------------------------------------------------------------------
     typedef void(__fastcall* tShoot)(void* self, const MethodInfo* m);
-    static tShoot o_shoot = nullptr;
 
-    static void __fastcall hk_shoot(void* self, const MethodInfo* m) {
+    static std::atomic<uint32_t> g_shootCalls{ 0 };
+
+    static tShoot o_shoot1 = nullptr;
+    static tShoot o_shoot2 = nullptr;
+    static tShoot o_shoot3 = nullptr;
+    static tShoot o_shoot4 = nullptr;
+
+    static void ShootBody(void* self, const MethodInfo* m, tShoot orig) {
+        g_shootCalls.fetch_add(1, std::memory_order_relaxed);
+
+        bool isLocal = (!SDK::g_localPlayer || self == SDK::g_localPlayer);
+
+        // silent aim: gira antes do tiro e restaura depois
         Quat original{};
         bool has = false;
-
-        if (C.aimbot && C.aimKeyDown && SDK::g_aimTarget &&
-            SDK::g_localPlayer && SDK::O_rotationIsQuat) {
+        if (isLocal && C.aimbot && C.aimKeyDown && SDK::g_aimTarget && SDK::g_localPlayer) {
             if (SDK::AimLock(SDK::g_aimTarget, original)) has = true;
         }
 
-        if (o_shoot) o_shoot(self, m);
+        if (orig) orig(self, m);
+
+        // magic bullets: dispara um projetil no alvo
+        if (isLocal && C.magicBullets && SDK::g_aimTarget && SDK::FireBulletReady()) {
+            Vec3 tp = SDK::TargetAimPos(SDK::g_aimTarget, C.aimBone);
+            if (!tp.zero()) SDK::FireBulletAt(tp);
+        }
 
         if (has && SDK::g_localPlayer) SDK::RestoreAim(SDK::g_localPlayer, original);
+
+        static ULONGLONG lastLog = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastLog > 1000) {
+            lastLog = now;
+            Log("[shoot] chamadas=%u isLocal=%d aimTarget=%p keyDown=%d silent=%d magic=%d",
+                g_shootCalls.load(), (int)isLocal, SDK::g_aimTarget,
+                (int)C.aimKeyDown, (int)C.silentAim, (int)C.magicBullets);
+        }
     }
+
+    static void __fastcall hk_shoot1(void* s, const MethodInfo* m) { ShootBody(s, m, o_shoot1); }
+    static void __fastcall hk_shoot2(void* s, const MethodInfo* m) { ShootBody(s, m, o_shoot2); }
+    static void __fastcall hk_shoot3(void* s, const MethodInfo* m) { ShootBody(s, m, o_shoot3); }
+    static void __fastcall hk_shoot4(void* s, const MethodInfo* m) { ShootBody(s, m, o_shoot4); }
 
     // recoil: duas assinaturas (params float x params ponteiro)
     typedef Quat(__fastcall* tRecoilF)(void*, const MethodInfo*, float, float, float, float);
@@ -302,18 +345,31 @@ namespace Hooks {
     bool InstallCombat() {
         bool ok = false;
 
-        if (SDK::M_shoot) {
-            void* p = SDK::MethodPtr(SDK::M_shoot);
-            if (p && MH_CreateHook(p, &hk_shoot, (void**)&o_shoot) == MH_OK) {
-                MH_EnableHook(p);
-                Log("[hooks] hook shoot OK");
-                ok = true;
+        Il2CppClass* ps = SDK::FindClass("PlayerScript");
+        if (ps) {
+            static const char* names[] = { "SemiAutoShoot", "Shoot", "AutoShoot", "FullAutoShoot" };
+            static void* detours[] = { (void*)&hk_shoot1, (void*)&hk_shoot2,
+                                       (void*)&hk_shoot3, (void*)&hk_shoot4 };
+            static tShoot* tramps[] = { &o_shoot1, &o_shoot2, &o_shoot3, &o_shoot4 };
+
+            int n = 0;
+            for (size_t i = 0; i < 4; ++i) {
+                MethodInfo* m = FindMethodByArity(ps, names[i], 0);
+                if (!m) { Log("[hooks] %s nao encontrado", names[i]); continue; }
+                void* p = SDK::MethodPtr(m);
+                if (!p) { Log("[hooks] %s sem ptr", names[i]); continue; }
+                if (MH_CreateHook(p, detours[n], (void**)tramps[n]) == MH_OK) {
+                    MH_EnableHook(p);
+                    Log("[hooks] hook shoot OK: %s (%p)", names[i], p);
+                    if (!SDK::M_shoot) SDK::M_shoot = m;
+                    ok = true;
+                    if (++n >= 4) break;
+                }
             }
         }
-        else Log("[hooks] M_shoot nulo");
+        else Log("[hooks] PlayerScript nulo");
 
         if (!SDK::M_recoil) {
-            Il2CppClass* ps = SDK::FindClass("PlayerScript");
             if (ps) {
                 SDK::M_recoil = FindMethodAny(ps, "ComputeShotRecoil");
                 if (!SDK::M_recoil) SDK::M_recoil = FindMethodAny(ps, "ShotRecoil");
