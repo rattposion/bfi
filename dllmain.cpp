@@ -1,8 +1,8 @@
 // ============================================================================
-//  dllmain.cpp  -  versao com log de cada passo (diagnostico)
+//  dllmain.cpp
 // ============================================================================
-
 #include <windows.h>
+#include <atomic>
 #include <cstdio>
 
 #include "il2cpp.h"
@@ -11,23 +11,22 @@
 #include "config.h"
 #include "sdk.h"
 #include "hooks.h"
+#include "features.h"
 
 HMODULE g_hModule = nullptr;
-bool    g_unload = false;
+std::atomic<bool> g_unload{ false };
 
 void Log(const char* fmt, ...);
 void LogInit();
 
-// ---------------------------------------------------------------------------
 static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     Log("!!!!!!!! EXCECAO code=0x%08X addr=%p fase=%s",
         ep->ExceptionRecord->ExceptionCode,
         ep->ExceptionRecord->ExceptionAddress,
-        g_phase);
+        g_phase ? g_phase : "?");
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// ---------------------------------------------------------------------------
 static DWORD WINAPI Main(LPVOID) {
     LogInit();
 
@@ -37,38 +36,36 @@ static DWORD WINAPI Main(LPVOID) {
 
     SetUnhandledExceptionFilter(CrashFilter);
 
-    while (!GetModuleHandleA("GameAssembly.dll")) Sleep(100);
+    while (!GetModuleHandleA("GameAssembly.dll")) {
+        if (g_unload.load()) return 0;
+        Sleep(100);
+    }
     Log("[bfi] GameAssembly.dll = %p", GetModuleHandleA("GameAssembly.dll"));
 
     g_phase = "resolve";
     if (!IL2CPP_API::Resolve()) { Log("[bfi] Resolve FALHOU"); return 0; }
-    Log("[bfi] API do il2cpp OK");
 
     g_phase = "domain";
     Il2CppDomain* dom = il2cpp_domain_get ? il2cpp_domain_get() : nullptr;
     if (!dom) { Log("[bfi] domain NULO"); return 0; }
-    Log("[bfi] dominio il2cpp pronto");
 
     g_phase = "attach";
     if (il2cpp_thread_attach) il2cpp_thread_attach(dom);
-    Log("[bfi] thread attach OK");
 
     g_phase = "sdk";
-    Log("[bfi] >>> chamando SDK::Init...");
-    bool okSdk = SDK::Init();
-    Log("[bfi] <<< SDK::Init retornou %d", (int)okSdk);
+    if (!SDK::Init()) { Log("[bfi] SDK::Init FALHOU"); }
+
+    g_phase = "config";
+    ConfigIO::Init();
 
     g_phase = "hooks";
-    Log("[bfi] >>> chamando Hooks::Init...");
-    bool okHk = Hooks::Init();
-    Log("[bfi] <<< Hooks::Init retornou %d", (int)okHk);
+    if (!Hooks::Init()) { Log("[bfi] Hooks::Init FALHOU"); }
 
     g_phase = "done";
     Log("[bfi] ===== pronto =====");
     return 0;
 }
 
-// ---------------------------------------------------------------------------
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_hModule = h;
@@ -77,10 +74,8 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
     }
     else if (reason == DLL_PROCESS_DETACH) {
         g_unload = true;
-        if (g_phase && *g_phase) {
-            SDK::Shutdown();
-            Hooks::Shutdown();
-        }
+        SDK::Shutdown();
+        Hooks::Shutdown();
     }
     return TRUE;
 }

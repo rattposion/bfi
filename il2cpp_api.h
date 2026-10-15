@@ -51,7 +51,13 @@ extern "C" {
 
 	extern const char* (*il2cpp_method_get_name)(const MethodInfo*);
 	extern uint32_t(*il2cpp_method_get_param_count)(const MethodInfo*);
+	extern const Il2CppType* (*il2cpp_method_get_param)(const MethodInfo*, uint32_t);
+	extern Il2CppType* (*il2cpp_method_get_return_type)(const MethodInfo*);
 	extern MethodInfo* (*il2cpp_object_get_virtual_method)(const Il2CppObject*, const MethodInfo*);
+
+	// --- tipos ---
+	extern char* (*il2cpp_type_get_name)(const Il2CppType*);
+	extern Il2CppObject* (*il2cpp_type_get_object)(const Il2CppType*);
 
 	// --- objetos ---
 	extern Il2CppClass* (*il2cpp_object_get_class)(const Il2CppObject*);

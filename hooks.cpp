@@ -1,12 +1,6 @@
 // ============================================================================
-//  hooks.cpp — versao final consolidada
-//  - dedupe por instancia (self) + por frame
-//  - AimLock salva o ORIGINAL, RestoreAim devolve
-//  - recoil com retorno (nao deixa XMM0 lixo)
-//  - sdkReady so apos viewProj valido
-//  - WndProc consome input com menu aberto
-//  - uninit unico do MinHook
-//  - todos os ticks ligados
+//  hooks.cpp — hooks + orquestracao de teclas.
+//  hk_lateUpdate chama SO Combat::Tick (sem tick duplicado).
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -32,19 +26,21 @@
 
 namespace Hooks {
 
-    decltype(g_hooksLive) g_hooksLive = false;
-    decltype(g_sdkReady)  g_sdkReady = false;
-    decltype(g_viewW)     g_viewW = 1920;
-    decltype(g_viewH)     g_viewH = 1080;
+    std::atomic<bool> g_imguiReady{ false };
+    std::atomic<bool> g_hooksLive{ false };
+    std::atomic<bool> g_sdkReady{ false };
+    int g_viewW = 1920;
+    int g_viewH = 1080;
 
     static bool g_mhInit = false;
     static std::atomic<uint32_t> g_frameCounter{ 0 };
     static uint32_t g_lastTickFrame = 0xFFFFFFFF;
 
-    static bool KeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+    static bool KeyDown(int vk) { return vk ? (GetAsyncKeyState(vk) & 0x8000) != 0 : false; }
 
     static bool Edge(int vk) {
         static bool prev[256] = {};
+        if (!vk) return false;
         bool cur = KeyDown(vk);
         bool r = cur && !prev[vk & 0xFF];
         prev[vk & 0xFF] = cur;
@@ -83,6 +79,17 @@ namespace Hooks {
     }
 
     // -----------------------------------------------------------------------
+    //  teclas
+    // -----------------------------------------------------------------------
+    void HandleKeys() {
+        if (Edge(C.menuKey)) C.menuOpen = !C.menuOpen;
+        if (Edge(C.panicKey)) Misc::Panic();
+        if (Edge(C.saveKey)) ConfigIO::Save();
+        if (Edge(C.unloadKey)) { ConfigIO::Save(); g_unload = true; }
+        if (C.aimKey) C.aimKeyDown = KeyDown(C.aimKey);
+    }
+
+    // -----------------------------------------------------------------------
     //  cursor
     // -----------------------------------------------------------------------
     typedef BOOL(WINAPI* tSetCursorPos)(int, int);
@@ -110,7 +117,6 @@ namespace Hooks {
     static HWND    g_hwnd = nullptr;
     static WNDPROC o_wndProc = nullptr;
     static bool    g_imguiInit = false;
-    static bool    g_frameLog = false;
 
     static LRESULT CALLBACK hk_wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_imguiInit) {
@@ -136,6 +142,7 @@ namespace Hooks {
         if (!ImGui_ImplWin32_Init(hwnd)) { Log("[hooks] ImGui_ImplWin32_Init FALHOU"); return; }
         if (!ImGui_ImplOpenGL3_Init("#version 130")) { Log("[hooks] ImGui_ImplOpenGL3_Init FALHOU"); return; }
         g_imguiInit = true;
+        g_imguiReady = true;
         Log("[hooks] ImGui inicializado (hwnd=%p)", hwnd);
     }
 
@@ -158,19 +165,12 @@ namespace Hooks {
         if (nb - lastBeat > 2000) {
             lastBeat = nb;
             Log("[hooks] beat: menu=%d sdk=%d alvos=%d local=%p",
-                (int)C.menuOpen, (int)g_sdkReady, SDK::g_targetCount, SDK::g_localPlayer);
+                (int)C.menuOpen, (int)g_sdkReady.load(), SDK::g_targetCount, SDK::g_localPlayer);
         }
 
-        if (Edge(VK_INSERT)) C.menuOpen = !C.menuOpen;
-        if (C.aimKey) C.aimKeyDown = KeyDown(C.aimKey);
+        HandleKeys();
 
         if (!g_imguiInit) return o_swap(hdc);
-
-        if (!g_frameLog) {
-            g_frameLog = true;
-            Log("[hooks] primeiro frame render OK (menuOpen=%d, sdkReady=%d)",
-                (int)C.menuOpen, (int)g_sdkReady);
-        }
 
         RECT rc;
         GetClientRect(g_hwnd, &rc);
@@ -182,7 +182,7 @@ namespace Hooks {
         ImGui::NewFrame();
 
         Menu::Render();
-        if (g_sdkReady) {
+        if (g_sdkReady.load()) {
             ESP::Draw();
             Misc::Draw();
         }
@@ -209,7 +209,7 @@ namespace Hooks {
     }
 
     // -----------------------------------------------------------------------
-    //  main thread
+    //  main thread — SO chama Combat::Tick
     // -----------------------------------------------------------------------
     typedef void(__fastcall* tLateUpdate)(void* self, void* method);
     static tLateUpdate o_lateUpdate = nullptr;
@@ -217,33 +217,14 @@ namespace Hooks {
     static void __fastcall hk_lateUpdate(void* self, void* method) {
         if (o_lateUpdate) o_lateUpdate(self, method);
 
-        // 1) filtro primario: so a instancia do local player
         if (SDK::g_localPlayer && self != SDK::g_localPlayer) return;
 
-        // 2) backup: nunca mais de uma vez por frame
         uint32_t f = g_frameCounter.load(std::memory_order_relaxed);
         if (f == g_lastTickFrame) return;
         g_lastTickFrame = f;
 
         SDK::g_frameId = f;
-
-        SDK::UpdateView();
-        if (!SDK::g_viewProjOk) return;
-
-        g_sdkReady = true;
-
-        SDK::UpdateTargets();
-
-        if (C.aimbot) SDK::g_aimTarget = Aimbot::Best();
-        else          SDK::g_aimTarget = nullptr;
-
-        Misc::Tick();
         Combat::Tick();
-        Aimbot::Tick();
-        Triggerbot::Tick();
-        Weapons::Tick();
-        Movement::Tick();
-        AntiCheat::Tick();
     }
 
     bool InstallMainThread() {
@@ -280,7 +261,6 @@ namespace Hooks {
 
         if (C.aimbot && C.aimKeyDown && SDK::g_aimTarget &&
             SDK::g_localPlayer && SDK::O_rotationIsQuat) {
-            // AimLock salva o ORIGINAL em `original` e aplica a mira
             if (SDK::AimLock(SDK::g_aimTarget, original)) has = true;
         }
 
@@ -289,15 +269,34 @@ namespace Hooks {
         if (has && SDK::g_localPlayer) SDK::RestoreAim(SDK::g_localPlayer, original);
     }
 
-    typedef Quat(__fastcall* tRecoil)(void* self, const MethodInfo* m,
-        void* a1, void* a2, void* a3, void* a4);
-    static tRecoil o_recoil = nullptr;
+    // recoil: duas assinaturas (params float x params ponteiro)
+    typedef Quat(__fastcall* tRecoilF)(void*, const MethodInfo*, float, float, float, float);
+    typedef Quat(__fastcall* tRecoilP)(void*, const MethodInfo*, void*, void*, void*, void*);
+    static tRecoilF o_recoilF = nullptr;
+    static tRecoilP o_recoilP = nullptr;
 
-    static Quat __fastcall hk_recoil(void* self, const MethodInfo* m,
+    static Quat __fastcall hk_recoil_f(void* self, const MethodInfo* m,
+        float a1, float a2, float a3, float a4) {
+        if (C.noRecoil) return Quat{ 0.f, 0.f, 0.f, 1.f };
+        return o_recoilF ? o_recoilF(self, m, a1, a2, a3, a4) : Quat{ 0.f, 0.f, 0.f, 1.f };
+    }
+
+    static Quat __fastcall hk_recoil_p(void* self, const MethodInfo* m,
         void* a1, void* a2, void* a3, void* a4) {
-        const Quat zero{ 0.f, 0.f, 0.f, 1.f };
-        if (C.noRecoil) return zero;
-        return o_recoil ? o_recoil(self, m, a1, a2, a3, a4) : zero;
+        if (C.noRecoil) return Quat{ 0.f, 0.f, 0.f, 1.f };
+        return o_recoilP ? o_recoilP(self, m, a1, a2, a3, a4) : Quat{ 0.f, 0.f, 0.f, 1.f };
+    }
+
+    static bool AllParamsFloat(const MethodInfo* m) {
+        uint32_t pc = il2cpp_method_get_param_count(m);
+        if (pc == 0) return false;
+        for (uint32_t i = 0; i < pc && i < 4; ++i) {
+            const Il2CppType* t = il2cpp_method_get_param(m, i);
+            if (!t) return false;
+            const char* tn = il2cpp_type_get_name(t);
+            if (!tn || !strstr(tn, "Single")) return false;
+        }
+        return true;
     }
 
     bool InstallCombat() {
@@ -313,23 +312,26 @@ namespace Hooks {
         }
         else Log("[hooks] M_shoot nulo");
 
-        // recoil: aridade desconhecida -> varredura
         if (!SDK::M_recoil) {
             Il2CppClass* ps = SDK::FindClass("PlayerScript");
             if (ps) {
-                for (uint32_t a = 0; a <= 6 && !SDK::M_recoil; ++a)
-                    SDK::M_recoil = FindMethodByArity(ps, "ComputeShotRecoil", a);
-                if (!SDK::M_recoil) SDK::M_recoil = FindMethodAny(ps, "ComputeShotRecoil");
+                SDK::M_recoil = FindMethodAny(ps, "ComputeShotRecoil");
+                if (!SDK::M_recoil) SDK::M_recoil = FindMethodAny(ps, "ShotRecoil");
             }
         }
 
         if (SDK::M_recoil) {
-            Log("[hooks] recoil: params=%u", il2cpp_method_get_param_count(SDK::M_recoil));
+            uint32_t pc = il2cpp_method_get_param_count(SDK::M_recoil);
             void* p = SDK::MethodPtr(SDK::M_recoil);
-            if (p && MH_CreateHook(p, &hk_recoil, (void**)&o_recoil) == MH_OK) {
-                MH_EnableHook(p);
-                Log("[hooks] hook recoil OK");
-                ok = true;
+            Log("[hooks] recoil: params=%u ptr=%p allFloat=%d", pc, p, (int)AllParamsFloat(SDK::M_recoil));
+
+            if (p && AllParamsFloat(SDK::M_recoil) && pc > 0 && pc <= 4) {
+                if (MH_CreateHook(p, &hk_recoil_f, (void**)&o_recoilF) == MH_OK) {
+                    MH_EnableHook(p); ok = true; Log("[hooks] hook recoil OK (float)");
+                }
+            }
+            else if (p && MH_CreateHook(p, &hk_recoil_p, (void**)&o_recoilP) == MH_OK) {
+                MH_EnableHook(p); ok = true; Log("[hooks] hook recoil OK (ptr/0arg)");
             }
         }
         else Log("[hooks] M_recoil nulo");
@@ -338,6 +340,11 @@ namespace Hooks {
     }
 
     // -----------------------------------------------------------------------
+    void ApplyFeatures() {
+        Log("[hooks] ApplyFeatures: noRecoil=%d noSpread=%d infAmmo=%d speed=%d antiCheat=%d",
+            (int)C.noRecoil, (int)C.noSpread, (int)C.infAmmo, (int)C.speedHack, (int)C.antiCheat);
+    }
+
     bool Init() {
         if (g_mhInit) return true;
         if (MH_Initialize() != MH_OK) { Log("[hooks] MH_Initialize FALHOU"); return false; }
@@ -347,7 +354,12 @@ namespace Hooks {
         InstallMainThread();
         InstallCursor();
         InstallCombat();
+
+        Aimbot::Install();
+        Triggerbot::Install();
         AntiCheat::Install();
+
+        ApplyFeatures();
 
         g_hooksLive = true;
         Log("[hooks] instalados");

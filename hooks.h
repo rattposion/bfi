@@ -5,10 +5,9 @@
 namespace Hooks {
     extern std::atomic<bool> g_imguiReady;
     extern std::atomic<bool> g_hooksLive;
-    extern bool g_sdkReady;
+    extern std::atomic<bool> g_sdkReady;
     extern int  g_viewW, g_viewH;
 
-    // instalacao (chamadas pelo dllmain)
     bool InstallSwap();
     bool InstallMainThread();
     bool InstallCursor();
@@ -17,4 +16,5 @@ namespace Hooks {
     bool Init();
     void Shutdown();
     void ApplyFeatures();
+    void HandleKeys();
 }

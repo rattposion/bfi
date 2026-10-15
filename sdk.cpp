@@ -1,12 +1,6 @@
 // ============================================================================
-//  sdk.cpp — versao consolidada
-//  - SEH com chaves explicitas
-//  - GetPos/SetPos com cache de MethodInfo POR CLASSE
-//  - FindBoneContains converte Entity -> Transform
-//  - raiz de bone via humanMeshAnimator + fallback de altura (1.70m)
-//  - CameraObj prioriza a mCamera do local player
-//  - seqlock no g_viewProj
-//  - diagnostico de hierarquia e dump do AntiHack
+//  sdk.cpp — scan PlayerScript+Entity, aim pela cameraTransform, nome auto,
+//  vivo por _health, refresh 200ms.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -39,7 +33,6 @@ extern "C" {
     const char* (*il2cpp_class_get_name)(const Il2CppClass*) = nullptr;
     const char* (*il2cpp_class_get_namespace)(const Il2CppClass*) = nullptr;
     Il2CppClass* (*il2cpp_class_get_parent)(const Il2CppClass*) = nullptr;
-    Il2CppClass* (*il2cpp_class_get_element_class)(const Il2CppClass*) = nullptr;
     Il2CppImage* (*il2cpp_class_get_image)(const Il2CppClass*) = nullptr;
     Il2CppType* (*il2cpp_class_get_type)(const Il2CppClass*) = nullptr;
     Il2CppClass* (*il2cpp_class_from_type)(const Il2CppType*) = nullptr;
@@ -49,9 +42,11 @@ extern "C" {
     const MethodInfo* (*il2cpp_class_get_methods)(const Il2CppClass*, void**) = nullptr;
     size_t(*il2cpp_field_get_offset)(const FieldInfo*) = nullptr;
     const char* (*il2cpp_field_get_name)(const FieldInfo*) = nullptr;
+    Il2CppType* (*il2cpp_field_get_type)(const FieldInfo*) = nullptr;
     void (*il2cpp_field_static_get_value)(const FieldInfo*, void*) = nullptr;
     const char* (*il2cpp_method_get_name)(const MethodInfo*) = nullptr;
     uint32_t(*il2cpp_method_get_param_count)(const MethodInfo*) = nullptr;
+    const Il2CppType* (*il2cpp_method_get_param)(const MethodInfo*, uint32_t) = nullptr;
     Il2CppClass* (*il2cpp_object_get_class)(const Il2CppObject*) = nullptr;
     Il2CppObject* (*il2cpp_object_new)(const Il2CppClass*) = nullptr;
     void* (*il2cpp_object_unbox)(const Il2CppObject*) = nullptr;
@@ -62,6 +57,7 @@ extern "C" {
     Il2CppArray* (*il2cpp_array_new)(const Il2CppClass*, size_t) = nullptr;
     Il2CppDomain* (*il2cpp_thread_attach)(const Il2CppDomain*) = nullptr;
     Il2CppObject* (*il2cpp_type_get_object)(const Il2CppType*) = nullptr;
+    char* (*il2cpp_type_get_name)(const Il2CppType*) = nullptr;
 }
 
 namespace IL2CPP_API {
@@ -79,7 +75,6 @@ namespace IL2CPP_API {
             {"il2cpp_class_get_name", (void**)&il2cpp_class_get_name},
             {"il2cpp_class_get_namespace", (void**)&il2cpp_class_get_namespace},
             {"il2cpp_class_get_parent", (void**)&il2cpp_class_get_parent},
-            {"il2cpp_class_get_element_class", (void**)&il2cpp_class_get_element_class},
             {"il2cpp_class_get_image", (void**)&il2cpp_class_get_image},
             {"il2cpp_class_get_type", (void**)&il2cpp_class_get_type},
             {"il2cpp_class_from_type", (void**)&il2cpp_class_from_type},
@@ -89,9 +84,11 @@ namespace IL2CPP_API {
             {"il2cpp_class_get_methods", (void**)&il2cpp_class_get_methods},
             {"il2cpp_field_get_offset", (void**)&il2cpp_field_get_offset},
             {"il2cpp_field_get_name", (void**)&il2cpp_field_get_name},
+            {"il2cpp_field_get_type", (void**)&il2cpp_field_get_type},
             {"il2cpp_field_static_get_value", (void**)&il2cpp_field_static_get_value},
             {"il2cpp_method_get_name", (void**)&il2cpp_method_get_name},
             {"il2cpp_method_get_param_count", (void**)&il2cpp_method_get_param_count},
+            {"il2cpp_method_get_param", (void**)&il2cpp_method_get_param},
             {"il2cpp_object_get_class", (void**)&il2cpp_object_get_class},
             {"il2cpp_object_new", (void**)&il2cpp_object_new},
             {"il2cpp_object_unbox", (void**)&il2cpp_object_unbox},
@@ -101,7 +98,8 @@ namespace IL2CPP_API {
             {"il2cpp_array_length", (void**)&il2cpp_array_length},
             {"il2cpp_array_new", (void**)&il2cpp_array_new},
             {"il2cpp_thread_attach", (void**)&il2cpp_thread_attach},
-            {"il2cpp_type_get_object", (void**)&il2cpp_type_get_object}
+            {"il2cpp_type_get_object", (void**)&il2cpp_type_get_object},
+            {"il2cpp_type_get_name", (void**)&il2cpp_type_get_name}
         };
         g_resolved = g_missing = 0;
         for (size_t i = 0; i < sizeof(tbl) / sizeof(tbl[0]); ++i) {
@@ -114,163 +112,119 @@ namespace IL2CPP_API {
     }
 }
 
-// ---------------------------------------------------------------------------
-//  wrappers SEH — chaves explicitas
-// ---------------------------------------------------------------------------
 #define SE_BEGIN __try
 #define SE_END   __except (EXCEPTION_EXECUTE_HANDLER)
 
 static Il2CppDomain* se_domain_get() {
     Il2CppDomain* r = nullptr;
-    SE_BEGIN{ if (il2cpp_domain_get) r = il2cpp_domain_get(); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_domain_get) r = il2cpp_domain_get(); } SE_END{ r = nullptr; }
     return r;
 }
 static const Il2CppAssembly** se_domain_get_assemblies(Il2CppDomain* d, size_t* n) {
     const Il2CppAssembly** r = nullptr;
-    SE_BEGIN{ if (il2cpp_domain_get_assemblies) r = il2cpp_domain_get_assemblies(d, n); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_domain_get_assemblies) r = il2cpp_domain_get_assemblies(d, n); } SE_END{ r = nullptr; }
     return r;
 }
 static Il2CppImage* se_assembly_get_image(const Il2CppAssembly* a) {
     Il2CppImage* r = nullptr;
-    SE_BEGIN{ if (il2cpp_assembly_get_image) r = il2cpp_assembly_get_image(a); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_assembly_get_image) r = il2cpp_assembly_get_image(a); } SE_END{ r = nullptr; }
     return r;
 }
 static size_t se_image_class_count(Il2CppImage* img) {
     size_t r = 0;
-    SE_BEGIN{ if (il2cpp_image_get_class_count) r = il2cpp_image_get_class_count(img); }
-    SE_END{ r = 0; }
+    SE_BEGIN{ if (il2cpp_image_get_class_count) r = il2cpp_image_get_class_count(img); } SE_END{ r = 0; }
     return r;
 }
 static Il2CppClass* se_image_get_class(Il2CppImage* img, size_t i) {
     Il2CppClass* r = nullptr;
-    SE_BEGIN{ if (il2cpp_image_get_class) r = il2cpp_image_get_class(img, i); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_image_get_class) r = il2cpp_image_get_class(img, i); } SE_END{ r = nullptr; }
     return r;
 }
 static const char* se_class_name(Il2CppClass* k) {
     const char* r = nullptr;
-    SE_BEGIN{ if (il2cpp_class_get_name) r = il2cpp_class_get_name(k); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_class_get_name) r = il2cpp_class_get_name(k); } SE_END{ r = nullptr; }
     return r;
 }
 static const char* se_class_namespace(Il2CppClass* k) {
     const char* r = nullptr;
-    SE_BEGIN{ if (il2cpp_class_get_namespace) r = il2cpp_class_get_namespace(k); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_class_get_namespace) r = il2cpp_class_get_namespace(k); } SE_END{ r = nullptr; }
     return r;
 }
 static Il2CppClass* se_class_parent(Il2CppClass* k) {
     Il2CppClass* r = nullptr;
-    SE_BEGIN{ if (il2cpp_class_get_parent) r = il2cpp_class_get_parent(k); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_class_get_parent) r = il2cpp_class_get_parent(k); } SE_END{ r = nullptr; }
     return r;
 }
 static MethodInfo* se_class_get_method_from_name(Il2CppClass* k, const char* n, int a) {
     MethodInfo* r = nullptr;
-    SE_BEGIN{ if (il2cpp_class_get_method_from_name) r = il2cpp_class_get_method_from_name(k, n, a); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_class_get_method_from_name) r = il2cpp_class_get_method_from_name(k, n, a); } SE_END{ r = nullptr; }
     return r;
 }
 static FieldInfo* se_class_get_field_from_name(Il2CppClass* k, const char* n) {
     FieldInfo* r = nullptr;
-    SE_BEGIN{ if (il2cpp_class_get_field_from_name) r = il2cpp_class_get_field_from_name(k, n); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_class_get_field_from_name) r = il2cpp_class_get_field_from_name(k, n); } SE_END{ r = nullptr; }
     return r;
 }
 static FieldInfo* se_class_get_fields(Il2CppClass* k, void** iter) {
     FieldInfo* r = nullptr;
-    SE_BEGIN{ if (il2cpp_class_get_fields) r = il2cpp_class_get_fields(k, iter); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_class_get_fields) r = il2cpp_class_get_fields(k, iter); } SE_END{ r = nullptr; }
     return r;
 }
 static const char* se_field_name(FieldInfo* f) {
     const char* r = nullptr;
-    SE_BEGIN{ if (il2cpp_field_get_name) r = il2cpp_field_get_name(f); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_field_get_name) r = il2cpp_field_get_name(f); } SE_END{ r = nullptr; }
     return r;
 }
 static size_t se_field_offset(FieldInfo* f) {
     size_t r = 0;
-    SE_BEGIN{ if (il2cpp_field_get_offset) r = il2cpp_field_get_offset(f); }
-    SE_END{ r = 0; }
+    SE_BEGIN{ if (il2cpp_field_get_offset) r = il2cpp_field_get_offset(f); } SE_END{ r = 0; }
     return r;
 }
 static void se_field_static_get_value(FieldInfo* f, void* out) {
-    SE_BEGIN{ if (il2cpp_field_static_get_value) il2cpp_field_static_get_value(f, out); }
-        SE_END{ }
-}
-static const char* se_method_name(const MethodInfo* m) {
-    const char* r = nullptr;
-    SE_BEGIN{ if (il2cpp_method_get_name) r = il2cpp_method_get_name(m); }
-    SE_END{ r = nullptr; }
-    return r;
-}
-static uint32_t se_method_param_count(const MethodInfo* m) {
-    uint32_t r = 0;
-    SE_BEGIN{ if (il2cpp_method_get_param_count) r = il2cpp_method_get_param_count(m); }
-    SE_END{ r = 0; }
-    return r;
+    SE_BEGIN{ if (il2cpp_field_static_get_value) il2cpp_field_static_get_value(f, out); } SE_END{}
 }
 static Il2CppClass* se_object_get_class(Il2CppObject* o) {
     Il2CppClass* r = nullptr;
-    SE_BEGIN{ if (il2cpp_object_get_class) r = il2cpp_object_get_class(o); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_object_get_class) r = il2cpp_object_get_class(o); } SE_END{ r = nullptr; }
     return r;
 }
 static Il2CppObject* se_object_new(Il2CppClass* k) {
     Il2CppObject* r = nullptr;
-    SE_BEGIN{ if (il2cpp_object_new) r = il2cpp_object_new(k); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_object_new) r = il2cpp_object_new(k); } SE_END{ r = nullptr; }
     return r;
 }
 static void* se_object_unbox(Il2CppObject* o) {
     void* r = nullptr;
-    SE_BEGIN{ if (il2cpp_object_unbox) r = il2cpp_object_unbox(o); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_object_unbox) r = il2cpp_object_unbox(o); } SE_END{ r = nullptr; }
     return r;
 }
 static Il2CppObject* se_runtime_invoke(const MethodInfo* m, void* o, void** args) {
     Il2CppObject* r = nullptr;
-    SE_BEGIN{ if (il2cpp_runtime_invoke) r = il2cpp_runtime_invoke(m, o, args, nullptr); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_runtime_invoke) r = il2cpp_runtime_invoke(m, o, args, nullptr); } SE_END{ r = nullptr; }
     return r;
 }
 static Il2CppDomain* se_thread_attach(Il2CppDomain* d) {
     Il2CppDomain* r = nullptr;
-    SE_BEGIN{ if (il2cpp_thread_attach) r = il2cpp_thread_attach(d); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_thread_attach) r = il2cpp_thread_attach(d); } SE_END{ r = nullptr; }
     return r;
 }
 static Il2CppObject* se_type_get_object(Il2CppType* t) {
     Il2CppObject* r = nullptr;
-    SE_BEGIN{ if (il2cpp_type_get_object) r = il2cpp_type_get_object(t); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_type_get_object) r = il2cpp_type_get_object(t); } SE_END{ r = nullptr; }
     return r;
 }
 static Il2CppType* se_class_get_type(Il2CppClass* k) {
     Il2CppType* r = nullptr;
-    SE_BEGIN{ if (il2cpp_class_get_type) r = il2cpp_class_get_type(k); }
-    SE_END{ r = nullptr; }
-    return r;
-}
-static uint32_t se_array_length(Il2CppArray* a) {
-    uint32_t r = 0;
-    SE_BEGIN{ if (il2cpp_array_length) r = il2cpp_array_length(a); }
-    SE_END{ r = 0; }
+    SE_BEGIN{ if (il2cpp_class_get_type) r = il2cpp_class_get_type(k); } SE_END{ r = nullptr; }
     return r;
 }
 static const char* se_string_chars(Il2CppString* s) {
     const char* r = nullptr;
-    SE_BEGIN{ if (il2cpp_string_chars) r = il2cpp_string_chars(s); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ if (il2cpp_string_chars) r = il2cpp_string_chars(s); } SE_END{ r = nullptr; }
     return r;
 }
 static bool se_read_bytes(void* src, void* dst, size_t len) {
-    SE_BEGIN{ memcpy(dst, src, len); }
-    SE_END{ return false; }
+    SE_BEGIN{ memcpy(dst, src, len); } SE_END{ return false; }
     return true;
 }
 static bool se_is_exec(void* p) {
@@ -279,46 +233,38 @@ static bool se_is_exec(void* p) {
     return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 }
-
 static void* se_array_at(Il2CppArray* a, uint32_t i) {
     void* r = nullptr;
-    SE_BEGIN{ r = *(void**)((uintptr_t)a + 0x20 + (size_t)i * sizeof(void*)); }
-    SE_END{ r = nullptr; }
+    SE_BEGIN{ r = *(void**)((uintptr_t)a + 0x20 + (size_t)i * sizeof(void*)); } SE_END{ r = nullptr; }
     return r;
 }
 static bool se_read_ptr(void* base, size_t off, void** out) {
     *out = nullptr;
-    SE_BEGIN{ *out = *(void**)((uintptr_t)base + off); }
-    SE_END{ *out = nullptr; return false; }
+    SE_BEGIN{ *out = *(void**)((uintptr_t)base + off); } SE_END{ *out = nullptr; return false; }
     return *out != nullptr;
 }
 static bool se_read_int(void* base, size_t off, int* out) {
     *out = 0;
-    SE_BEGIN{ *out = *(int*)((uintptr_t)base + off); }
-    SE_END{ *out = 0; return false; }
+    SE_BEGIN{ *out = *(int*)((uintptr_t)base + off); } SE_END{ *out = 0; return false; }
     return true;
 }
 static bool se_read_bool(void* base, size_t off) {
     unsigned char b = 0;
-    SE_BEGIN{ b = *(unsigned char*)((uintptr_t)base + off); }
-    SE_END{ b = 0; }
+    SE_BEGIN{ b = *(unsigned char*)((uintptr_t)base + off); } SE_END{ b = 0; }
     return b != 0;
 }
 static float se_read_float(void* base, size_t off) {
     float r = 0.f;
-    SE_BEGIN{ r = *(float*)((uintptr_t)base + off); }
-    SE_END{ r = 0.f; }
+    SE_BEGIN{ r = *(float*)((uintptr_t)base + off); } SE_END{ r = 0.f; }
     return r;
 }
 static bool se_read_vec3(void* base, size_t off, Vec3* out) {
-    SE_BEGIN{ memcpy(out, (void*)((uintptr_t)base + off), sizeof(Vec3)); }
-    SE_END{ return false; }
+    SE_BEGIN{ memcpy(out, (void*)((uintptr_t)base + off), sizeof(Vec3)); } SE_END{ return false; }
     return true;
 }
 
 namespace SDK {
 
-    // ======================= estado =======================
     std::unordered_map<std::string, Il2CppClass*> g_classes;
     std::mutex g_classesMx;
 
@@ -339,15 +285,14 @@ namespace SDK {
     float g_viewProj[16] = { 0 };
     static volatile LONG g_vpSeq = 0;
 
-    // ======================= offsets =======================
     uint32_t O_health = 0, O_alive = 0, O_team = 0, O_isLocal = 0, O_name = 0, O_weapon = 0;
     uint32_t O_vel = 0, O_speed = 0, O_rot = 0, O_rotation = 0, O_cam = 0, O_camTf = 0;
     uint32_t O_mCamera = 0, O_humanMeshAnimator = 0, O_humanMeshReferences = 0;
     uint32_t O_stats = 0, O_gunView = 0, O_gunStats = 0, O_gunStatsOnView = 0;
     uint32_t O_curAmmo = 0, O_maxAmmo = 0, O_reloading = 0, O_spread = 0, O_fireRate = 0, O_dmg = 0;
+    static uint32_t O_localPlayerScript = 0;
     bool     O_rotationIsQuat = true;
 
-    // ======================= classes =======================
     Il2CppClass* kEntity = nullptr;
     Il2CppClass* kPlayerScript = nullptr;
     Il2CppClass* kPlayer = nullptr;
@@ -359,7 +304,6 @@ namespace SDK {
     Il2CppClass* kQuaternion = nullptr;
     Il2CppClass* kAntiHack = nullptr;
 
-    // ======================= metodos =======================
     MethodInfo* M_shoot = nullptr;
     MethodInfo* M_recoil = nullptr;
     MethodInfo* M_fireBullet = nullptr;
@@ -385,7 +329,38 @@ namespace SDK {
     static std::unordered_map<Il2CppObject*, Il2CppObject*> g_tfCache;
     static std::unordered_map<Il2CppClass*, MethodInfo*>     g_getPosMx;
 
+    static std::vector<uint32_t> g_strOffs;      // campos string do PlayerScript
+    static uint32_t g_pickedNameOff = 0;
+
     static const int kMaxTargets = MAX_TARGETS;
+
+    // ======================= pick de campo por nome + tipo =======================
+    uint32_t PickFieldOff(Il2CppClass* k, std::initializer_list<const char*> names,
+        const char* typeSub) {
+        if (!k) return 0;
+        for (Il2CppClass* c = k; c; c = se_class_parent(c)) {
+            for (const char* n : names) {
+                FieldInfo* f = se_class_get_field_from_name(c, n);
+                if (!f) continue;
+                if (typeSub) {
+                    const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+                    const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                    if (!tn || !strstr(tn, typeSub)) continue;
+                }
+                uint32_t o = (uint32_t)se_field_offset(f);
+                if (o) return o;
+            }
+        }
+        return 0;
+    }
+
+    static const char* FieldTypeOf(Il2CppClass* k, const char* name) {
+        FieldInfo* f = k ? se_class_get_field_from_name(k, name) : nullptr;
+        if (!f) return "?";
+        const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+        const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+        return tn ? tn : "?";
+    }
 
     // ======================= cache de classes =======================
     static void RegisterClass(const char* ns, const char* nm, Il2CppClass* k) {
@@ -502,11 +477,7 @@ namespace SDK {
         Il2CppObject* node = obj;
         if (!IsTransformClass(k)) {
             node = CachedTransform(obj);
-            if (!node) {
-                static bool logged = false;
-                if (!logged) { logged = true; Log("[sdk] GetPos: %s sem transform", se_class_name(k)); }
-                return out;
-            }
+            if (!node) return out;
             k = se_object_get_class(node);
             if (!k) return out;
         }
@@ -520,8 +491,6 @@ namespace SDK {
         if (p) memcpy(&out, p, sizeof(Vec3));
         return out;
     }
-
-    Vec3 GetPos(void* o) { return GetPos((Il2CppObject*)o); }
 
     void SetPos(Il2CppObject* obj, Vec3 v) {
         if (!obj) return;
@@ -547,7 +516,60 @@ namespace SDK {
         se_runtime_invoke(sp, node, args);
     }
 
-    void SetPos(void* o, Vec3 v) { SetPos((Il2CppObject*)o, v); }
+    // ======================= rotacao da camera =======================
+    Il2CppObject* CamTfObj() {
+        if (!g_localPlayer || !O_camTf) return nullptr;
+        return (Il2CppObject*)SafeReadObjPub(g_localPlayer, O_camTf);
+    }
+
+    Quat LookRot(Vec3 dir) {
+        Quat out{ 0.f, 0.f, 0.f, 1.f };
+        if (!kQuaternion) kQuaternion = FindClass("Quaternion", "UnityEngine");
+        if (!kQuaternion) return out;
+        if (!M_lookRot) M_lookRot = se_class_get_method_from_name(kQuaternion, "LookRotation", 1);
+        if (!M_lookRot) return out;
+
+        Il2CppObject* bv = nullptr;
+        if (!kVector3) kVector3 = FindClass("Vector3", "UnityEngine");
+        if (!kVector3) return out;
+        bv = se_object_new(kVector3);
+        if (!bv) return out;
+        void* bp = se_object_unbox(bv);
+        if (!bp) return out;
+        memcpy(bp, &dir, sizeof(Vec3));
+
+        void* a[1]; a[0] = bv;
+        Il2CppObject* r = se_runtime_invoke(M_lookRot, nullptr, a);
+        if (!r) return out;
+        void* p = se_object_unbox(r);
+        if (p) memcpy(&out, p, sizeof(Quat));
+        return out;
+    }
+
+    bool GetRot(Il2CppObject* tf, Quat& out) {
+        if (!tf) return false;
+        Il2CppClass* k = se_object_get_class(tf);
+        if (!k) return false;
+        MethodInfo* gr = se_class_get_method_from_name(k, "get_rotation", 0);
+        if (!gr) return false;
+        Il2CppObject* b = se_runtime_invoke(gr, tf, nullptr);
+        if (!b) return false;
+        void* p = se_object_unbox(b);
+        if (!p) return false;
+        memcpy(&out, p, sizeof(Quat));
+        return true;
+    }
+
+    bool SetRot(Il2CppObject* tf, Quat q) {
+        if (!tf) return false;
+        Il2CppClass* k = se_object_get_class(tf);
+        if (!k) return false;
+        MethodInfo* sr = se_class_get_method_from_name(k, "set_rotation", 1);
+        if (!sr) return false;
+        void* a[1]; a[0] = &q;
+        se_runtime_invoke(sr, tf, a);
+        return true;
+    }
 
     Vec3 GetVelocity(Il2CppObject* o) {
         Vec3 v{ 0.f, 0.f, 0.f };
@@ -566,31 +588,80 @@ namespace SDK {
     }
 
     static float ReadHealth(Il2CppObject* e) {
-        if (!e || !O_health) return 0.f;
+        if (!e || !O_health) return 100.f;
         float hp = se_read_float(e, O_health);
-        if (hp != hp || hp < 0.f || hp > 100000.f) {
-            int hpi = 0; se_read_int(e, O_health, &hpi); hp = (float)hpi;
+        if (!(hp >= 0.f && hp <= 100000.f)) {
+            int hpi = 0; se_read_int(e, O_health, &hpi);
+            if (hpi >= 0 && hpi <= 100000) hp = (float)hpi;
         }
+        if (!(hp >= 0.f && hp <= 100000.f)) return 100.f;
+        if (hp > 1.5f && hp <= 150.f) return hp;        // escala 0..100
+        if (hp >= 0.f && hp <= 1.5f) return hp * 100.f; // escala 0..1
         return hp;
     }
 
     float GetHealth(Il2CppObject* o) { return ReadHealth(o); }
-    float GetHealth(void* o) { return ReadHealth((Il2CppObject*)o); }
 
     bool IsEnemy(Il2CppObject* o) {
-        if (!o || !O_team) return true;
+        if (!o) return false;
+        if (!O_team) return true;
         int team = 0; se_read_int(o, O_team, &team);
         return team != g_localTeam;
+    }
+
+    // ======================= nome automatico =======================
+    static void BuildStringOffsets() {
+        g_strOffs.clear();
+        if (!kPlayerScript) return;
+        void* it = nullptr;
+        for (;;) {
+            FieldInfo* f = se_class_get_fields(kPlayerScript, &it);
+            if (!f) break;
+            const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+            if (!tn || !strstr(tn, "String")) continue;
+            uint32_t o = (uint32_t)se_field_offset(f);
+            if (o) g_strOffs.push_back(o);
+        }
+        Log("[sdk] campos String em PlayerScript: %d", (int)g_strOffs.size());
+    }
+
+    static bool PlausibleName(const char* s) {
+        if (!s || !s[0]) return false;
+        size_t len = strlen(s);
+        if (len < 2 || len > 24) return false;
+        bool allDigits = true;
+        for (const char* p = s; *p; ++p) {
+            if (*p < 32 || *p > 126) return false;
+            if (*p < '0' || *p > '9') allDigits = false;
+        }
+        return !allDigits;
     }
 
     void GetNameBuf(Il2CppObject* o, char* out, int n) {
         if (!out || n <= 0) return;
         out[0] = 0;
-        if (!o || !O_name) return;
-        void* sp = nullptr;
-        if (!se_read_ptr(o, (size_t)O_name, &sp) || !sp) return;
-        const char* s = se_string_chars((Il2CppString*)sp);
-        if (s) strncpy_s(out, (size_t)n, s, _TRUNCATE);
+        if (!o) return;
+
+        // 1) offset explicito, se resolver
+        if (O_name) {
+            void* sp = nullptr;
+            if (se_read_ptr(o, (size_t)O_name, &sp) && sp) {
+                const char* s = se_string_chars((Il2CppString*)sp);
+                if (PlausibleName(s)) { strncpy_s(out, (size_t)n, s, _TRUNCATE); return; }
+            }
+        }
+
+        // 2) varre os campos string do PlayerScript
+        for (uint32_t off : g_strOffs) {
+            void* sp = nullptr;
+            if (!se_read_ptr(o, off, &sp) || !sp) continue;
+            const char* s = se_string_chars((Il2CppString*)sp);
+            if (!PlausibleName(s)) continue;
+            if (!g_pickedNameOff) { g_pickedNameOff = off; Log("[sdk] campo de nome = 0x%X (\"%s\")", off, s); }
+            strncpy_s(out, (size_t)n, s, _TRUNCATE);
+            return;
+        }
     }
 
     std::string GetName(Il2CppObject* o) {
@@ -601,6 +672,58 @@ namespace SDK {
 
     Il2CppObject* GetGunStats(Il2CppObject* p) { return (p && O_gunStats) ? SafeReadObjPub(p, O_gunStats) : nullptr; }
     Il2CppObject* GetWeapon(Il2CppObject* p) { return (p && O_weapon) ? SafeReadObjPub(p, O_weapon) : nullptr; }
+
+    // ======================= diag =======================
+    static void DumpStringFields(Il2CppObject* inst) {
+        if (!inst) return;
+        Il2CppClass* k = se_object_get_class(inst);
+        if (!k) return;
+        Log("[str] ---- campos String de %s ----", se_class_name(k));
+        void* iter = nullptr;
+        int n = 0;
+        for (;;) {
+            FieldInfo* f = se_class_get_fields(k, &iter);
+            if (!f) break;
+            const char* fn = se_field_name(f);
+            if (!fn) continue;
+            const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+            if (!tn || !strstr(tn, "String")) continue;
+            uint32_t off = (uint32_t)se_field_offset(f);
+            if (!off) continue;
+            void* sp = nullptr;
+            if (!se_read_ptr(inst, off, &sp) || !sp) { Log("[str]   %s @0x%X = (null)", fn, off); continue; }
+            const char* s = se_string_chars((Il2CppString*)sp);
+            Log("[str]   %s @0x%X = \"%s\"", fn, off, s ? s : "?");
+            if (++n > 25) break;
+        }
+        Log("[str] ---- fim ----");
+    }
+
+    static void DumpFloatFields(Il2CppObject* inst) {
+        if (!inst) return;
+        Il2CppClass* k = se_object_get_class(inst);
+        if (!k) return;
+        Log("[flt] ---- campos float de %s ----", se_class_name(k));
+        void* iter = nullptr;
+        int n = 0;
+        for (;;) {
+            FieldInfo* f = se_class_get_fields(k, &iter);
+            if (!f) break;
+            const char* fn = se_field_name(f);
+            if (!fn) continue;
+            const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+            if (!tn || !strstr(tn, "Single")) continue;
+            uint32_t off = (uint32_t)se_field_offset(f);
+            if (!off) continue;
+            float v = se_read_float(inst, off);
+            if (!(v >= -1000.f && v <= 100000.f)) continue;
+            Log("[flt]   %s @0x%X = %.3f", fn, off, (double)v);
+            if (++n > 30) break;
+        }
+        Log("[flt] ---- fim ----");
+    }
 
     // ======================= bones =======================
     Il2CppObject* FindBoneContains(Il2CppObject* root, const char* sub, int budget) {
@@ -664,64 +787,21 @@ namespace SDK {
         return nullptr;
     }
 
-    void LogHierarchy(Il2CppObject* root, int maxNodes) {
-        if (!root) { Log("[hier] root nulo"); return; }
-        static Il2CppObject* stk[512];
-        int top = 0; stk[top++] = root;
-        int visited = 0;
-
-        while (top > 0 && visited < maxNodes) {
-            Il2CppObject* cur = stk[--top];
-            if (!cur) continue;
-            Il2CppClass* k = se_object_get_class(cur);
-            if (!k) continue;
-
-            MethodInfo* gn = se_class_get_method_from_name(k, "get_name", 0);
-            const char* nm = nullptr;
-            if (gn) {
-                Il2CppObject* s = se_runtime_invoke(gn, cur, nullptr);
-                if (s) nm = se_string_chars((Il2CppString*)s);
-            }
-            Log("[hier] %s", nm ? nm : "?");
-
-            int cc = 0;
-            MethodInfo* gc = se_class_get_method_from_name(k, "get_childCount", 0);
-            if (gc) {
-                Il2CppObject* b = se_runtime_invoke(gc, cur, nullptr);
-                if (b) { void* p = se_object_unbox(b); if (p) cc = *(int*)p; }
-            }
-
-            MethodInfo* gch = se_class_get_method_from_name(k, "GetChild", 1);
-            if (!gch) continue;
-            if (!kInt32) kInt32 = FindClass("Int32", "System");
-            if (!kInt32) continue;
-
-            for (int i = 0; i < cc && top < 512; ++i) {
-                Il2CppObject* bi = se_object_new(kInt32);
-                if (!bi) break;
-                void* bp = se_object_unbox(bi);
-                if (!bp) break;
-                *(int*)bp = i;
-                void* a[1]; a[0] = bi;
-                Il2CppObject* c = se_runtime_invoke(gch, cur, a);
-                if (c) stk[top++] = c;
-            }
-            ++visited;
-        }
-    }
-
     // ======================= camera / view =======================
     Il2CppObject* CameraObj() {
         if (!kCamera) kCamera = FindClass("Camera", "UnityEngine");
         if (!kCamera) return nullptr;
 
-        // 1) camera propria do local player
-        if (g_localPlayer && O_mCamera) {
-            Il2CppObject* c = SafeReadObjPub(g_localPlayer, O_mCamera);
+        if (MethodInfo* m = se_class_get_method_from_name(kCamera, "get_main", 0)) {
+            Il2CppObject* c = se_runtime_invoke(m, nullptr, nullptr);
             if (c) return c;
         }
 
-        // 2) cameraTransform.GetComponent<Camera>()
+        if (g_localPlayer && O_mCamera) {
+            Il2CppObject* c = SafeReadObjPub(g_localPlayer, O_mCamera);
+            if (c && IsA(c, kCamera)) return c;
+        }
+
         if (g_localPlayer && O_camTf) {
             Il2CppObject* tf = SafeReadObjPub(g_localPlayer, O_camTf);
             if (tf) {
@@ -743,17 +823,15 @@ namespace SDK {
             }
         }
 
-        // 3) globais
-        MethodInfo* m = se_class_get_method_from_name(kCamera, "get_main", 0);
-        if (m) { Il2CppObject* c = se_runtime_invoke(m, nullptr, nullptr); if (c) return c; }
+        if (MethodInfo* m = se_class_get_method_from_name(kCamera, "get_current", 0)) {
+            Il2CppObject* c = se_runtime_invoke(m, nullptr, nullptr);
+            if (c) return c;
+        }
 
-        m = se_class_get_method_from_name(kCamera, "get_current", 0);
-        if (m) { Il2CppObject* c = se_runtime_invoke(m, nullptr, nullptr); if (c) return c; }
-
-        m = se_class_get_method_from_name(kCamera, "get_allCameras", 0);
-        if (m) {
+        if (MethodInfo* m = se_class_get_method_from_name(kCamera, "get_allCameras", 0)) {
             Il2CppArray* arr = (Il2CppArray*)se_runtime_invoke(m, nullptr, nullptr);
-            if (arr && se_array_length(arr) > 0) return (Il2CppObject*)se_array_at(arr, 0);
+            if (arr && il2cpp_array_length && il2cpp_array_length(arr) > 0)
+                return (Il2CppObject*)se_array_at(arr, 0);
         }
         return nullptr;
     }
@@ -820,8 +898,30 @@ namespace SDK {
     }
 
     bool VisibleLine(Vec3 a, Vec3 b) {
-        Vec2 t;
-        return WorldToScreen(a, t) && WorldToScreen(b, t);
+        Vec2 sa, sb;
+        if (!WorldToScreen(a, sa) || !WorldToScreen(b, sb)) return false;
+        const float W = (float)Hooks::g_viewW, H = (float)Hooks::g_viewH;
+        auto inside = [&](const Vec2& p) {
+            return p.x > -W * 0.25f && p.x < W * 1.25f && p.y > -H * 0.25f && p.y < H * 1.25f;
+            };
+        return inside(sa) && inside(sb);
+    }
+
+    Vec3 TargetAimPos(Il2CppObject* p, int boneMode) {
+        if (!p) return Vec3();
+        EnterCriticalSection(&g_targetCs);
+        for (int i = 0; i < g_targetCount; ++i) {
+            if (g_targets[i].player != p) continue;
+            Target& t = g_targets[i];
+            Vec3 h = t.headBone ? GetPos(t.headBone) : t.head;
+            Vec3 f = t.footBone ? GetPos(t.footBone) : t.feet;
+            LeaveCriticalSection(&g_targetCs);
+            if (boneMode == 0) return h;
+            if (boneMode == 2) return Vec3(h.x, (h.y + f.y) * 0.5f, h.z);
+            return Vec3(h.x, h.y - (h.y - f.y) * 0.25f, h.z);
+        }
+        LeaveCriticalSection(&g_targetCs);
+        return Vec3();
     }
 
     void LockTargets() { EnterCriticalSection(&g_targetCs); }
@@ -885,133 +985,192 @@ namespace SDK {
         t.obj = t.player;
         t.feet = t.pos;
         t.hp = t.health;
-        t.isLocal = false;
-        t.enemy = (t.team != g_localTeam);
+        t.enemy = (O_team == 0) ? true : (t.team != g_localTeam);
         t.lastSeen = GetTickCount64();
-        if (t.headBone) t.lastBoneScan = GetTickCount64();
+    }
+
+    static void ResolveHeadFeet(Target& t) {
+        const float H = 1.75f;
+
+        bool haveHead = (t.headBone != nullptr);
+        bool haveFeet = (t.footBone != nullptr);
+
+        if (haveHead) t.head = GetPos(t.headBone);
+        if (haveFeet) t.feet = GetPos(t.footBone);
+
+        if (haveHead && haveFeet) {
+            float dy = t.head.y - t.feet.y;
+            if (dy < 0.6f || dy > 2.6f)
+                t.feet = Vec3(t.head.x, t.head.y - H, t.head.z);
+        }
+        else if (haveHead) {
+            t.feet = Vec3(t.head.x, t.head.y - H, t.head.z);
+        }
+        else if (haveFeet) {
+            t.head = Vec3(t.feet.x, t.feet.y + H, t.feet.z);
+        }
+        else {
+            t.head = t.pos;
+            t.feet = Vec3(t.pos.x, t.pos.y - H, t.pos.z);
+        }
+
+        if (t.head.y < t.feet.y) {
+            float mid = (t.head.y + t.feet.y) * 0.5f;
+            t.head.y = mid + H * 0.5f;
+            t.feet.y = mid - H * 0.5f;
+        }
+    }
+
+    static bool IsLocalEntity(Il2CppObject* e) {
+        if (!e) return true;
+        if (e == g_localPlayer || e == g_local) return true;
+        if (O_isLocal && se_read_bool(e, O_isLocal)) return true;
+        if (O_localPlayerScript && kPlayerScript && IsA(e, kPlayerScript)) {
+            Il2CppObject* lp = SafeReadObjPub(e, O_localPlayerScript);
+            if (lp == e) return true;
+        }
+        return false;
+    }
+
+    static void AdoptLocal(Il2CppObject* e) {
+        if (!e || g_localPlayer) return;
+        g_localPlayer = e;
+        g_local = e;
+        if (O_team) { int tm = 0; if (se_read_int(e, O_team, &tm)) g_localTeam = tm; }
+        Log("[sdk] localPlayer encontrado no scan (%p) team=%d", e, g_localTeam);
+    }
+
+    static bool AlreadyAdded(Il2CppObject* e, int c) {
+        for (int i = 0; i < c; ++i) if (g_targets[i].player == e) return true;
+        return false;
     }
 
     void RefreshTargets() {
         if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
-        if (g_localPlayer && O_team) { int tm = 0; if (se_read_int(g_localPlayer, O_team, &tm)) g_localTeam = tm; }
-
-        if (!kEntity) kEntity = FindClass("Entity");
-        if (!kEntity) { Log("[sdk] classe Entity nao encontrada"); return; }
 
         Il2CppClass* oc = FindClass("Object", "UnityEngine");
         if (!oc) { Log("[sdk] UnityEngine.Object nao encontrada"); return; }
         MethodInfo* fot = se_class_get_method_from_name(oc, "FindObjectsOfType", 1);
         if (!fot) { Log("[sdk] FindObjectsOfType nao encontrado"); return; }
-        Il2CppType* t = se_class_get_type(kEntity);
-        if (!t) { Log("[sdk] class_get_type falhou"); return; }
-        Il2CppObject* typeObj = se_type_get_object(t);
-        if (!typeObj) { Log("[sdk] type_get_object falhou"); return; }
 
-        void* args[1]; args[0] = typeObj;
-        Il2CppArray* arr = (Il2CppArray*)se_runtime_invoke(fot, nullptr, args);
-        if (!arr) { Log("[sdk] FindObjectsOfType retornou nulo"); return; }
-
-        uint32_t n = se_array_length(arr);
+        Il2CppClass* scans[2] = {
+            kPlayerScript ? kPlayerScript : FindClass("PlayerScript"),
+            kEntity ? kEntity : FindClass("Entity")
+        };
 
         static const char* kHeads[] = { "Head", "head", "HEAD", "Bip01 Head",
                                         "mixamorig:Head", "neck", "Bone_Head" };
         static const char* kFeet[] = { "Foot", "foot", "Foot_L", "Bip01 L Foot",
                                         "mixamorig:LeftFoot", "toe", "Bone_Foot" };
-        static bool hierLogged = false;
+
+        int totalObjs = 0;
 
         EnterCriticalSection(&g_targetCs);
         int c = 0;
-        for (uint32_t i = 0; i < n && c < kMaxTargets; ++i) {
-            Il2CppObject* e = (Il2CppObject*)se_array_at(arr, i);
-            if (!e) continue;
 
-            if (O_isLocal && se_read_bool(e, O_isLocal)) {
-                if (!g_localPlayer) { g_localPlayer = e; g_local = e; Log("[sdk] localPlayer via isLocalPlayer"); }
-                continue;
-            }
-            if (e == g_localPlayer || e == g_local) continue;
+        for (int s = 0; s < 2 && c < kMaxTargets; ++s) {
+            Il2CppClass* sc = scans[s];
+            if (!sc) continue;
+            if (s == 1 && scans[0] == scans[1]) break;
 
-            Target& tgt = g_targets[c];
-            memset(&tgt, 0, sizeof(Target));
+            Il2CppType* t = se_class_get_type(sc);
+            if (!t) continue;
+            Il2CppObject* typeObj = se_type_get_object(t);
+            if (!typeObj) continue;
 
-            tgt.player = e;
-            tgt.obj = e;
-            tgt.alive = O_alive ? se_read_bool(e, O_alive) : true;
-            tgt.team = 0;
-            if (O_team) se_read_int(e, O_team, &tgt.team);
-            tgt.pos = GetPos(e);
-            tgt.health = ReadHealth(e);
-            tgt.hp = tgt.health;
-            tgt.weapon = 0;
-            if (O_weapon) se_read_int(e, O_weapon, &tgt.weapon);
-            GetNameBuf(e, tgt.name, sizeof(tgt.name));
+            void* args[1]; args[0] = typeObj;
+            Il2CppArray* arr = (Il2CppArray*)se_runtime_invoke(fot, nullptr, args);
+            if (!arr) continue;
 
-            Il2CppClass* ek = se_object_get_class(e);
-            const char* en = ek ? se_class_name(ek) : nullptr;
-            tgt.npc = (en && strstr(en, "NPC") != nullptr);
+            uint32_t n = il2cpp_array_length ? il2cpp_array_length(arr) : 0;
+            totalObjs += (int)n;
 
-            // ---- raiz dos bones: transform do entity; senao o animator do mesh ----
-            Il2CppObject* boneRoot = CachedTransform(e);
-            if (O_humanMeshAnimator) {
-                Il2CppObject* anim = SafeReadObjPub(e, O_humanMeshAnimator);
-                if (anim) {
-                    Il2CppObject* at = ResolveGetTransform(anim);
-                    if (at) boneRoot = at;
+            for (uint32_t i = 0; i < n && c < kMaxTargets; ++i) {
+                Il2CppObject* e = (Il2CppObject*)se_array_at(arr, i);
+                if (!e) continue;
+
+                if (IsLocalEntity(e)) { AdoptLocal(e); continue; }
+                if (AlreadyAdded(e, c)) continue;
+
+                Target& tgt = g_targets[c];
+                memset(&tgt, 0, sizeof(Target));
+
+                tgt.player = e;
+                tgt.obj = e;
+                tgt.health = ReadHealth(e);
+                tgt.hp = tgt.health;
+                tgt.alive = (tgt.health > 0.5f);
+                if (O_alive && O_health == 0) tgt.alive = se_read_bool(e, O_alive);
+
+                if (O_team) se_read_int(e, O_team, &tgt.team);
+                tgt.pos = GetPos(e);
+                if (O_weapon) se_read_int(e, O_weapon, &tgt.weapon);
+                GetNameBuf(e, tgt.name, sizeof(tgt.name));
+
+                Il2CppClass* ek = se_object_get_class(e);
+                const char* en = ek ? se_class_name(ek) : nullptr;
+                tgt.npc = (en && strstr(en, "NPC") != nullptr);
+
+                Il2CppObject* boneRoot = CachedTransform(e);
+                if (O_humanMeshAnimator) {
+                    Il2CppObject* anim = SafeReadObjPub(e, O_humanMeshAnimator);
+                    if (anim) {
+                        Il2CppObject* at = ResolveGetTransform(anim);
+                        if (at) boneRoot = at;
+                    }
                 }
+
+                tgt.headBone = FindBoneAny(boneRoot, kHeads, 7);
+                tgt.footBone = FindBoneAny(boneRoot, kFeet, 7);
+                ResolveHeadFeet(tgt);
+
+                tgt.onScreen = false;
+                SyncAliases(tgt);
+                ++c;
             }
-
-            if (!hierLogged && boneRoot) {
-                hierLogged = true;
-                Log("[hier] ---- arvore do alvo ----");
-                LogHierarchy(boneRoot, 60);
-                Log("[hier] ---- fim ----");
-            }
-
-            tgt.headBone = FindBoneAny(boneRoot, kHeads, 7);
-            tgt.footBone = FindBoneAny(boneRoot, kFeet, 7);
-
-            // fallback: altura humana fixa -> ESP funciona sem osso
-            if (tgt.headBone) tgt.head = GetPos(tgt.headBone);
-            else              tgt.head = Vec3{ tgt.pos.x, tgt.pos.y + 1.70f, tgt.pos.z };
-
-            tgt.feet = tgt.footBone ? GetPos(tgt.footBone) : tgt.pos;
-
-            tgt.onScreen = false;
-            SyncAliases(tgt);
-            ++c;
         }
+
         g_targetCount = c;
         LeaveCriticalSection(&g_targetCs);
 
         static int lastLog = -1;
         if (g_targetCount != lastLog) {
             lastLog = g_targetCount;
-            Log("[sdk] scan: objetos=%u alvos=%d local=%p", n, g_targetCount, g_localPlayer);
+            Log("[sdk] scan: objetos=%d alvos=%d local=%p team=%d",
+                totalObjs, g_targetCount, g_localPlayer, g_localTeam);
+        }
+
+        static bool dumped = false;
+        if (!dumped && g_targetCount > 0) {
+            dumped = true;
+            Target& t = g_targets[0];
+            Log("[diag] alvo=%p pos=(%.2f,%.2f,%.2f) head=(%.2f,%.2f,%.2f) feet=(%.2f,%.2f,%.2f) hb=%p fb=%p hp=%.1f nome=\"%s\"",
+                t.player, t.pos.x, t.pos.y, t.pos.z, t.head.x, t.head.y, t.head.z,
+                t.feet.x, t.feet.y, t.feet.z, t.headBone, t.footBone, t.health, t.name);
+            DumpStringFields(t.player);
+            DumpFloatFields(t.player);
         }
     }
 
     void UpdateTargets() {
-        static DWORD lastRefresh = 0;
-        DWORD now = GetTickCount();
-        if (now - lastRefresh > 500) { lastRefresh = now; ClearTfCache(); RefreshTargets(); }
+        static ULONGLONG lastRefresh = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastRefresh > 200) { lastRefresh = now; ClearTfCache(); RefreshTargets(); }
 
         if (!g_localPlayer) return;
         g_localPos = GetPos(g_localPlayer);
 
         EnterCriticalSection(&g_targetCs);
-        int onScr = 0;
         for (int i = 0; i < g_targetCount; ++i) {
             Target& t = g_targets[i];
             if (!t.player) continue;
 
-            t.alive = O_alive ? se_read_bool(t.player, O_alive) : true;
             t.health = ReadHealth(t.player);
+            t.alive = (t.health > 0.5f);
+            if (O_alive && O_health == 0) t.alive = se_read_bool(t.player, O_alive);
+
             t.pos = GetPos(t.player);
-
-            if (t.headBone) t.head = GetPos(t.headBone);
-            else            t.head = Vec3{ t.pos.x, t.pos.y + 1.70f, t.pos.z };
-
-            t.feet = t.footBone ? GetPos(t.footBone) : t.pos;
+            ResolveHeadFeet(t);
 
             float dx = t.head.x - g_localPos.x, dy = t.head.y - g_localPos.y, dz = t.head.z - g_localPos.z;
             t.dist = sqrtf(dx * dx + dy * dy + dz * dz);
@@ -1022,28 +1181,10 @@ namespace SDK {
             t.onScreen = okH && okF && (h > 1.f)
                 && t.scrFeet.y > -64.f
                 && t.scrHead.y < (float)ScreenH() + 64.f;
-            if (t.onScreen) ++onScr;
 
             SyncAliases(t);
         }
-
-        static int dbgCnt = 0;
-        if (++dbgCnt % 200 == 0 && g_targetCount > 0) {
-            Target& t0 = g_targets[0];
-            float m[16];
-            memcpy(m, g_viewProj, sizeof(m));
-            float ww = m[3] * t0.head.x + m[7] * t0.head.y + m[11] * t0.head.z + m[15];
-            Log("[sdk] w2s: mundo=(%.1f,%.1f,%.1f) tela=(%.0f,%.0f) h=%.0f ok=%d w=%.3f cam=%p",
-                t0.head.x, t0.head.y, t0.head.z, t0.scrHead.x, t0.scrHead.y,
-                (t0.scrFeet.y - t0.scrHead.y), (int)t0.onScreen, ww, g_camera);
-        }
         LeaveCriticalSection(&g_targetCs);
-
-        static int lastOnScr = -1;
-        if (onScr != lastOnScr) {
-            lastOnScr = onScr;
-            Log("[sdk] onScreen: %d de %d (viewOk=%d)", onScr, g_targetCount, (int)g_viewProjOk);
-        }
     }
 
     std::vector<Target> Snapshot() {
@@ -1065,40 +1206,34 @@ namespace SDK {
     }
 
     // ======================= aim =======================
+    // agora salva/aplica a rotacao da CAMERA (que e o que define a mira)
     bool AimLock(Il2CppObject* target, Quat& savedOriginal) {
-        if (!target || !g_localPlayer || !O_rotation || !O_rotationIsQuat) return false;
+        Il2CppObject* camTf = CamTfObj();
+        if (!target || !camTf) return false;
 
-        memcpy(&savedOriginal, (void*)((uintptr_t)g_localPlayer + O_rotation), sizeof(Quat));
+        if (!GetRot(camTf, savedOriginal)) return false;
 
-        Vec3 me = GetPos(g_localPlayer);
-        Il2CppObject* hb = FindBoneContains(target, "Head", 2048);
-        Vec3 tp = hb ? GetPos(hb) : GetPos(target);
+        Vec3 me = GetPos(camTf);
+        Vec3 tp = TargetAimPos(target, C.aimBone);
+        if (tp.zero()) tp = GetPos(target);
         Vec3 dir{ tp.x - me.x, tp.y - me.y, tp.z - me.z };
+        float L = dir.len();
+        if (L < 0.0001f) return false;
+        dir = dir * (1.f / L);
 
-        if (!kQuaternion) kQuaternion = FindClass("Quaternion", "UnityEngine");
-        if (!kVector3)    kVector3 = FindClass("Vector3", "UnityEngine");
-        if (!kQuaternion || !kVector3) return false;
+        Quat q = LookRot(dir);
+        if (!SetRot(camTf, q)) return false;
 
-        if (!M_lookRot) M_lookRot = se_class_get_method_from_name(kQuaternion, "LookRotation", 1);
-        if (!M_lookRot) return false;
+        if (g_localPlayer && O_rotation && O_rotationIsQuat)
+            SafeWrite((uintptr_t)g_localPlayer + O_rotation, (void*)&q, sizeof(q));
 
-        Il2CppObject* bv = BoxVec3(dir);
-        if (!bv) return false;
-        void* args[1]; args[0] = bv;
-        Il2CppObject* boxed = se_runtime_invoke(M_lookRot, nullptr, args);
-        if (!boxed) return false;
-        void* p = se_object_unbox(boxed);
-        if (!p) return false;
-
-        Quat q;
-        memcpy(&q, p, sizeof(Quat));
-        SafeWrite((uintptr_t)g_localPlayer + O_rotation, &q, sizeof(q));
         return true;
     }
 
-    void RestoreAim(Il2CppObject* p, const Quat& q) {
-        if (!p || !O_rotation || !O_rotationIsQuat) return;
-        SafeWrite((uintptr_t)p + O_rotation, (void*)&q, sizeof(q));
+    void RestoreAim(Il2CppObject* /*p*/, const Quat& q) {
+        Il2CppObject* camTf = CamTfObj();
+        if (!camTf) return;
+        SetRot(camTf, q);
     }
 
     void FireBulletAt(Vec3 pos) {
@@ -1108,7 +1243,7 @@ namespace SDK {
         float L = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
         if (L > 0.0001f) { dir.x /= L; dir.y /= L; dir.z /= L; }
 
-        uint32_t np = se_method_param_count(M_FireBullet);
+        uint32_t np = il2cpp_method_get_param_count ? il2cpp_method_get_param_count(M_FireBullet) : 0;
         if (np == 0) np = 1;
         std::vector<Il2CppObject*> keep(np, nullptr);
         std::vector<void*> args(np, nullptr);
@@ -1117,7 +1252,7 @@ namespace SDK {
     }
 
     // ======================= init / shutdown =======================
-    void Shutdown(void) {
+    void Shutdown() {
         g_phase = "sdk.shutdown";
         Log("[sdk] Shutdown");
         g_localPlayer = nullptr;
@@ -1128,33 +1263,33 @@ namespace SDK {
         ClearTfCache();
     }
 
-    static unsigned int FieldOff(Il2CppClass* k, const char* n) {
-        if (!k) return 0;
-        FieldInfo* f = se_class_get_field_from_name(k, n);
-        return f ? (unsigned int)se_field_offset(f) : 0;
-    }
-
     static void ResolveOffsets() {
         if (kEntity) {
-            O_rotation = FieldOff(kEntity, "rotation");
-            O_camTf = FieldOff(kEntity, "cameraTransform");
-            O_vel = FieldOff(kEntity, "velocity");
-            O_name = FieldOff(kEntity, "username");
-            O_isLocal = FieldOff(kEntity, "isLocalPlayer");
-            if (!O_isLocal) O_isLocal = FieldOff(kEntity, "isMine");
-            if (!O_isLocal) O_isLocal = FieldOff(kEntity, "isOwner");
+            O_health = PickFieldOff(kEntity, { "_health", "health", "hp", "Health", "mHealth", "currentHealth", "life" }, "Single");
+            O_alive = PickFieldOff(kEntity, { "shouldBeAlive", "alive", "isAlive", "mAlive", "IsAlive" }, "Boolean");
+            O_isLocal = PickFieldOff(kEntity, { "isMine", "isLocalPlayer", "isOwner" }, "Boolean");
+            O_rotation = PickFieldOff(kEntity, { "rotation" });
+            O_camTf = PickFieldOff(kEntity, { "cameraTransform" });
+            O_vel = PickFieldOff(kEntity, { "velocity", "movingVelocity" });
+            O_name = PickFieldOff(kEntity, { "username", "playerName", "name", "nickName", "mName" }, "String");
         }
         if (kPlayerScript) {
-            O_gunStats = FieldOff(kPlayerScript, "mpCurrentGunStats");
-            O_team = FieldOff(kPlayerScript, "mpTeamNumber");
-            O_weapon = FieldOff(kPlayerScript, "weapon");
-            O_speed = FieldOff(kPlayerScript, "lastMoveVelocity");
-            O_mCamera = FieldOff(kPlayerScript, "mCamera");
-            O_humanMeshAnimator = FieldOff(kPlayerScript, "humanMeshAnimator");
-            O_humanMeshReferences = FieldOff(kPlayerScript, "humanMeshReferences");
-            if (!O_isLocal)  O_isLocal = FieldOff(kPlayerScript, "isLocalPlayer");
-            if (!O_name)     O_name = FieldOff(kPlayerScript, "username");
-            if (!O_rotation) O_rotation = FieldOff(kPlayerScript, "rotation");
+            if (!O_health) O_health = PickFieldOff(kPlayerScript, { "_health", "health", "hp", "mHealth" }, "Single");
+            if (!O_alive)  O_alive = PickFieldOff(kPlayerScript, { "shouldBeAlive", "alive", "isAlive" }, "Boolean");
+            if (!O_isLocal) O_isLocal = PickFieldOff(kPlayerScript, { "isMine", "isLocalPlayer" }, "Boolean");
+            if (!O_rotation) O_rotation = PickFieldOff(kPlayerScript, { "rotation" });
+            if (!O_name) O_name = PickFieldOff(kPlayerScript, { "username", "playerName", "name", "nickName", "mName" }, "String");
+
+            O_localPlayerScript = PickFieldOff(kPlayerScript, { "localPlayerScript" });
+            O_gunStats = PickFieldOff(kPlayerScript, { "mpCurrentGunStats", "gunStats", "mGunStats" });
+            O_gunView = PickFieldOff(kPlayerScript, { "fpsGunView", "gunView", "mGunView", "currentGunView" });
+            O_gunStatsOnView = PickFieldOff(kPlayerScript, { "gunStatsOnView", "mGunStatsOnView", "statsOnView" });
+            O_team = PickFieldOff(kPlayerScript, { "mpTeamNumber", "team", "teamNumber", "mTeam" });
+            O_weapon = PickFieldOff(kPlayerScript, { "weapon", "currentWeapon", "mWeapon" });
+            O_speed = PickFieldOff(kPlayerScript, { "movementSpeedMultiplier", "lastMoveVelocity", "speed", "moveSpeed" });
+            O_mCamera = PickFieldOff(kPlayerScript, { "mCamera", "camera", "cam" });
+            O_humanMeshAnimator = PickFieldOff(kPlayerScript, { "humanMeshAnimator", "meshAnimator", "animator" });
+            O_humanMeshReferences = PickFieldOff(kPlayerScript, { "humanMeshReferences", "meshReferences" });
         }
 
         if (!O_rotation) O_rotation = 0x9B8;
@@ -1172,9 +1307,10 @@ namespace SDK {
         O_cam = O_camTf;
         O_rotationIsQuat = true;
 
-        Log("[sdk] offsets: rot=0x%X cam=0x%X team=0x%X alive=0x%X hp=0x%X name=0x%X wpn=0x%X isLocal=0x%X mCam=0x%X anim=0x%X",
-            O_rotation, O_camTf, O_team, O_alive, O_health, O_name, O_weapon, O_isLocal,
-            O_mCamera, O_humanMeshAnimator);
+        Log("[sdk] offsets: hp=0x%X(%s) alive=0x%X name=0x%X team=0x%X rot=0x%X(%s) camTf=0x%X mCam=0x%X anim=0x%X lps=0x%X",
+            O_health, FieldTypeOf(kPlayerScript, "_health"), O_alive, O_name, O_team,
+            O_rotation, FieldTypeOf(kPlayerScript, "rotation"), O_camTf, O_mCamera, O_humanMeshAnimator,
+            O_localPlayerScript);
     }
 
     static void ResolveMethods() {
@@ -1183,11 +1319,11 @@ namespace SDK {
             if (!M_shoot) M_shoot = se_class_get_method_from_name(kPlayerScript, "Shoot", 0);
             M_FireBullet = se_class_get_method_from_name(kPlayerScript, "FireBullet", 7);
             M_fireBullet = M_FireBullet;
+            M_recoil = se_class_get_method_from_name(kPlayerScript, "ComputeShotRecoil", 0);
         }
         if (kTransform) {
             M_set_position = se_class_get_method_from_name(kTransform, "set_position", 1);
             M_set_forward = se_class_get_method_from_name(kTransform, "set_forward", 1);
-            M_getTransform = se_class_get_method_from_name(kTransform, "get_transform", 0);
         }
         if (kCamera) {
             M_get_fov = se_class_get_method_from_name(kCamera, "get_fieldOfView", 0);
@@ -1199,20 +1335,16 @@ namespace SDK {
     bool Init() {
         g_phase = "sdk.init";
         Log("[sdk] Init: ENTROU");
-        Log("==================================================");
 
         if (!IL2CPP_API::Resolve()) { Log("[sdk] Init: Resolve FALHOU"); return false; }
-        Log("[sdk] Init: Resolve OK");
 
         Il2CppDomain* dom = se_domain_get();
         if (!dom) { Log("[sdk] Init: domain NULO"); return false; }
         se_thread_attach(dom);
-        Log("[sdk] Init: domain+attach OK");
 
         InitializeCriticalSection(&g_targetCs);
 
         BuildCache();
-        Log("[sdk] Init: cache OK (%d classes)", (int)g_classes.size());
 
         kEntity = FindClass("Entity");
         kPlayerScript = FindClass("PlayerScript");
@@ -1226,11 +1358,12 @@ namespace SDK {
         kAntiHack = FindClass("AntiHack");
         if (!kAntiHack) kAntiHack = FindClass("AntiCheat");
 
-        Log("[sdk] classes: entity=%p player=%p transform=%p camera=%p",
+        Log("[sdk] classes: entity=%p playerScript=%p transform=%p camera=%p",
             kEntity, kPlayerScript, kTransform, kCamera);
 
         ResolveOffsets();
         ResolveMethods();
+        BuildStringOffsets();
 
         DumpFields(kEntity, "Entity");
         DumpFields(kPlayerScript, "PlayerScript");

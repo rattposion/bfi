@@ -1,7 +1,3 @@
-// ============================================================================
-//  triggerbot.cpp — dispara automaticamente quando ha alvo sob a mira.
-//  Roda na thread principal, chamado pelo hk_lateUpdate.
-// ============================================================================
 #include "features.h"
 #include "sdk.h"
 #include "hooks.h"
@@ -14,19 +10,13 @@ namespace Triggerbot {
 
     static ULONGLONG g_next = 0;
 
-    // ------------------------------------------------------------------
-    //  dispara pelo metodo mais confiavel disponivel
-    // ------------------------------------------------------------------
     static void Fire() {
         if (!SDK::g_localPlayer) return;
 
-        // M_shoot e SemiAutoShoot()/Shoot() — 0 args, chamado no player local
         if (SDK::M_shoot) {
             il2cpp_runtime_invoke(SDK::M_shoot, SDK::g_localPlayer, nullptr, nullptr);
             return;
         }
-
-        // fallback: FireBullet(argc desconhecido) — passa array zerado
         if (SDK::M_FireBullet) {
             uint32_t n = il2cpp_method_get_param_count(SDK::M_FireBullet);
             if (n == 0) n = 1;
@@ -35,7 +25,6 @@ namespace Triggerbot {
         }
     }
 
-    // ------------------------------------------------------------------
     void Tick() {
         if (!C.triggerbot) return;
         if (!SDK::g_localPlayer) return;
@@ -50,16 +39,12 @@ namespace Triggerbot {
         if (!t) return;
 
         Fire();
-
-        // alimenta o hitmarker do visuals.cpp
         C.lastHitTime = (float)(GetTickCount64() / 1000.0);
-
         g_next = GetTickCount64() + (ULONGLONG)C.triggerDelay;
     }
 
     bool Install() {
-        Log("[triggerbot] install: shoot=%p fire=%p delay=%d",
-            SDK::M_shoot, SDK::M_FireBullet, (int)C.triggerDelay);
+        Log("[triggerbot] install: shoot=%p fire=%p", SDK::M_shoot, SDK::M_FireBullet);
         return true;
     }
 

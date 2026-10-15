@@ -1,9 +1,6 @@
 // ============================================================================
-//  menu.cpp
-//  Define void Menu::Draw(void)  -> casa com ?Draw@Menu@@YAXXZ
-//  Salva/carrega direto em bfi.ini (nao depende de Config::Save)
+//  menu.cpp — Menu::Draw() : o menu completo. Escreve direto em C.*
 // ============================================================================
-
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
@@ -23,97 +20,8 @@ namespace Menu {
 
     static bool s_binding = false;
 
-    // ---------------------------------------------------------------------------
-    static void IniPath(char* out, size_t n) {
-        GetModuleFileNameA(g_hModule, out, (DWORD)n);
-        char* s = strrchr(out, '\\');
-        if (s) s[1] = 0; else out[0] = 0;
-        strncat_s(out, n, "bfi.ini", _TRUNCATE);
-    }
-
-    static void SaveIni() {
-        char path[MAX_PATH];
-        IniPath(path, sizeof(path));
-
-        FILE* f = nullptr;
-        if (fopen_s(&f, path, "w") != 0 || !f) return;
-
-        fprintf(f, "aimbot=%d\n", C(aimbot) ? 1 : 0);
-        fprintf(f, "aimKey=%d\n", C(aimKey));
-        fprintf(f, "aimTeam=%d\n", C(aimTeam) ? 1 : 0);
-        fprintf(f, "aimVisible=%d\n", C(aimVisible) ? 1 : 0);
-        fprintf(f, "aimFov=%.3f\n", C(aimFov));
-        fprintf(f, "aimSmooth=%.3f\n", C(aimSmooth));
-        fprintf(f, "noRecoil=%d\n", C(noRecoil) ? 1 : 0);
-        fprintf(f, "noSpread=%d\n", C(noSpread) ? 1 : 0);
-        fprintf(f, "infiniteAmmo=%d\n", C(infiniteAmmo) ? 1 : 0);
-        fprintf(f, "esp=%d\n", C(esp) ? 1 : 0);
-        fprintf(f, "espBox=%d\n", C(espBox) ? 1 : 0);
-        fprintf(f, "espName=%d\n", C(espName) ? 1 : 0);
-        fprintf(f, "espLine=%d\n", C(espLine) ? 1 : 0);
-        fprintf(f, "espDist=%d\n", C(espDist) ? 1 : 0);
-        fprintf(f, "espFill=%d\n", C(espFill) ? 1 : 0);
-        fprintf(f, "teamCheck=%d\n", C(teamCheck) ? 1 : 0);
-        fprintf(f, "espThickness=%.3f\n", C(espThickness));
-        fprintf(f, "espMaxDist=%.3f\n", C(espMaxDist));
-        fprintf(f, "speed=%d\n", C(speed) ? 1 : 0);
-        fprintf(f, "speedValue=%.3f\n", C(speedValue));
-        fprintf(f, "crosshair=%d\n", C(crosshair) ? 1 : 0);
-        fprintf(f, "fps=%d\n", C(fps) ? 1 : 0);
-        fprintf(f, "hitmarkerTime=%.3f\n", C(hitmarkerTime));
-        fprintf(f, "lastHitTime=%.3f\n", C(lastHitTime));
-
-        fclose(f);
-        Log("[menu] config salvo");
-    }
-
-    static void LoadIni() {
-        char path[MAX_PATH];
-        IniPath(path, sizeof(path));
-
-        FILE* f = nullptr;
-        if (fopen_s(&f, path, "r") != 0 || !f) return;
-
-        char line[160];
-        while (fgets(line, sizeof(line), f)) {
-            char  k[64] = { 0 };
-            float v = 0.f;
-            if (sscanf_s(line, "%63[^=]=%f", k, (unsigned)sizeof(k), &v) != 2) continue;
-
-            if (!strcmp(k, "aimbot"))       C(aimbot) = (v != 0.f);
-            else if (!strcmp(k, "aimKey"))       C(aimKey) = (int)v;
-            else if (!strcmp(k, "aimTeam"))      C(aimTeam) = (v != 0.f);
-            else if (!strcmp(k, "aimVisible"))   C(aimVisible) = (v != 0.f);
-            else if (!strcmp(k, "aimFov"))       C(aimFov) = v;
-            else if (!strcmp(k, "aimSmooth"))    C(aimSmooth) = v;
-            else if (!strcmp(k, "noRecoil"))     C(noRecoil) = (v != 0.f);
-            else if (!strcmp(k, "noSpread"))     C(noSpread) = (v != 0.f);
-            else if (!strcmp(k, "infiniteAmmo")) C(infiniteAmmo) = (v != 0.f);
-            else if (!strcmp(k, "esp"))          C(esp) = (v != 0.f);
-            else if (!strcmp(k, "espBox"))       C(espBox) = (v != 0.f);
-            else if (!strcmp(k, "espName"))      C(espName) = (v != 0.f);
-            else if (!strcmp(k, "espLine"))      C(espLine) = (v != 0.f);
-            else if (!strcmp(k, "espDist"))      C(espDist) = (v != 0.f);
-            else if (!strcmp(k, "espFill"))      C(espFill) = (v != 0.f);
-            else if (!strcmp(k, "teamCheck"))    C(teamCheck) = (v != 0.f);
-            else if (!strcmp(k, "espThickness")) C(espThickness) = v;
-            else if (!strcmp(k, "espMaxDist"))   C(espMaxDist) = v;
-            else if (!strcmp(k, "speed"))        C(speed) = (v != 0.f);
-            else if (!strcmp(k, "speedValue"))   C(speedValue) = v;
-            else if (!strcmp(k, "crosshair"))    C(crosshair) = (v != 0.f);
-            else if (!strcmp(k, "fps"))          C(fps) = (v != 0.f);
-            else if (!strcmp(k, "hitmarkerTime"))C(hitmarkerTime) = v;
-            else if (!strcmp(k, "lastHitTime"))  C(lastHitTime) = v;
-        }
-
-        fclose(f);
-        Log("[menu] config carregado");
-    }
-
-    // ---------------------------------------------------------------------------
     static const char* KeyName(int vk) {
         static char buf[32];
-
         switch (vk) {
         case 0:            return "None";
         case VK_LBUTTON:   return "Mouse1";
@@ -128,6 +36,7 @@ namespace Menu {
         case VK_TAB:       return "Tab";
         case VK_CAPITAL:   return "Caps";
         case VK_DELETE:    return "Del";
+        case VK_INSERT:    return "Insert";
         case VK_HOME:      return "Home";
         case VK_END:       return "End";
         default: break;
@@ -147,7 +56,6 @@ namespace Menu {
 
         if (s_binding) {
             for (int k = 1; k < 0xFE; ++k) {
-                if (k == VK_INSERT) continue;                 // tecla do menu
                 if (GetAsyncKeyState(k) & 0x8000) {
                     *key = k;
                     s_binding = false;
@@ -157,87 +65,131 @@ namespace Menu {
         }
     }
 
-    // ---------------------------------------------------------------------------
     void Draw() {
-        ImGui::GetIO().MouseDrawCursor = C(menuOpen);
-        if (!C(menuOpen)) return;
+        ImGui::GetIO().MouseDrawCursor = C.menuOpen;
+        if (!C.menuOpen) return;
 
-        ImGui::SetNextWindowSize(ImVec2(540, 470), ImGuiCond_FirstUseEver);
-        if (!ImGui::Begin("BF Internal", &C(menuOpen))) { ImGui::End(); return; }
+        ImGui::SetNextWindowSize(ImVec2(560, 500), ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin("BF Internal", &C.menuOpen)) { ImGui::End(); return; }
 
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.f, 1.f), "BFI - Bullet Force Internal");
-        ImGui::Text("Insert = abre/fecha");
+        ImGui::Text("Insert = abre/fecha | F5 = salvar | Del = panic | F8 = descarregar");
         ImGui::Separator();
 
         if (ImGui::BeginTabBar("bfi_tabs")) {
 
             if (ImGui::BeginTabItem("Aimbot")) {
-                ImGui::Checkbox("Aimbot", &C(aimbot));
-                ImGui::Checkbox("Time no time", &C(aimTeam));
-                ImGui::Checkbox("So visivel", &C(aimVisible));
-                ImGui::Checkbox("Sem recuo", &C(noRecoil));
+                ImGui::Checkbox("Aimbot", &C.aimbot);
+                ImGui::Checkbox("Ignorar time", &C.aimTeam);
+                ImGui::Checkbox("So visivel", &C.aimVisible);
+                ImGui::Checkbox("Girar player (aim rotate)", &C.aimRotate);
+                ImGui::Checkbox("Silent aim", &C.silentAim);
+                ImGui::Checkbox("Magic bullets", &C.magicBullets);
 
                 ImGui::Separator();
-                ImGui::SliderFloat("FOV", &C(aimFov), 1.f, 180.f, "%.0f");
-                ImGui::SliderFloat("Smooth", &C(aimSmooth), 1.f, 20.f, "%.1f");
+                ImGui::SliderFloat("FOV", &C.aimFov, 1.f, 180.f, "%.0f");
+                ImGui::SliderFloat("Smooth", &C.aimSmooth, 1.f, 20.f, "%.1f");
+                ImGui::Combo("Osso", &C.aimBone, "Cabeca\0Pescoco\0Peito\0");
+                ImGui::Combo("Modo", &C.aimMode, "Mais perto da mira\0Menor vida\0Mais perto\0");
+                ImGui::Checkbox("Circulo de FOV", &C.showFovCircle);
 
                 ImGui::Separator();
-                KeyBind("Tecla de mira", &C(aimKey));
-                ImGui::Text("Estado: %s", C(aimKeyDown) ? "ATIVO" : "solto");
+                KeyBind("Tecla de mira", &C.aimKey);
+                ImGui::Text("Estado: %s", C.aimKeyDown ? "ATIVO" : "solto");
                 ImGui::EndTabItem();
             }
 
             if (ImGui::BeginTabItem("Visual")) {
-                ImGui::Checkbox("ESP", &C(esp));
+                ImGui::Checkbox("ESP", &C.esp);
 
                 ImGui::Separator();
-                ImGui::Checkbox("Caixa", &C(espBox));
-                ImGui::Checkbox("Nome", &C(espName));
-                ImGui::Checkbox("Linha", &C(espLine));
-                ImGui::Checkbox("Distancia", &C(espDist));
-                ImGui::Checkbox("Preenchido", &C(espFill));
-                ImGui::Checkbox("Ignorar time", &C(teamCheck));
+                ImGui::Checkbox("Caixa", &C.espBox);
+                ImGui::Checkbox("Nome", &C.espName);
+                ImGui::Checkbox("Vida (barra)", &C.espHealth);
+                ImGui::Checkbox("Vida (numero)", &C.espHealthNum);
+                ImGui::Checkbox("Linha", &C.espSnapline);
+                ImGui::Checkbox("Distancia", &C.espDistance);
+                ImGui::Checkbox("Arma", &C.espWeapon);
+                ImGui::Checkbox("Esqueleto", &C.espSkeleton);
+                ImGui::Checkbox("Preenchido", &C.espFill);
+                ImGui::Checkbox("Ignorar time", &C.teamCheck);
+                ImGui::Checkbox("Ignorar NPCs", &C.espNpc);
 
                 ImGui::Separator();
-                ImGui::SliderFloat("Espessura", &C(espThickness), 0.5f, 6.f, "%.1f");
-                ImGui::SliderFloat("Dist. max", &C(espMaxDist), 10.f, 500.f, "%.0f m");
+                ImGui::SliderFloat("Espessura", &C.espThickness, 0.5f, 6.f, "%.1f");
+                ImGui::SliderFloat("Dist. max", &C.espMaxDist, 10.f, 1000.f, "%.0f m");
+                ImGui::SliderFloat("Altura corpo", &C.espBodyH, 1.f, 2.2f, "%.2f");
+                ImGui::SliderFloat("Escala Y", &C.espScaleY, 0.5f, 2.f, "%.2f");
+                ImGui::SliderFloat("Offset Y", &C.espOffY, -100.f, 100.f, "%.0f");
+                ImGui::ColorEdit4("Cor da caixa", C.espBoxColor);
+                ImGui::ColorEdit4("Cor do texto", C.espTextColor);
+                ImGui::ColorEdit4("Cor do esqueleto", C.espSkelColor);
                 ImGui::EndTabItem();
             }
 
             if (ImGui::BeginTabItem("Armas")) {
-                ImGui::Checkbox("Sem recuo", &C(noRecoil));
-                ImGui::Checkbox("Sem spread", &C(noSpread));
-                ImGui::Checkbox("Municao infinita", &C(infiniteAmmo));
+                ImGui::Checkbox("Sem recuo", &C.noRecoil);
+                ImGui::Checkbox("Sem spread", &C.noSpread);
+                ImGui::Checkbox("Municao infinita", &C.infAmmo);
+                ImGui::Checkbox("Sem recarregar", &C.noReload);
+                ImGui::Checkbox("Tiro rapido", &C.rapidFire);
+                ImGui::Separator();
+                ImGui::Checkbox("Triggerbot", &C.triggerbot);
+                ImGui::SliderFloat("Delay (ms)", &C.triggerDelay, 0.f, 300.f, "%.0f");
                 ImGui::EndTabItem();
             }
 
             if (ImGui::BeginTabItem("Movimento")) {
-                ImGui::Checkbox("Speed hack", &C(speed));
-                ImGui::SliderFloat("Velocidade", &C(speedValue), 1.f, 10.f, "%.1f");
+                ImGui::Checkbox("Speed hack", &C.speedHack);
+                ImGui::SliderFloat("Velocidade", &C.speedValue, 1.f, 20.f, "%.1f");
+                ImGui::Checkbox("Fly (espaco)", &C.fly);
+                ImGui::SliderFloat("Vel. fly", &C.flySpeed, 1.f, 30.f, "%.1f");
+                ImGui::Checkbox("Super pulo", &C.superJump);
+                ImGui::SliderFloat("Forca pulo", &C.jumpPower, 1.f, 30.f, "%.1f");
+                ImGui::Checkbox("Teleporte (T)", &C.teleport);
                 ImGui::EndTabItem();
             }
 
             if (ImGui::BeginTabItem("Misc")) {
-                ImGui::Checkbox("Mira (crosshair)", &C(crosshair));
-                ImGui::Checkbox("FPS", &C(fps));
-
+                ImGui::Checkbox("Crosshair", &C.crosshair);
+                ImGui::SliderFloat("Tam crosshair", &C.crosshairSize, 1.f, 30.f, "%.0f");
+                ImGui::ColorEdit4("Cor crosshair", C.crosshairColor);
+                ImGui::Checkbox("Hitmarker", &C.hitmarker);
+                ImGui::Checkbox("Watermark", &C.watermark);
+                ImGui::Checkbox("FPS", &C.fps);
                 ImGui::Separator();
-                ImGui::SliderFloat("Duracao hitmarker", &C(hitmarkerTime), 0.05f, 2.f, "%.2f s");
-                ImGui::SliderFloat("Duracao hit", &C(lastHitTime), 0.05f, 2.f, "%.2f s");
+                ImGui::SliderFloat("FOV camera", &C.camFov, 0.f, 140.f, "%.0f");
+                ImGui::Text("0 = nao mexer");
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("AntiCheat")) {
+                ImGui::Checkbox("Ativo", &C.antiCheat);
+                ImGui::Checkbox("Limpar blocked", &C.blockedUnlock);
+                ImGui::Checkbox("Limpar noclip", &C.blockedNoZone);
+                ImGui::SliderInt("Stage", &C.stage, 0, 20);
                 ImGui::EndTabItem();
             }
 
             if (ImGui::BeginTabItem("Config")) {
-                if (ImGui::Button("Salvar", ImVec2(120, 0)))   SaveIni();
+                if (ImGui::Button("Salvar", ImVec2(120, 0))) ConfigIO::Save();
                 ImGui::SameLine();
-                if (ImGui::Button("Carregar", ImVec2(120, 0))) LoadIni();
+                if (ImGui::Button("Carregar", ImVec2(120, 0))) ConfigIO::Load();
                 ImGui::Separator();
                 ImGui::Text("Arquivo: bfi.ini (ao lado da dll)");
+                KeyBind("Tecla do menu", &C.menuKey);
+                KeyBind("Tecla panic", &C.panicKey);
+                KeyBind("Tecla salvar", &C.saveKey);
+                KeyBind("Tecla descarregar", &C.unloadKey);
                 ImGui::EndTabItem();
             }
 
             ImGui::EndTabBar();
         }
+
+        ImGui::Separator();
+        ImGui::Text("alvos: %d  desenhados: %d", SDK::g_targetCount, SDK::dbg_drawn);
+        ImGui::Text("local: %p  cam: %p  viewOk: %d", SDK::g_localPlayer, SDK::g_camera, (int)SDK::g_viewProjOk);
 
         ImGui::End();
     }

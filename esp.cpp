@@ -1,5 +1,5 @@
 // ============================================================================
-//  esp.cpp — desenho do ESP. Roda na thread de render, zero chamada il2cpp.
+//  esp.cpp — desenho do ESP (thread de render, sem chamada il2cpp)
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -18,16 +18,8 @@ namespace ESP {
             (int)(c[2] * 255.f), (int)(c[3] * 255.f * aMul));
     }
 
-    static inline void Box(ImDrawList* dl, float x0, float y0, float x1, float y1,
-        ImU32 col, float th) {
-        dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), col, 0.f, 0, th);
-    }
-
-    // =====================================================================
     void Draw() {
         SDK::dbg_drawn = 0;
-
-        static int s_lastDrawn = -1;
 
         if (!C.esp) return;
         if (!SDK::g_localPlayer) return;
@@ -43,26 +35,23 @@ namespace ESP {
         float cx = (float)SDK::ScreenW() * 0.5f;
         float cy = (float)SDK::ScreenH();
 
-        int cTotal = 0, cSelf = 0, cMorto = 0, cNpc = 0, cTime = 0, cTela = 0, cDist = 0, cAltura = 0;
-
         SDK::LockTargets();
         int n = SDK::g_targetCount;
 
         for (int i = 0; i < n; ++i) {
             Target& t = SDK::g_targets[i];
-            cTotal++;
 
-            if (!t.player) { cSelf++; continue; }
-            if (t.player == SDK::g_localPlayer) { cSelf++; continue; }
-            if (!t.alive) { cMorto++; continue; }
-            if (C.espNpc && t.npc) { cNpc++; continue; }
-            if (C.teamCheck && SDK::g_localTeam != 0 && t.team == SDK::g_localTeam) { cTime++; continue; }
-            if (!t.onScreen) { cTela++; continue; }
-            if (C.espMaxDist > 1.f && t.dist > C.espMaxDist) { cDist++; continue; }
+            if (!t.player) continue;
+            if (t.player == SDK::g_localPlayer) continue;
+            if (!t.alive) continue;
+            if (C.espNpc && t.npc) continue;
+            if (C.teamCheck && SDK::g_localTeam != 0 && t.team == SDK::g_localTeam) continue;
+            if (!t.onScreen) continue;
+            if (C.espMaxDist > 1.f && t.dist > C.espMaxDist) continue;
 
             float top = t.scrHead.y + C.espOffY;
             float h = (t.scrFeet.y - top) * C.espScaleY;
-            if (h < 4.f || h > 2000.f) { cAltura++; continue; }
+            if (h < 4.f || h > 2000.f) continue;
 
             float w = h * 0.5f * (C.espBodyH / 1.8f);
             float x0 = t.scrHead.x - w * 0.5f;
@@ -74,12 +63,12 @@ namespace ESP {
                 dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), Col(C.espBoxColor, 0.20f));
 
             if (C.espBox)
-                Box(dl, x0, y0, x1, y1, colBox, th);
+                dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), colBox, 0.f, 0, th);
 
             if (C.espHealth) {
                 float hp = t.health * 0.01f;
+                if (!(hp >= 0.f && hp <= 1.f)) hp = 1.f;     // lixo -> cheia
                 if (hp > 1.f) hp = 1.f;
-                if (hp < 0.f) hp = 0.f;
 
                 float bw = 4.f;
                 float bx = x0 - bw - 2.f;
@@ -106,8 +95,7 @@ namespace ESP {
 
             if (C.espName && t.name[0]) {
                 float tw = (float)strlen(t.name) * (C.espFontSize * 0.55f);
-                dl->AddText(ImVec2(t.scrHead.x - tw * 0.5f, y0 - C.espFontSize - 2.f),
-                    colText, t.name);
+                dl->AddText(ImVec2(t.scrHead.x - tw * 0.5f, y0 - C.espFontSize - 2.f), colText, t.name);
             }
 
             if (C.espWeapon) {
@@ -128,12 +116,6 @@ namespace ESP {
 
         SDK::UnlockTargets();
         SDK::dbg_drawn = drawn;
-
-        if (drawn != s_lastDrawn) {
-            s_lastDrawn = drawn;
-            Log("[esp] drawn=%d n=%d | null/self=%d morto=%d npc=%d time=%d FORA_TELA=%d dist=%d altura=%d",
-                drawn, n, cSelf, cMorto, cNpc, cTime, cTela, cDist, cAltura);
-        }
     }
 
 } // namespace ESP

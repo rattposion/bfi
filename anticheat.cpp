@@ -1,6 +1,5 @@
 // ============================================================================
-//  anticheat.cpp — limpeza de flags do AntiHack + linha `dbg:` de diagnostico.
-//  Roda na thread principal, chamado pelo hk_lateUpdate.
+//  anticheat.cpp — limpeza de flags + diagnostico
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -20,7 +19,6 @@ namespace AntiCheat {
     static uint32_t o_blocked = 0, o_speed = 0, o_fly = 0, o_noclip = 0, o_stage = 0;
     static int g_clears = 0;
 
-    // ------------------------------------------------------------------
     static uint32_t FieldOff(Il2CppClass* k, const char* name) {
         if (!k) return 0;
         for (Il2CppClass* c = k; c; c = il2cpp_class_get_parent(c)) {
@@ -38,7 +36,6 @@ namespace AntiCheat {
         return 0;
     }
 
-    // ------------------------------------------------------------------
     bool Install() {
         g_cls = SDK::kAntiHack;
         if (!g_cls) g_cls = SDK::FindClass("AntiHack");
@@ -53,14 +50,9 @@ namespace AntiCheat {
 
         Log("[ac] Install cls=%p blocked=0x%X speed=0x%X fly=0x%X noclip=0x%X stage=0x%X",
             g_cls, o_blocked, o_speed, o_fly, o_noclip, o_stage);
-
-        if (!o_blocked && !o_speed && !o_fly && !o_noclip && !o_stage)
-            Log("[ac] nenhum campo reconhecido — rode SDK::DumpFields(SDK::kAntiHack, \"AntiHack\")");
-
         return true;
     }
 
-    // ------------------------------------------------------------------
     static void FindInstance() {
         static uint64_t lastTry = 0;
         uint64_t now = GetTickCount64();
@@ -80,35 +72,8 @@ namespace AntiCheat {
         }
     }
 
-    // ------------------------------------------------------------------
-    //  diagnostico — mesma fonte que o ESP usa
-    // ------------------------------------------------------------------
-    static void Diag() {
-        static ULONGLONG last = 0;
-        ULONGLONG agora = GetTickCount64();
-        if (agora - last < 1000) return;
-        last = agora;
-
-        std::vector<Target> snap = SDK::Snapshot();
-        int alvos = (int)snap.size();
-        int vivos = 0, comBone = 0, naTela = 0;
-
-        for (size_t i = 0; i < snap.size(); ++i) {
-            if (snap[i].alive)    ++vivos;
-            if (snap[i].headBone) ++comBone;
-            if (snap[i].onScreen) ++naTela;
-        }
-
-        Log("dbg: alvos=%d vivos=%d comBone=%d naTela=%d local=%p cam=%p fase=%s",
-            alvos, vivos, comBone, naTela, SDK::g_localPlayer, SDK::g_camera, g_phase);
-    }
-
-    // ------------------------------------------------------------------
     void Tick() {
         PHASE("AntiCheat::Tick");
-
-        Diag();                        // diagnostico roda mesmo sem instancia
-
         if (!C.antiCheat) return;
         if (!g_cls) return;
         if (!g_obj) { FindInstance(); if (!g_obj) return; }
@@ -121,8 +86,7 @@ namespace AntiCheat {
         if (o_noclip && C.blockedNoZone)  WriteAt<bool>(base + o_noclip, false);
         if (o_stage && C.stage > 0)       WriteAt<int>(base + o_stage, C.stage);
 
-        g_clears++;
-        if (g_clears % 600 == 0) Log("[ac] limpando flags (obj=%p)", g_obj);
+        if (++g_clears % 600 == 0) Log("[ac] limpando flags (obj=%p)", g_obj);
     }
 
 } // namespace AntiCheat

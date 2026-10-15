@@ -1,10 +1,9 @@
 #pragma once
 
 // =====================================================================
-//  Config global.
-//  Funciona das DUAS formas e aponta para o MESMO objeto:
-//      C.esp      -> variavel (referencia)
-//      C(esp)     -> macro
+//  Config global. Funciona das DUAS formas apontando para o MESMO objeto:
+//      C.esp   -> variavel (referencia)
+//      C(esp)  -> macro
 // =====================================================================
 struct Config;
 extern Config  g_cfg;
