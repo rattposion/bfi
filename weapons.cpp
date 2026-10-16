@@ -1,12 +1,18 @@
 // ============================================================================
 //  weapons.cpp — stats + ANTI-RECOIL por zeragem dos campos de origem
 //
-//  >>> FIX desta versao:
-//   1) DumpGunArray(): dumpar o array de loadout "gunStats[]" elemento por
-//      elemento (o mpCurrentGunStats aponta para um clone em branco).
-//   2) Dump da fpsGunView: a viewmodel referencia as stats vivas.
-//   3) rapidFire respeita SDK::g_rateIsRpm.
+//  >>> ESTE ARQUIVO DEVE CONTER "namespace Weapons" e apenas UMA vez.
+//      Se ele estiver com o conteudo de anticheat.cpp, o linker acusa
+//      LNK2019 AntiCheat::Install/Tick.
 // ============================================================================
+
+// trava anti-duplicacao: se o arquivo for colado duas vezes no mesmo .cpp,
+// dispara um erro claro em vez de C2084/C2086.
+#ifdef BFI_WEAPONS_CPP
+#error "weapons.cpp esta com o conteudo DUPLICADO (colado duas vezes)"
+#endif
+#define BFI_WEAPONS_CPP
+
 #include "features.h"
 #include "sdk.h"
 #include "hooks.h"
@@ -16,6 +22,12 @@
 #include <windows.h>
 #include <cstring>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+//  MARCADOR DE BUILD — combat.cpp referencia os dois marcadores. Se o
+//  conteudo dos arquivos estiver trocado, o linker acusa estes nomes.
+// ---------------------------------------------------------------------------
+extern "C" int bfi_weapons_obj = 0xBF;
 
 namespace Weapons {
 
@@ -176,11 +188,14 @@ namespace Weapons {
         Log("[ammo] ---- fim ----");
     }
 
-    // >>> FIX: dumpa um array de gunStats elemento por elemento
     static void DumpGunArray(const char* tag, void* arr) {
         if (!arr) return;
         __try {
-            int len = *(int*)((uintptr_t)arr + 0x10);
+            // 0x18 = max_length. 0x10 e o ponteiro 'bounds'.
+            int len = 0;
+            if (il2cpp_array_length) len = (int)il2cpp_array_length((const Il2CppArray*)arr);
+            if (len <= 0) len = *(int*)((uintptr_t)arr + 0x18);
+
             Log("[guns] %s: len=%d", tag, len);
             if (len < 0 || len > 64) len = 64;
             for (int i = 0; i < len; ++i) {
@@ -352,3 +367,4 @@ namespace Weapons {
     }
 
 } // namespace Weapons
+// ==== FIM weapons.cpp ====

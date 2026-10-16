@@ -53,6 +53,12 @@ struct Vec3 {
     float len()  const { return sqrtf(x * x + y * y + z * z); }
     float dist(const Vec3& o) const { return (*this - o).len(); }
     bool  zero() const { return x == 0.f && y == 0.f && z == 0.f; }
+    // >>> FIX: (0,0,0) e um ponto VALIDO. zero() nao serve para detectar falha
+    //     de resolucao em TargetAimPos. isFinite() serve.
+    bool  isFinite() const {
+        return x == x && y == y && z == z &&
+            fabsf(x) < 1.0e6f && fabsf(y) < 1.0e6f && fabsf(z) < 1.0e6f;
+    }
 };
 struct Quat { float x, y, z, w; };
 

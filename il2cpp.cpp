@@ -51,8 +51,12 @@ namespace IL2CPP {
         R(method_get_param); R(method_get_return_type); R(type_get_name);
         R(runtime_invoke); R(thread_attach); R(object_unbox); R(string_new);
 #undef R
-        // nome real difere do macro
-        class_from_type = (decltype(class_from_type))GetProcAddress(ga, "il2cpp_class_from_il2cpp_type");
+
+        // >>> FIX: o nome do export varia entre versoes do Unity. Tenta os DOIS,
+        //     senao este ponteiro fica nulo e o codigo que depende dele morre calado.
+        class_from_type = (decltype(class_from_type))GetProcAddress(ga, "il2cpp_class_from_type");
+        if (!class_from_type)
+            class_from_type = (decltype(class_from_type))GetProcAddress(ga, "il2cpp_class_from_il2cpp_type");
 
         bool ok = domain_get && domain_get_assemblies && assembly_get_image && class_from_name
             && runtime_invoke && class_get_field_from_name && field_get_offset
@@ -61,7 +65,7 @@ namespace IL2CPP {
             && class_get_parent && class_get_type && type_get_object && class_get_fields
             && class_from_type && field_get_type && field_get_name && type_get_name;
 
-        Log("il2cpp init: %s", ok ? "OK" : "FALHOU");
+        Log("il2cpp init: %s (class_from_type=%p)", ok ? "OK" : "FALHOU", class_from_type);
         if (ok) EnsureAttached();
         return ok;
     }
@@ -96,7 +100,7 @@ namespace IL2CPP {
         Il2CppException* exc = nullptr;
         __try {
             Il2CppObject* r = runtime_invoke(m, obj, args, &exc);
-            return exc ? nullptr : r;          // <- CORRIGIDO: excecao = resultado invalido
+            return exc ? nullptr : r;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
     }
@@ -202,7 +206,11 @@ namespace IL2CPP {
             for (uint32_t i = 0; i < pc && i < 5; i++) {
                 const Il2CppType* pt = method_get_param(m, i);
                 const char* tn = pt ? type_get_name(pt) : "?";
-                strcat_s(buf, tn ? tn : "?"); strcat_s(buf, ", ");
+                // >>> FIX: strcat_s com 2 args usa sizeof(buf); mas com 5 tipos
+                //     longos dava para estourar. Checa antes.
+                if (strlen(buf) + strlen(tn ? tn : "?") + 3 >= sizeof(buf)) break;
+                strcat_s(buf, tn ? tn : "?");
+                strcat_s(buf, ", ");
             }
             Log("  %s(%s)", mn, buf);
             found++;

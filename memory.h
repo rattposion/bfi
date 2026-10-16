@@ -114,9 +114,15 @@ inline bool ReadMem(uintptr_t addr, void* out, size_t n) {
 inline bool WriteMem(uintptr_t addr, const void* in, size_t n) {
     if (IsBadPtr(addr) || !in) return false;
     DWORD old = 0;
-    VirtualProtect((void*)addr, n, PAGE_EXECUTE_READWRITE, &old);
+    if (!VirtualProtect((void*)addr, n, PAGE_EXECUTE_READWRITE, &old)) return false;
+
+    bool ok = true;
     __try { memcpy((void*)addr, in, n); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-    VirtualProtect((void*)addr, n, old, &old);
-    return true;
+    // >>> FIX: restaura a protecao ANTES de sair, inclusive no caminho de excecao
+    //     (antes, a pagina ficava PAGE_EXECUTE_READWRITE para sempre).
+    __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+
+    DWORD tmp = 0;
+    VirtualProtect((void*)addr, n, old, &tmp);
+    return ok;
 }

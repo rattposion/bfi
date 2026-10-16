@@ -96,6 +96,9 @@
     <ClInclude Include="menu.h">
       <Filter>features.h</Filter>
     </ClInclude>
+    <ClInclude Include="unlock.h">
+      <Filter>features.h</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="imgui\imgui.cpp">
@@ -181,6 +184,12 @@
       <Filter>features.h</Filter>
     </ClCompile>
     <ClCompile Include="features.cpp">
+      <Filter>features.h</Filter>
+    </ClCompile>
+    <ClCompile Include="unlock.cpp">
+      <Filter>features.h</Filter>
+    </ClCompile>
+    <ClCompile Include="recoil.cpp">
       <Filter>features.h</Filter>
     </ClCompile>
   </ItemGroup>

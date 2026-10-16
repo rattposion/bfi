@@ -1,12 +1,24 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
 //
-//  >>> FIX desta versao:
-//   1) FindGunStatsObj agora valida o candidato e, se ele for um clone em
-//      branco (mpCurrentGunStats apontando para template), procura no array
-//      de loadout (tipo "gunStats[]") o elemento com valores reais.
-//   2) O_gsMagSize/O_gsAmmo/O_gsGunObj/O_gunStatsArray resolvidos por nome.
-//   3) ResolveWeaponFields com os nomes reais do gunStats.
+//  >>> CORRECOES acumuladas:
+//   1) FindGunStatsObj lia o TAMANHO do array em 0x10 ('bounds'). Fica em 0x18.
+//   2) se_runtime_invoke garante il2cpp_thread_attach por thread.
+//   3) il2cpp_class_from_type ganhou fallback para o nome longo do export.
+//   4) ReadTeam retorna -1 quando NAO conseguiu ler.
+//   5) O_rotationIsQuat deixou de ser hardcoded.
+//   6) FovRadiusPx centralizado.
+//   7) g_frameId nunca era incrementado -> cache de TargetVisible preso.
+//   8) Offsets do gunStats resolvidos PELA CLASSE DA INSTANCIA.
+//   9) Slots de alvo estaveis + cache de bones por player.
+//  10) LOS em round-robin (3 alvos/frame) fora do critical section.
+//  11) ReadHealth/ReadTeam nao leem bytes de ponteiro como float.
+//  12) LOS identifica o dono do collider por ANCESTRALIDADE (nao por posicao).
+//  13) Arma equipada detectada por gunObject.activeInHierarchy.
+//  14) AntiHack: FindClassExact (o match de sufixo casava StoreAntiHack).
+//  15) FireBullet: direcao = ULTIMO Vector3, nao indice fixo.
+//  16) WorldToScreen: 'm' podia sair nao inicializado se as 64 tentativas do
+//      guard caissem todas no ramo impar do g_vpSeq (C6001).
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -15,6 +27,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
@@ -117,6 +130,15 @@ namespace IL2CPP_API {
             if (p) { *tbl[i].slot = (void*)p; ++g_resolved; }
             else { *tbl[i].slot = nullptr; ++g_missing; Log("[il2cpp] faltando: %s", tbl[i].name); }
         }
+
+        if (!il2cpp_class_from_type) {
+            FARPROC p = GetProcAddress(ga, "il2cpp_class_from_il2cpp_type");
+            if (p) {
+                il2cpp_class_from_type = (decltype(il2cpp_class_from_type))p;
+                Log("[il2cpp] class_from_type resolvido pelo nome longo");
+            }
+        }
+
         Log("[il2cpp] resolvidas %d, faltando %d", g_resolved, g_missing);
         return g_resolved > 0;
     }
@@ -230,7 +252,25 @@ static void* se_object_unbox(Il2CppObject* o) {
     SE_BEGIN{ if (il2cpp_object_unbox) r = il2cpp_object_unbox(o); } SE_END{ r = nullptr; }
     return r;
 }
+
+// ---------------------------------------------------------------------------
+//  >>> FIX: attach preguicoso por thread.
+// ---------------------------------------------------------------------------
+static thread_local bool t_il2cppAttached = false;
+static void EnsureThreadAttached() {
+    if (t_il2cppAttached) return;
+    t_il2cppAttached = true;
+    if (!il2cpp_thread_attach || !il2cpp_domain_get) return;
+
+    Il2CppDomain* d = nullptr;
+    SE_BEGIN{ d = il2cpp_domain_get(); } SE_END{ d = nullptr; }
+    if (!d) return;
+    SE_BEGIN{ il2cpp_thread_attach(d); } SE_END{}
+}
+
 static Il2CppObject* se_runtime_invoke(const MethodInfo* m, void* o, void** args) {
+    if (!m) return nullptr;
+    EnsureThreadAttached();
     Il2CppObject* r = nullptr;
     SE_BEGIN{ if (il2cpp_runtime_invoke) r = il2cpp_runtime_invoke(m, o, args, nullptr); } SE_END{ r = nullptr; }
     return r;
@@ -325,11 +365,14 @@ namespace SDK {
     bool     O_rotationIsQuat = true;
 
     static bool g_rotIsSyncVar = false;
+    static bool g_healthIsSync = false;
+    static bool g_teamIsSync = false;
     static Quat g_savedPlayerRot{ 0.f, 0.f, 0.f, 1.f };
 
     // offsets do gunStats + campo do array de loadout
     static uint32_t O_gsMagSize = 0, O_gsAmmo = 0, O_gsGunObj = 0;
     static uint32_t O_gunStatsArray = 0;
+    static Il2CppClass* g_gsCls = nullptr;
 
     Il2CppClass* kEntity = nullptr;
     Il2CppClass* kPlayerScript = nullptr;
@@ -361,12 +404,24 @@ namespace SDK {
     static MethodInfo* M_GetComponent = nullptr;
     static MethodInfo* M_camW2C = nullptr;
     static MethodInfo* M_camProj = nullptr;
+    static MethodInfo* M_findFromId = nullptr;
+    static Il2CppClass* kObject = nullptr;
 
     static Il2CppClass* kPhysics = nullptr;
+    static Il2CppClass* kRaycastHit = nullptr;
     static MethodInfo* M_raycast = nullptr;
+    static int          g_rayKind = 0;   // ver kRayNames
+    static bool         g_rayUsesRay = false;
     static uint32_t     O_hitDist = 0;
+    static uint32_t     O_hitCollider = 0;
+    static bool         g_hitColIsId = true;
+    static bool         g_losLogged = false;
     static uint8_t      g_losState[MAX_TARGETS];
     static uint64_t     g_losFrame = (uint64_t)-1;
+
+    static const char* kRayNames[] = {
+        "off", "Raycast4", "Raycast5", "Linecast3", "Linecast4", "RaycastRay3", "RaycastRay4"
+    };
 
     static std::mutex g_tfMx;
     static std::unordered_map<Il2CppObject*, Il2CppObject*> g_tfCache;
@@ -376,6 +431,16 @@ namespace SDK {
     static uint32_t g_pickedNameOff = 0;
 
     static const int kMaxTargets = MAX_TARGETS;
+
+    // slots estaveis de alvo (nao embaralham a cada refresh)
+    static Il2CppObject* g_slotOwner[MAX_TARGETS] = {};
+    static uint32_t      g_slotSeen[MAX_TARGETS] = {};
+    static uint32_t      g_slotGen = 1;
+
+    // cache de bones por player (evita varrer a hierarquia a cada 200ms)
+    struct BoneCacheEnt { Il2CppObject* player; Il2CppObject* head; Il2CppObject* foot; };
+    static BoneCacheEnt g_boneCache[64] = {};
+    static int          g_boneEvict = 0;
 
     // ======================= pick de campo =======================
     static uint32_t FindTypedField(Il2CppClass* k, std::initializer_list<const char*> names,
@@ -474,27 +539,38 @@ namespace SDK {
         return (uintptr_t)obj + foff;
     }
 
+    // >>> FIX: quando o SyncVar ainda nao existe, NAO ler os bytes do ponteiro
+    //     como float (dava lixo/0). Retorna 100 (desconhecido) nesse caso.
     static float ReadHealth(Il2CppObject* e) {
         if (!e || !O_health) return 100.f;
 
         float hp;
         uintptr_t a = SyncVarValueAddr(e, O_health, "Single");
-        if (a) hp = SafeRead<float>(a, 100.f);
-        else   hp = se_read_float(e, O_health);
+        if (a) {
+            hp = SafeRead<float>(a, 100.f);
+        }
+        else if (g_healthIsSync) {
+            return 100.f;
+        }
+        else {
+            hp = se_read_float(e, O_health);
+        }
 
         if (!(hp >= 0.f && hp <= 100000.f)) return 100.f;
-        if (hp > 0.f && hp <= 1.5f) hp *= 100.f;
+        if (hp > 0.f && hp < 1.5f) hp *= 100.f;
         return hp;
     }
 
+    // >>> FIX: -1 = "nao consegui ler"
     static int ReadTeam(Il2CppObject* e) {
-        if (!e || !O_team) return 0;
+        if (!e || !O_team) return -1;
         uintptr_t a = SyncVarValueAddr(e, O_team, "Byte");
         if (!a) a = SyncVarValueAddr(e, O_team, "Int32");
         if (a) {
             unsigned char b = SafeRead<unsigned char>(a, 0);
             return (int)b;
         }
+        if (g_teamIsSync) return -1;
         return SafeRead<int>((uintptr_t)e + O_team, 0) & 0xFF;
     }
 
@@ -569,6 +645,26 @@ namespace SDK {
         return nullptr;
     }
 
+    // >>> MELHORIA: match EXATO (sem sufixo).
+    static Il2CppClass* FindClassExact(const char* name) {
+        if (!name) return nullptr;
+        std::lock_guard<std::mutex> lk(g_classesMx);
+        auto it = g_classes.find(name);
+        return it == g_classes.end() ? nullptr : it->second;
+    }
+
+    void ListClassesContaining(const char* sub) {
+        if (!sub) return;
+        std::lock_guard<std::mutex> lk(g_classesMx);
+        int n = 0;
+        for (auto& kv : g_classes) {
+            if (kv.first.find(sub) == std::string::npos) continue;
+            Log("[cls] %s", kv.first.c_str());
+            if (++n > 80) break;
+        }
+        Log("[cls] ---- %d classes contendo \"%s\" ----", n, sub);
+    }
+
     int ScreenW() { return Hooks::g_viewW; }
     int ScreenH() { return Hooks::g_viewH; }
 
@@ -576,6 +672,30 @@ namespace SDK {
         void* r = nullptr;
         if (!se_read_ptr(base, (size_t)off, &r)) return nullptr;
         return (Il2CppObject*)r;
+    }
+
+    Il2CppClass* AntiHackClass() { return kAntiHack; }
+
+    Il2CppClass* FindAntiHackClass() {
+        static const char* names[] = { "AntiHack", "AntiCheat", "AntiHackSystem", "AntiHackManager" };
+        for (const char* n : names) {
+            Il2CppClass* k = FindClassExact(n);
+            if (k) return k;
+        }
+        return nullptr;
+    }
+
+    Il2CppObject* AntiHackInstance() {
+        if (!kAntiHack) return nullptr;
+        static const char* names[] = { "instance", "Instance", "_instance", "singleton", "Singleton" };
+        for (const char* n : names) {
+            FieldInfo* f = se_class_get_field_from_name(kAntiHack, n);
+            if (!f) continue;
+            Il2CppObject* v = nullptr;
+            se_field_static_get_value(f, &v);
+            if (v) return v;
+        }
+        return nullptr;
     }
 
     // ======================= transform / posicao =======================
@@ -772,7 +892,9 @@ namespace SDK {
     bool IsEnemy(Il2CppObject* o) {
         if (!o) return false;
         if (!O_team) return true;
-        return ReadTeam(o) != g_localTeam;
+        int t = ReadTeam(o);
+        if (t < 0 || g_localTeam < 0) return true;
+        return t != g_localTeam;
     }
 
     // ======================= nome =======================
@@ -904,6 +1026,11 @@ namespace SDK {
     }
 
     // ======================= bones =======================
+    static const char* kHeads[] = { "Head", "head", "HEAD", "Bip01 Head",
+                                    "mixamorig:Head", "neck", "Bone_Head" };
+    static const char* kFeet[] = { "Foot", "foot", "Foot_L", "Bip01 L Foot",
+                                   "mixamorig:LeftFoot", "toe", "Bone_Foot" };
+
     Il2CppObject* FindBoneContains(Il2CppObject* root, const char* sub, int budget) {
         if (!root || !sub) return nullptr;
 
@@ -959,6 +1086,55 @@ namespace SDK {
             if (b) return b;
         }
         return nullptr;
+    }
+
+    // >>> MELHORIA: bones cacheados por player.
+    static BoneCacheEnt* BoneCacheFind(Il2CppObject* p) {
+        for (auto& b : g_boneCache) if (b.player == p) return &b;
+        return nullptr;
+    }
+
+    static BoneCacheEnt* BoneCacheInsert(Il2CppObject* p) {
+        for (auto& b : g_boneCache) if (!b.player) { b.player = p; b.head = b.foot = nullptr; return &b; }
+        BoneCacheEnt* b = &g_boneCache[g_boneEvict++ % 64];
+        b->player = p; b->head = b->foot = nullptr;
+        return b;
+    }
+
+    static void ResolveBones(Target& t, Il2CppObject* e) {
+        BoneCacheEnt* bc = BoneCacheFind(e);
+        if (!bc) {
+            bc = BoneCacheInsert(e);
+            if (bc) {
+                Il2CppObject* playerTf = CachedTransform(e);
+                Il2CppObject* animTf = nullptr;
+                if (O_humanMeshAnimator) {
+                    Il2CppObject* anim = SafeReadObjPub(e, O_humanMeshAnimator);
+                    if (anim) animTf = ResolveGetTransform(anim);
+                }
+
+                static bool hierDumped = false;
+                if (!hierDumped) {
+                    hierDumped = true;
+                    Log("[hier] ---- player transform ----");
+                    LogHierarchy(playerTf, 80);
+                    if (animTf && animTf != playerTf) {
+                        Log("[hier] ---- animator transform ----");
+                        LogHierarchy(animTf, 80);
+                    }
+                    Log("[hier] ---- fim ----");
+                }
+
+                bc->head = FindBoneAny(playerTf, kHeads, 7);
+                bc->foot = FindBoneAny(playerTf, kFeet, 7);
+                if ((!bc->head || !bc->foot) && animTf && animTf != playerTf) {
+                    if (!bc->head) bc->head = FindBoneAny(animTf, kHeads, 7);
+                    if (!bc->foot) bc->foot = FindBoneAny(animTf, kFeet, 7);
+                }
+                Log("[sdk] bones %p head=%p foot=%p", e, bc->head, bc->foot);
+            }
+        }
+        if (bc) { t.headBone = bc->head; t.footBone = bc->foot; }
     }
 
     // ======================= camera / view =======================
@@ -1048,13 +1224,18 @@ namespace SDK {
     bool WorldToScreen(Vec3 w, Vec2& out) {
         if (!g_viewProjOk) return false;
 
-        float m[16];
-        for (;;) {
+        // >>> FIX C6001: 'm' podia sair nao inicializado se as 64 tentativas do
+        //     guard caissem todas no ramo impar do g_vpSeq.
+        float m[16] = {};
+        bool copied = false;
+        for (int guard = 0; guard < 64; ++guard) {
             LONG s1 = g_vpSeq;
             if (s1 & 1) { YieldProcessor(); continue; }
             memcpy(m, g_viewProj, sizeof(m));
+            copied = true;
             if (g_vpSeq == s1) break;
         }
+        if (!copied) memcpy(m, g_viewProj, sizeof(m));
 
         float x = m[0] * w.x + m[4] * w.y + m[8] * w.z + m[12];
         float y = m[1] * w.x + m[5] * w.y + m[9] * w.z + m[13];
@@ -1086,30 +1267,41 @@ namespace SDK {
     }
 
     // ======================= LINE OF SIGHT =======================
-    static MethodInfo* FindRaycast4() {
+    // Backends, em ordem de preferencia:
+    //   1 Raycast(Vector3,Vector3,out RaycastHit,float)
+    //   2 Raycast(Vector3,Vector3,out RaycastHit,float,int)
+    //   3 Linecast(Vector3,Vector3,out RaycastHit)
+    //   4 Linecast(Vector3,Vector3,out RaycastHit,int)
+    //   5 Raycast(Ray,out RaycastHit,float)
+    //   6 Raycast(Ray,out RaycastHit,float,int)
+    static MethodInfo* FindPhysicsRay(const char* name, int nParams, int kind,
+        const char* t0, const char* t1, const char* t2) {
         if (!kPhysics) kPhysics = FindClass("Physics", "UnityEngine");
         if (!kPhysics) return nullptr;
+
         void* it = nullptr;
         for (;;) {
             const MethodInfo* m = il2cpp_class_get_methods(kPhysics, &it);
             if (!m) break;
-            if (strcmp(il2cpp_method_get_name(m), "Raycast") != 0) continue;
-            if (il2cpp_method_get_param_count(m) != 4) continue;
+            if (strcmp(il2cpp_method_get_name(m), name) != 0) continue;
+            if ((int)il2cpp_method_get_param_count(m) != nParams) continue;
 
             const Il2CppType* p0 = il2cpp_method_get_param(m, 0);
-            const Il2CppType* p1 = il2cpp_method_get_param(m, 1);
-            const Il2CppType* p2 = il2cpp_method_get_param(m, 2);
-            const Il2CppType* p3 = il2cpp_method_get_param(m, 3);
-            if (!p0 || !p1 || !p2 || !p3) continue;
+            if (!p0) continue;
             const char* n0 = il2cpp_type_get_name(p0);
-            const char* n1 = il2cpp_type_get_name(p1);
-            const char* n2 = il2cpp_type_get_name(p2);
-            const char* n3 = il2cpp_type_get_name(p3);
-            if (!n0 || !n1 || !n2 || !n3) continue;
-            if (!strstr(n0, "Vector3")) continue;
-            if (!strstr(n1, "Vector3")) continue;
-            if (!strstr(n2, "RaycastHit")) continue;
-            if (!strstr(n3, "Single")) continue;
+            if (!n0 || !strstr(n0, t0)) continue;
+
+            if (t1) {
+                const Il2CppType* p1 = il2cpp_method_get_param(m, 1);
+                const char* n1 = p1 ? il2cpp_type_get_name(p1) : nullptr;
+                if (!n1 || !strstr(n1, t1)) continue;
+            }
+            if (t2) {
+                const Il2CppType* p2 = il2cpp_method_get_param(m, 2);
+                const char* n2 = p2 ? il2cpp_type_get_name(p2) : nullptr;
+                if (!n2 || !strstr(n2, t2)) continue;
+            }
+            g_rayKind = kind;
             return (MethodInfo*)m;
         }
         return nullptr;
@@ -1117,56 +1309,196 @@ namespace SDK {
 
     static uint32_t HitDistOffset() {
         if (O_hitDist) return O_hitDist;
-        Il2CppClass* k = FindClass("RaycastHit", "UnityEngine");
-        if (k) {
-            FieldInfo* f = se_class_get_field_from_name(k, "m_Distance");
-            if (!f) f = se_class_get_field_from_name(k, "distance");
+        if (!kRaycastHit) kRaycastHit = FindClass("RaycastHit", "UnityEngine");
+        if (kRaycastHit) {
+            FieldInfo* f = se_class_get_field_from_name(kRaycastHit, "m_Distance");
+            if (!f) f = se_class_get_field_from_name(kRaycastHit, "distance");
             if (f) O_hitDist = (uint32_t)se_field_offset(f);
+
+            FieldInfo* fc = se_class_get_field_from_name(kRaycastHit, "m_Collider");
+            if (!fc) fc = se_class_get_field_from_name(kRaycastHit, "collider");
+            if (fc) {
+                const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(fc) : nullptr;
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                g_hitColIsId = !tn || (strstr(tn, "Int32") != nullptr) || (strstr(tn, "Int") != nullptr);
+                O_hitCollider = (uint32_t)se_field_offset(fc);
+            }
         }
         if (!O_hitDist) O_hitDist = 0x1C;
-        Log("[los] Physics=%p Raycast=%p hitDistOff=0x%X", kPhysics, M_raycast, O_hitDist);
         return O_hitDist;
     }
 
-    bool HasLineOfSight(Vec3 eye, Vec3 aim) {
-        if (!M_raycast) M_raycast = FindRaycast4();
+    static void ResolveRaycast() {
+        if (M_raycast) return;
+        g_rayKind = 0;
+        g_rayUsesRay = false;
+
+        M_raycast = FindPhysicsRay("Raycast", 4, 1, "Vector3", "Vector3", "RaycastHit");
+        if (!M_raycast) M_raycast = FindPhysicsRay("Raycast", 5, 2, "Vector3", "Vector3", "RaycastHit");
+        if (!M_raycast) M_raycast = FindPhysicsRay("Linecast", 3, 3, "Vector3", "Vector3", "RaycastHit");
+        if (!M_raycast) M_raycast = FindPhysicsRay("Linecast", 4, 4, "Vector3", "Vector3", "RaycastHit");
+        if (!M_raycast) M_raycast = FindPhysicsRay("Raycast", 3, 5, "Ray", nullptr, "RaycastHit");
+        if (!M_raycast) M_raycast = FindPhysicsRay("Raycast", 4, 6, "Ray", nullptr, "RaycastHit");
+
+        if (M_raycast) {
+            g_rayUsesRay = (g_rayKind >= 5);
+            HitDistOffset();
+        }
+        if (!g_losLogged) {
+            g_losLogged = true;
+            Log("[los] Physics=%p metodo=%p backend=%s hitOff=0x%X colOff=0x%X colIsId=%d",
+                kPhysics, M_raycast, kRayNames[g_rayKind], O_hitDist, O_hitCollider, (int)g_hitColIsId);
+        }
+    }
+
+    static MethodInfo* FindRaycast4() { ResolveRaycast(); return M_raycast; }
+
+    bool LosReady() { if (!M_raycast) ResolveRaycast(); return M_raycast != nullptr; }
+
+    const char* LosBackend() {
+        int k = g_rayKind;
+        if (k < 0 || k > 6) k = 0;
+        return kRayNames[k];
+    }
+
+    struct RayS { Vec3 origin; Vec3 dir; };
+
+    static bool ShootRay(Vec3 from, Vec3 dir, float len, unsigned char* hitBuf) {
+        if (g_rayKind == 0) return false;
+
+        Vec3 sv = from, dv = dir; float lv = len; int mask = -1;
+        RayS ray{ from, dir };
+        void* args[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
+
+        switch (g_rayKind) {
+        case 1: args[0] = &sv;  args[1] = &dv;    args[2] = hitBuf; args[3] = &lv; break;
+        case 2: args[0] = &sv;  args[1] = &dv;    args[2] = hitBuf; args[3] = &lv; args[4] = &mask; break;
+        case 3: args[0] = &sv;  args[1] = &dv;    args[2] = hitBuf; break;
+        case 4: args[0] = &sv;  args[1] = &dv;    args[2] = hitBuf; args[3] = &mask; break;
+        case 5: args[0] = &ray; args[1] = hitBuf; args[2] = &lv; break;
+        case 6: args[0] = &ray; args[1] = hitBuf; args[2] = &lv; args[3] = &mask; break;
+        default: return false;
+        }
+
+        Il2CppObject* r = se_runtime_invoke(M_raycast, nullptr, args);
+        if (!r) return false;
+        void* pb = se_object_unbox(r);
+        return pb && *(unsigned char*)pb != 0;
+    }
+
+    static Il2CppObject* ObjectFromInstanceID(int id) {
+        if (id <= 0) return nullptr;
+        if (!kObject) kObject = FindClass("Object", "UnityEngine");
+        if (!kObject) return nullptr;
+        if (!M_findFromId) M_findFromId = se_class_get_method_from_name(kObject, "FindObjectFromInstanceID", 1);
+        if (!M_findFromId) return nullptr;
+        void* a[1]; a[0] = &id;
+        return se_runtime_invoke(M_findFromId, nullptr, a);
+    }
+
+    // --- identificacao do dono do collider por ANCESTRALIDADE ---
+    // >>> FIX: a versao anterior comparava a POSICAO do transform do collider
+    //     com a camera. O collider do player e filho do root, e o root fica
+    //     nos pes (~1.5-2m abaixo do olho), entao "self" nunca casava e o
+    //     codigo caia no return false -> quase tudo marcado como oculto.
+    static MethodInfo* M_get_parent = nullptr;
+
+    static Il2CppObject* ParentOf(Il2CppObject* tf) {
+        if (!tf) return nullptr;
+        Il2CppClass* k = se_object_get_class(tf);
+        if (!k) return nullptr;
+        if (!M_get_parent) M_get_parent = se_class_get_method_from_name(k, "get_parent", 0);
+        if (!M_get_parent) return nullptr;
+        return se_runtime_invoke(M_get_parent, tf, nullptr);
+    }
+
+    static Il2CppObject* ColliderFromHit(unsigned char* hitBuf) {
+        if (!O_hitCollider) return nullptr;
+        if (g_hitColIsId) {
+            int id = 0;
+            if (!se_read_int(hitBuf, O_hitCollider, &id) || id <= 0) return nullptr;
+            return ObjectFromInstanceID(id);
+        }
+        void* p = nullptr;
+        if (!se_read_ptr(hitBuf, O_hitCollider, &p) || !p) return nullptr;
+        return (Il2CppObject*)p;
+    }
+
+    // 0 = obstaculo | 1 = corpo do local | 2 = alvo
+    static int OwnerKind(Il2CppObject* col, Il2CppObject* localTf,
+        Il2CppObject* targetTf, Vec3 aim) {
+        Il2CppObject* tf = ResolveGetTransform(col);
+        if (!tf) return 0;
+
+        Il2CppObject* walk = tf;
+        for (int d = 0; walk && d < 10; ++d) {
+            if (localTf && walk == localTf) return 1;
+            if (targetTf && walk == targetTf) return 2;
+            walk = ParentOf(walk);
+        }
+
+        if (targetTf && localTf) return 0;   // ancestralidade resolvida -> obstaculo
+
+        Vec3 op = GetPos(tf);                // fallback quando faltou referencia
+        if (op.zero()) return 0;
+        if (!targetTf && (op - aim).len() < 2.5f) return 2;
+        if (!localTf && (op - g_localPos).len() < 1.5f) return 1;
+        return 0;
+    }
+
+    bool HasLineOfSightEx(Vec3 eye, Vec3 aim, Il2CppObject* localTf, Il2CppObject* targetTf) {
+        if (!M_raycast) ResolveRaycast();
         if (!M_raycast) return true;
         if (!O_hitDist) HitDistOffset();
 
+        if (!localTf && g_localPlayer) localTf = CachedTransform(g_localPlayer);
+
         Vec3 d = aim - eye;
         float dist = d.len();
-        if (dist < 0.05f) return true;
+        if (dist < 2.0f) return true;
         Vec3 dir{ d.x / dist, d.y / dist, d.z / dist };
 
-        alignas(16) unsigned char hitBuf[128];
-        float travelled = 0.35f;
+        // rede de seguranca para quando o collider nao pode ser resolvido
+        float skip = dist * 0.30f;
+        if (skip > 1.4f) skip = 1.4f;
 
-        for (int iter = 0; iter < 3; ++iter) {
+        alignas(16) unsigned char hitBuf[160];
+        float travelled = 0.f;
+
+        for (int iter = 0; iter < 10; ++iter) {
             float len = dist - travelled;
-            if (len < 0.05f) return true;
+            if (len < 0.1f) return true;
 
             memset(hitBuf, 0, sizeof(hitBuf));
             Vec3 sv = eye + dir * travelled;
-            Vec3 dv = dir;
-            float lv = len;
-            void* args[4] = { &sv, &dv, (void*)hitBuf, &lv };
 
-            Il2CppObject* r = se_runtime_invoke(M_raycast, nullptr, args);
-            if (!r) return true;
-            void* pb = se_object_unbox(r);
-            if (!pb || *(unsigned char*)pb == 0) return true;
+            if (!ShootRay(sv, dir, len, hitBuf)) return true;   // nada no caminho
 
             Vec3 hitPoint{ 0.f, 0.f, 0.f };
             se_read_bytes(hitBuf, &hitPoint, sizeof(Vec3));
             float hitDist = (hitPoint - sv).len();
-
             if (hitDist < 0.01f)
                 se_read_bytes(hitBuf + O_hitDist, &hitDist, sizeof(float));
 
-            if (hitDist < 0.30f) { travelled += hitDist + 0.05f; continue; }
-            return hitDist >= (len - 0.5f);
+            // classificacao pelo dono real do collider
+            if (Il2CppObject* col = ColliderFromHit(hitBuf)) {
+                int kind = OwnerKind(col, localTf, targetTf, aim);
+                if (kind == 2) return true;                        // bateu no alvo
+                if (kind == 1) { travelled += 0.30f; continue; }   // proprio corpo/arma
+                return false;                                      // obstaculo real
+            }
+
+            // fallback por distancia
+            if (hitDist < 0.05f) { travelled += 0.30f; continue; }
+            float abs = travelled + hitDist;
+            if (abs < skip) { travelled = abs + 0.06f; continue; }
+            return abs >= (dist - 0.9f);
         }
         return true;
+    }
+
+    bool HasLineOfSight(Vec3 eye, Vec3 aim) {
+        return HasLineOfSightEx(eye, aim, nullptr, nullptr);
     }
 
     bool TargetVisible(int idx, Vec3 eye, Vec3 aim) {
@@ -1186,7 +1518,7 @@ namespace SDK {
 
     bool RaycastTest(Vec3 from, Vec3 to, float& outHitDist) {
         outHitDist = -1.f;
-        if (!M_raycast) M_raycast = FindRaycast4();
+        if (!M_raycast) ResolveRaycast();
         if (!M_raycast) return false;
         if (!O_hitDist) HitDistOffset();
 
@@ -1195,20 +1527,15 @@ namespace SDK {
         if (len < 0.01f) return false;
         Vec3 dir{ d.x / len, d.y / len, d.z / len };
 
-        alignas(16) unsigned char hitBuf[128];
+        alignas(16) unsigned char hitBuf[160];
         memset(hitBuf, 0, sizeof(hitBuf));
-        Vec3 sv = from, dv = dir; float lv = len;
-        void* args[4] = { &sv, &dv, (void*)hitBuf, &lv };
-
-        Il2CppObject* r = se_runtime_invoke(M_raycast, nullptr, args);
-        if (!r) return false;
-        void* pb = se_object_unbox(r);
-        if (!pb) return false;
-        if (*(unsigned char*)pb == 0) return false;
+        if (!ShootRay(from, dir, len, hitBuf)) return false;
 
         Vec3 hitPoint{ 0.f, 0.f, 0.f };
         se_read_bytes(hitBuf, &hitPoint, sizeof(Vec3));
-        outHitDist = (hitPoint - sv).len();
+        outHitDist = (hitPoint - from).len();
+        if (outHitDist < 0.01f)
+            se_read_bytes(hitBuf + O_hitDist, &outHitDist, sizeof(float));
         return true;
     }
 
@@ -1221,6 +1548,14 @@ namespace SDK {
         if (!ReadMatrix(g_camera, M_camProj, P)) return 1.732f;
         if (P[5] <= 0.0001f) return 1.732f;
         return P[5];
+    }
+
+    // >>> FIX: fonte UNICA do raio do FOV.
+    float FovRadiusPx(float deg) {
+        float cot = CameraCotHalfFovY();
+        float h = (float)ScreenH();
+        if (cot <= 0.f || h <= 0.f) return 99999.f;
+        return (h * 0.5f) * tanf(deg * 0.01745329252f) * cot;
     }
 
     Vec3 TargetAimPos(Il2CppObject* p, int boneMode) {
@@ -1269,39 +1604,122 @@ namespace SDK {
     void DumpFields(const char* className) { DumpFields(FindClass(className), className); }
 
     // ======================= weapon stats =======================
+    // >>> FIX: offsets resolvidos PELA CLASSE DA INSTANCIA.
+    static void EnsureGunOffsets(Il2CppClass* k) {
+        if (!k || k == g_gsCls) return;
+        const char* kn = se_class_name(k);
+        if (!kn || (!strstr(kn, "gunStats") && !strstr(kn, "GunStats"))) return;
+
+        g_gsCls = k;
+        O_gsMagSize = PickFieldOff(k, { "magSize", "magazineSize", "maxAmmo" }, "Int32");
+        O_gsAmmo = PickFieldOff(k, { "ammoInMagazine", "currentAmmo", "curAmmo" }, "Int32");
+        O_gsGunObj = PickFieldOff(k, { "gunObject", "gunObj" });
+        if (!O_gsMagSize) O_gsMagSize = 0xFC;
+        if (!O_gsAmmo)    O_gsAmmo = 0x90;
+        if (!O_gsGunObj)  O_gsGunObj = 0x148;
+
+        Log("[sdk] gunStats offsets (cls=%s): mag=0x%X ammo=0x%X gunObj=0x%X",
+            kn, O_gsMagSize, O_gsAmmo, O_gsGunObj);
+    }
+
     static bool GunStatsLooksLive(Il2CppObject* s) {
         if (!s) return false;
+        Il2CppClass* k = se_object_get_class(s);
+        if (!k) return false;
+        EnsureGunOffsets(k);
+
         if (O_gsGunObj && SafeReadObjPub(s, O_gsGunObj)) return true;
         if (O_gsMagSize && SafeRead<int>((uintptr_t)s + O_gsMagSize, 0) > 0) return true;
         if (O_gsAmmo && SafeRead<int>((uintptr_t)s + O_gsAmmo, 0) > 0) return true;
         return false;
     }
 
+    // >>> MELHORIA: a arma equipada e a que tem o gunObject ATIVO na cena.
+    static bool GunStatsEquipped(Il2CppObject* s) {
+        if (!s || !O_gsGunObj) return false;
+        Il2CppObject* go = SafeReadObjPub(s, O_gsGunObj);
+        if (!go) return false;
+        Il2CppClass* gk = se_object_get_class(go);
+        if (!gk) return false;
+        MethodInfo* m = se_class_get_method_from_name(gk, "get_activeInHierarchy", 0);
+        if (!m) return false;
+        Il2CppObject* r = se_runtime_invoke(m, go, nullptr);
+        if (!r) return false;
+        void* p = se_object_unbox(r);
+        return p && *(unsigned char*)p != 0;
+    }
+
+    // Fonte primaria: arma NA MAO (fpsGunView). Offsets do build atual:
+    //   0x30 gunStats[]  |  0x38 gunStats  |  0x48 Int32 indice (-1 = nenhuma)
+    static Il2CppObject* GunStatsFromView() {
+        if (!g_localPlayer || !O_gunView) return nullptr;
+        Il2CppObject* v = SafeReadObjPub(g_localPlayer, O_gunView);
+        if (!v) return nullptr;
+
+        Il2CppObject* held = SafeReadObjPub(v, 0x38);
+        if (GunStatsLooksLive(held)) return held;
+
+        int idx = SafeRead<int>((uintptr_t)v + 0x48, -1);
+        Il2CppObject* arr = SafeReadObjPub(v, 0x30);
+        if (arr && idx >= 0) {
+            int len = 0;
+            if (il2cpp_array_length) len = (int)il2cpp_array_length((const Il2CppArray*)arr);
+            if (len <= 0) len = SafeRead<int>((uintptr_t)arr + 0x18, 0);
+            if (idx < len) {
+                void* e = nullptr;
+                if (se_read_ptr(arr, 0x20 + (size_t)idx * 8, &e) && e &&
+                    GunStatsLooksLive((Il2CppObject*)e))
+                    return (Il2CppObject*)e;
+            }
+        }
+        return nullptr;
+    }
+
     Il2CppObject* FindGunStatsObj() {
         if (!g_localPlayer) return nullptr;
 
-        // candidato direto (pode ser um clone em branco)
-        Il2CppObject* cand = nullptr;
-        if (O_gunStats) cand = SafeReadObjPub(g_localPlayer, O_gunStats);
+        if (Il2CppObject* g = GunStatsFromView()) return g;
+
+        Il2CppObject* cand = O_gunStats ? SafeReadObjPub(g_localPlayer, O_gunStats) : nullptr;
         if (GunStatsLooksLive(cand)) return cand;
 
-        // >>> FIX: procura no array de loadout um gunStats com valores reais
         if (O_gunStatsArray) {
             Il2CppObject* arr = SafeReadObjPub(g_localPlayer, O_gunStatsArray);
             if (arr) {
-                int len = SafeRead<int>((uintptr_t)arr + 0x10, 0);
-                if (len > 0 && len <= 64) {
+                // >>> FIX: o TAMANHO fica em 0x18 (max_length). 0x10 e o ponteiro
+                //     'bounds', que num array 1D e NULL -> len=0 -> nunca varria.
+                int len = 0;
+                if (il2cpp_array_length) len = (int)il2cpp_array_length((const Il2CppArray*)arr);
+                if (len <= 0) len = SafeRead<int>((uintptr_t)arr + 0x18, 0);
+
+                if (len > 0 && len <= 128) {
+                    Il2CppObject* firstLive = nullptr;
+                    int firstLiveIdx = -1;
+
                     for (int i = 0; i < len; ++i) {
                         void* e = nullptr;
                         if (!se_read_ptr(arr, 0x20 + (size_t)i * 8, &e) || !e) continue;
-                        if (GunStatsLooksLive((Il2CppObject*)e)) {
-                            static int lastIdx = -1;
-                            if (lastIdx != i) {
-                                lastIdx = i;
-                                Log("[sdk] gunStats vivo = loadout[%d] (%p)", i, e);
-                            }
-                            return (Il2CppObject*)e;
+                        Il2CppObject* g = (Il2CppObject*)e;
+                        if (!GunStatsLooksLive(g)) continue;
+
+                        if (!firstLive) { firstLive = g; firstLiveIdx = i; }
+                        if (!GunStatsEquipped(g)) continue;
+
+                        static int lastEq = -1;
+                        if (lastEq != i) {
+                            lastEq = i;
+                            Log("[sdk] gunStats EQUIPADO = loadout[%d] (%p)", i, g);
                         }
+                        return g;
+                    }
+                    if (firstLive) {
+                        static int lastIdx = -1;
+                        if (lastIdx != firstLiveIdx) {
+                            lastIdx = firstLiveIdx;
+                            Log("[sdk] gunStats vivo = loadout[%d] (%p) [nenhum ativo]",
+                                firstLiveIdx, firstLive);
+                        }
+                        return firstLive;
                     }
                 }
             }
@@ -1309,7 +1727,6 @@ namespace SDK {
 
         if (cand) return cand;
 
-        // fallback: varredura por tipo
         Il2CppClass* k = se_object_get_class(g_localPlayer);
         if (k) {
             void* it = nullptr;
@@ -1329,6 +1746,8 @@ namespace SDK {
         return nullptr;
     }
 
+    Il2CppObject* GetGunStatsLive() { return FindGunStatsObj(); }
+
     int ResolveWeaponFields(Il2CppObject* stats,
         uint32_t& cur, uint32_t& max, uint32_t& reserve,
         uint32_t& reload, uint32_t& spread, uint32_t& rate, uint32_t& dmg) {
@@ -1344,15 +1763,24 @@ namespace SDK {
                                 "mMaxAmmo", "magazineSize", "clipSize" }, "Int32");
         reserve = PickFieldOff(k, { "totalAmmo", "reserveAmmo", "ammoReserve",
                                     "spareAmmo", "totalMags" }, "Int32");
-        reload = PickFieldOff(k, { "reloading", "isReloading", "mReloading" }, "Boolean");
+
+        // >>> FIX: nao existe campo "reloading" nem "damage" neste jogo.
+        reload = PickFieldOff(k, { "reloading", "isReloading", "mReloading",
+                                   "hasShellReloading", "requiresClearChamber" }, "Boolean");
+        if (!reload) reload = PickFieldOff(k, { "reloadTimer", "reloadingTimer",
+                                                "reloadAnimationTime" }, "Single");
+
         spread = PickFieldOff(k, { "hipMinSpread", "spread", "currentSpread", "mSpread" }, "Single");
+        if (!spread) spread = PickFieldOff(k, { "adsMinSpread" }, "Single");
 
         rate = PickFieldOff(k, { "shotDelay", "fireDelay", "chamberTime", "cooldown" }, "Single");
         if (!rate) {
             rate = PickFieldOff(k, { "RPM" }, "Single");
             g_rateIsRpm = (rate != 0);
         }
-        dmg = PickFieldOff(k, { "damage", "mDamage", "dmg", "damagePerShot" });
+
+        dmg = PickFieldOff(k, { "damage", "damagePerShot", "bulletDamage",
+                                "hitDamage", "mDamage", "dmg" });
 
         int n = 0;
         if (cur) ++n; if (max) ++n; if (reserve) ++n; if (reload) ++n;
@@ -1436,7 +1864,7 @@ namespace SDK {
     static void SyncAliases(Target& t) {
         t.obj = t.player;
         t.hp = t.health;
-        t.enemy = (O_team == 0) ? true : (t.team != g_localTeam);
+        t.enemy = (O_team == 0) ? true : (g_localTeam < 0 || t.team < 0 || t.team != g_localTeam);
         t.lastSeen = GetTickCount64();
     }
 
@@ -1493,10 +1921,7 @@ namespace SDK {
             Log("[sdk] localPlayer adotado (%p) team=%d", e, g_localTeam);
     }
 
-    static bool AlreadyAdded(Il2CppObject* e, int c) {
-        for (int i = 0; i < c; ++i) if (g_targets[i].player == e) return true;
-        return false;
-    }
+    struct FoundEnt { int slot; Il2CppObject* e; };
 
     void RefreshTargets() {
         if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
@@ -1512,17 +1937,13 @@ namespace SDK {
             kEntity ? kEntity : FindClass("Entity")
         };
 
-        static const char* kHeads[] = { "Head", "head", "HEAD", "Bip01 Head",
-                                        "mixamorig:Head", "neck", "Bone_Head" };
-        static const char* kFeet[] = { "Foot", "foot", "Foot_L", "Bip01 L Foot",
-                                        "mixamorig:LeftFoot", "toe", "Bone_Foot" };
+        ++g_slotGen;
 
+        std::vector<FoundEnt> found;
+        found.reserve(MAX_TARGETS);
         int totalObjs = 0;
 
-        EnterCriticalSection(&g_targetCs);
-        int c = 0;
-
-        for (int s = 0; s < 2 && c < kMaxTargets; ++s) {
+        for (int s = 0; s < 2; ++s) {
             Il2CppClass* sc = scans[s];
             if (!sc) continue;
             if (s == 1 && scans[0] == scans[1]) break;
@@ -1539,64 +1960,66 @@ namespace SDK {
             uint32_t n = il2cpp_array_length ? il2cpp_array_length(arr) : 0;
             totalObjs += (int)n;
 
-            for (uint32_t i = 0; i < n && c < kMaxTargets; ++i) {
+            for (uint32_t i = 0; i < n; ++i) {
                 Il2CppObject* e = (Il2CppObject*)se_array_at(arr, i);
                 if (!e) continue;
-
                 if (IsLocalEntity(e)) { AdoptLocal(e); continue; }
-                if (AlreadyAdded(e, c)) continue;
 
-                Target& tgt = g_targets[c];
-                memset(&tgt, 0, sizeof(Target));
-
-                tgt.player = e;
-                tgt.obj = e;
-                tgt.health = ReadHealth(e);
-                tgt.hp = tgt.health;
-                tgt.alive = (tgt.health > 0.5f);
-                tgt.team = ReadTeam(e);
-                tgt.pos = GetPos(e);
-                if (O_weapon) se_read_int(e, O_weapon, &tgt.weapon);
-                GetNameBuf(e, tgt.name, sizeof(tgt.name));
-
-                Il2CppClass* ek = se_object_get_class(e);
-                const char* en = ek ? se_class_name(ek) : nullptr;
-                tgt.npc = (en && strstr(en, "NPC") != nullptr);
-
-                Il2CppObject* playerTf = CachedTransform(e);
-                Il2CppObject* animTf = nullptr;
-                if (O_humanMeshAnimator) {
-                    Il2CppObject* anim = SafeReadObjPub(e, O_humanMeshAnimator);
-                    if (anim) animTf = ResolveGetTransform(anim);
-                }
-
-                static bool hierDumped = false;
-                if (!hierDumped) {
-                    hierDumped = true;
-                    Log("[hier] ---- player transform ----");
-                    LogHierarchy(playerTf, 80);
-                    if (animTf && animTf != playerTf) {
-                        Log("[hier] ---- animator transform ----");
-                        LogHierarchy(animTf, 80);
-                    }
-                    Log("[hier] ---- fim ----");
-                }
-
-                tgt.headBone = FindBoneAny(playerTf, kHeads, 7);
-                tgt.footBone = FindBoneAny(playerTf, kFeet, 7);
-                if ((!tgt.headBone || !tgt.footBone) && animTf && animTf != playerTf) {
-                    if (!tgt.headBone) tgt.headBone = FindBoneAny(animTf, kHeads, 7);
-                    if (!tgt.footBone) tgt.footBone = FindBoneAny(animTf, kFeet, 7);
-                }
-
-                ResolveHeadFeet(tgt);
-
-                tgt.onScreen = false;
-                SyncAliases(tgt);
-                ++c;
+                bool dup = false;
+                for (auto& f : found) if (f.e == e) { dup = true; break; }
+                if (!dup) found.push_back({ -1, e });
             }
         }
 
+        // >>> MELHORIA: slots estaveis.
+        for (auto& f : found)
+            for (int i = 0; i < MAX_TARGETS; ++i)
+                if (g_slotOwner[i] == f.e) { f.slot = i; g_slotSeen[i] = g_slotGen; break; }
+
+        for (auto& f : found) {
+            if (f.slot >= 0) continue;
+            for (int i = 0; i < MAX_TARGETS; ++i) {
+                if (!g_slotOwner[i] || g_slotSeen[i] != g_slotGen) {
+                    g_slotOwner[i] = f.e; g_slotSeen[i] = g_slotGen; f.slot = i; break;
+                }
+            }
+        }
+        for (int i = 0; i < MAX_TARGETS; ++i)
+            if (g_slotSeen[i] != g_slotGen) g_slotOwner[i] = nullptr;
+
+        std::sort(found.begin(), found.end(),
+            [](const FoundEnt& a, const FoundEnt& b) { return a.slot < b.slot; });
+
+        EnterCriticalSection(&g_targetCs);
+        int c = 0;
+        for (auto& f : found) {
+            if (c >= kMaxTargets || f.slot < 0) break;
+
+            Target& tgt = g_targets[c];
+            if (tgt.player != f.e) {
+                memset(&tgt, 0, sizeof(Target));
+                tgt.player = f.e;
+                tgt.obj = f.e;
+                tgt.slot = (uint32_t)f.slot;
+                tgt.team = ReadTeam(f.e);
+                tgt.pos = GetPos(f.e);
+                GetNameBuf(f.e, tgt.name, sizeof(tgt.name));
+                if (O_weapon) se_read_int(f.e, O_weapon, &tgt.weapon);
+
+                Il2CppClass* ek = se_object_get_class(f.e);
+                const char* en = ek ? se_class_name(ek) : nullptr;
+                tgt.npc = (en && strstr(en, "NPC") != nullptr);
+
+                ResolveBones(tgt, f.e);
+            }
+
+            tgt.health = ReadHealth(f.e);
+            tgt.alive = (tgt.health > 0.5f);
+            ResolveHeadFeet(tgt);
+            tgt.onScreen = false;
+            SyncAliases(tgt);
+            ++c;
+        }
         g_targetCount = c;
         LeaveCriticalSection(&g_targetCs);
 
@@ -1620,15 +2043,20 @@ namespace SDK {
 
     void UpdateTargets() {
         static ULONGLONG lastRefresh = 0;
+        static ULONGLONG lastTfClear = 0;
         ULONGLONG now = GetTickCount64();
-        if (now - lastRefresh > 200) { lastRefresh = now; ClearTfCache(); RefreshTargets(); }
+        if (now - lastRefresh > 200) { lastRefresh = now; RefreshTargets(); }
+        if (now - lastTfClear > 2000) { lastTfClear = now; ClearTfCache(); }
 
         if (!g_localPlayer) return;
+
+        ++g_frameId;                       // >>> FIX: cache de TargetVisible
         g_localPos = GetPos(g_localPlayer);
         g_localTeam = ReadTeam(g_localPlayer);
 
         Il2CppObject* camTf = CamTfObj();
         Vec3 eye = camTf ? GetPos(camTf) : g_localPos;
+        if (eye.zero()) eye = Vec3(g_localPos.x, g_localPos.y + 1.6f, g_localPos.z);
 
         EnterCriticalSection(&g_targetCs);
         for (int i = 0; i < g_targetCount; ++i) {
@@ -1650,11 +2078,27 @@ namespace SDK {
                 && t.scrFeet.y > -64.f
                 && t.scrHead.y < (float)ScreenH() + 64.f;
 
-            t.visible = HasLineOfSight(eye, t.head);
-
             SyncAliases(t);
         }
         LeaveCriticalSection(&g_targetCs);
+
+        // >>> MELHORIA: LOS em round-robin (3 alvos por frame), FORA do critical
+        //     section, com as DUAS referencias de transform.
+        Il2CppObject* localTf = g_localPlayer ? CachedTransform(g_localPlayer) : nullptr;
+
+        static int losCursor = 0;
+        int n = g_targetCount;
+        if (n > 0) {
+            if (losCursor >= n) losCursor = 0;
+            for (int k = 0; k < 3 && k < n; ++k) {
+                int i = losCursor + k;
+                if (i >= n) i -= n;
+                if (!g_targets[i].player) continue;
+                Il2CppObject* ttf = CachedTransform(g_targets[i].player);
+                g_targets[i].visible = HasLineOfSightEx(eye, g_targets[i].head, localTf, ttf);
+            }
+            losCursor = (losCursor + 3) % n;
+        }
     }
 
     std::vector<Target> Snapshot() {
@@ -1722,6 +2166,17 @@ namespace SDK {
         uint32_t np = il2cpp_method_get_param_count ? il2cpp_method_get_param_count(M_FireBullet) : 0;
         if (np == 0) np = 1;
 
+        // >>> FIX: a direcao e o ULTIMO Vector3 da assinatura, nao um indice
+        //     fixo. O [fire7] confirma: a3 = posicao (|a3|=46.7),
+        //     a4 = direcao unitaria (|a4|=1.00).
+        int vCount = 0;
+        for (uint32_t i = 0; i < np; ++i) {
+            const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
+            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+            if (tn && strstr(tn, "Vector3")) ++vCount;
+        }
+        const int dirVIndex = (dirSlot >= 0) ? dirSlot : (vCount > 0 ? vCount - 1 : 0);
+
         std::vector<Vec3>   vbuf(np);
         std::vector<float>  fbuf(np, 0.f);
         std::vector<int>    ibuf(np, 0);
@@ -1734,7 +2189,7 @@ namespace SDK {
             const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
             const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
             if (tn && strstr(tn, "Vector3")) {
-                bool isDir = (dirSlot >= 0) ? (vIndex == dirSlot) : (vIndex == 1);
+                bool isDir = (vIndex == dirVIndex);
                 vbuf[i] = isDir ? dir : muzzle;
                 args[i] = &vbuf[i];
                 ++vIndex;
@@ -1756,6 +2211,8 @@ namespace SDK {
         g_camera = nullptr;
         g_aimTarget = nullptr;
         g_targetCount = 0;
+        memset(g_slotOwner, 0, sizeof(g_slotOwner));
+        memset(g_boneCache, 0, sizeof(g_boneCache));
         ClearTfCache();
     }
 
@@ -1805,21 +2262,36 @@ namespace SDK {
 
         O_rot = O_rotation;
         O_cam = O_camTf;
-        O_rotationIsQuat = true;
 
         {
-            const char* rtE = FieldTypeOf(kEntity, "rotation");
             const char* rtP = FieldTypeOf(kPlayerScript, "rotation");
-            g_rotIsSyncVar = (rtE && strstr(rtE, "SyncVar")) || (rtP && strstr(rtP, "SyncVar"));
+            const char* rtE = FieldTypeOf(kEntity, "rotation");
+            g_rotIsSyncVar = (rtP && strstr(rtP, "SyncVar")) || (rtE && strstr(rtE, "SyncVar"));
+
+            const char* rotT = (rtP && rtP[0] != '?') ? rtP : rtE;
+            O_rotationIsQuat = (!rotT) || rotT[0] == '?' || (strstr(rotT, "Quaternion") != nullptr);
+
+            const char* hpT = FieldTypeOf(kPlayerScript, "_health");
+            if (!hpT || hpT[0] == '?') hpT = FieldTypeOf(kEntity, "_health");
+            g_healthIsSync = hpT && strstr(hpT, "SyncVar") != nullptr;
+
+            const char* tmT = FieldTypeOf(kPlayerScript, "mpTeamNumber");
+            if (!tmT || tmT[0] == '?') tmT = FieldTypeOf(kEntity, "team");
+            g_teamIsSync = tmT && strstr(tmT, "SyncVar") != nullptr;
         }
 
-        // >>> FIX: offsets do gunStats + campo do array de loadout
+        // classe real e a aninhada PlayerScript.gunStats.
         if (!kGunStats) kGunStats = FindClass("gunStats");
+        if (!kGunStats) kGunStats = FindClass("GunStats");
         if (kGunStats) {
             O_gsMagSize = PickFieldOff(kGunStats, { "magSize", "magazineSize", "maxAmmo" }, "Int32");
             O_gsAmmo = PickFieldOff(kGunStats, { "ammoInMagazine", "currentAmmo" }, "Int32");
             O_gsGunObj = PickFieldOff(kGunStats, { "gunObject" });
         }
+        if (!O_gsMagSize) O_gsMagSize = 0xFC;
+        if (!O_gsAmmo)    O_gsAmmo = 0x90;
+        if (!O_gsGunObj)  O_gsGunObj = 0x148;
+
         if (kPlayerScript && !O_gunStatsArray) {
             void* it = nullptr;
             for (;;) {
@@ -1894,22 +2366,32 @@ namespace SDK {
         kNPC = FindClass("NPC");
         kTransform = FindClass("Transform", "UnityEngine");
         kCamera = FindClass("Camera", "UnityEngine");
-        kGunStats = FindClass("GunStats");
-        if (!kGunStats) kGunStats = FindClass("gunStats");
+        kObject = FindClass("Object", "UnityEngine");
+        kRaycastHit = FindClass("RaycastHit", "UnityEngine");
+        kGunStats = FindClass("gunStats");
+        if (!kGunStats) kGunStats = FindClass("GunStats");
         kVector3 = FindClass("Vector3", "UnityEngine");
         kQuaternion = FindClass("Quaternion", "UnityEngine");
-        kAntiHack = FindClass("AntiHack");
-        if (!kAntiHack) kAntiHack = FindClass("AntiCheat");
+
+        // >>> FIX: FindClass("AntiHack") casava StoreAntiHack.
+        kAntiHack = FindAntiHackClass();
+        if (!kAntiHack) {
+            ListClassesContaining("AntiHack");
+            ListClassesContaining("Anti");
+            ListClassesContaining("Hack");
+        }
 
         memset(g_losState, 0xFF, sizeof(g_losState));
 
         ResolveOffsets();
         ResolveMethods();
         BuildStringOffsets();
+        ResolveRaycast();
 
-        M_raycast = FindRaycast4();
-        if (M_raycast) HitDistOffset();
-        Log("[los] Raycast=%p hitDist=0x%X", M_raycast, O_hitDist);
+        if (kAntiHack) {
+            Log("[ac] classe=%s instance=%p", se_class_name(kAntiHack), AntiHackInstance());
+            DumpFields(kAntiHack, "AntiHack");
+        }
 
         g_phase = "sdk.done";
         Log("[sdk] Init: CONCLUIDO");

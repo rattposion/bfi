@@ -1,3 +1,10 @@
+// ============================================================================
+//  visuals.cpp
+//  >>> FIX: o circulo do FOV usava uma formula propria com constante fixa
+//  (0.4142 = tan(22.5 graus)) enquanto o aim usava a matriz de projecao da
+//  camera. Os dois nao batiam (~2.4x de diferenca). Agora ambos usam
+//  SDK::FovRadiusPx.
+// ============================================================================
 #include "features.h"
 #include "sdk.h"
 #include "hooks.h"
@@ -45,7 +52,9 @@ static void DrawCrosshair(ImDrawList* dl, float cx, float cy) {
 
 static void DrawFovCircle(ImDrawList* dl, float cx, float cy, float H) {
     if (!C.showFovCircle) return;
-    float r = (float)tan(C.aimFov * 3.14159265f / 360.f) / 0.4142f * (H * 0.5f);
+    if (!SDK::g_viewProjOk) return;
+
+    float r = SDK::FovRadiusPx(C.aimFov);   // >>> FIX: mesma formula do aim
     if (r < 3.f || r > H) return;
     dl->AddCircle(ImVec2(cx, cy), r, C4(C.aimColor, 0.8f), 64, 1.5f);
 }

@@ -43,7 +43,6 @@ namespace ConfigIO {
         S_B(esp); S_B(espBox); S_B(espFill); S_B(espName); S_B(espHealth);
         S_B(espHealthNum); S_B(espWeapon); S_B(espDistance); S_B(espSnapline);
         S_B(espSkeleton); S_B(espNpc); S_B(teamCheck); S_B(fps);
-        // >>> visual check (verde/vermelho) + linha do centro ate o inimigo
         S_B(espVisCheck); S_B(espVisLine);
         S_F(espThickness); S_F(espMaxDist); S_F(espFontSize);
         S_F(espOffY); S_F(espScaleY); S_F(espBodyH);
@@ -74,6 +73,14 @@ namespace ConfigIO {
         S_B(watermark);
 
         S_B(antiCheat); S_B(blockedNoZone); S_B(blockedUnlock); S_I(stage);
+
+        // ---- UNLOCK ----
+        S_B(unlockAll); S_B(unlockWeapons); S_B(unlockSkins);
+        S_B(unlockAttachments); S_B(unlockCurrency);
+        S_B(fillLoadoutSlots); S_B(applySlots);
+        S_I(slotWeapon[0]); S_I(slotWeapon[1]); S_I(slotWeapon[2]);
+        S_I(currencyValue); S_F(unlockInterval);
+        S_B(skinChanger); S_I(skinIndex); S_I(unlockLevel);
 
 #undef S_B
 #undef S_I
@@ -135,6 +142,14 @@ namespace ConfigIO {
             L_B(watermark);
 
             L_B(antiCheat); L_B(blockedNoZone); L_B(blockedUnlock); L_I(stage);
+
+            // ---- UNLOCK ----
+            L_B(unlockAll); L_B(unlockWeapons); L_B(unlockSkins);
+            L_B(unlockAttachments); L_B(unlockCurrency);
+            L_B(fillLoadoutSlots); L_B(applySlots);
+            L_I(slotWeapon[0]); L_I(slotWeapon[1]); L_I(slotWeapon[2]);
+            L_I(currencyValue); L_F(unlockInterval);
+            L_B(skinChanger); L_I(skinIndex); L_I(unlockLevel);
 
 #undef L_B
 #undef L_I

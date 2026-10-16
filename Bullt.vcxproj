@@ -46,6 +46,7 @@
     <ClInclude Include="minhook\src\hde\table64.h" />
     <ClInclude Include="minhook\src\trampoline.h" />
     <ClInclude Include="sdk.h" />
+    <ClInclude Include="unlock.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="aimbot.cpp" />
@@ -73,8 +74,10 @@
     <ClCompile Include="minhook\src\trampoline.c" />
     <ClCompile Include="misc.cpp" />
     <ClCompile Include="movement.cpp" />
+    <ClCompile Include="recoil.cpp" />
     <ClCompile Include="sdk.cpp" />
     <ClCompile Include="triggerbot.cpp" />
+    <ClCompile Include="unlock.cpp" />
     <ClCompile Include="visuals.cpp" />
     <ClCompile Include="weapons.cpp" />
   </ItemGroup>

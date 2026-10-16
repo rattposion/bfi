@@ -1,5 +1,11 @@
 // ============================================================================
 //  dllmain.cpp
+//
+//  >>> CORRECOES:
+//   1) IL2CPP::Init() era NUNCA chamado (a camada il2cpp.cpp inteira ficava
+//      morta). Agora e chamado e o resultado e logado.
+//   2) A tecla de "descarregar" (F8) so setava g_unload e NADA descarregava.
+//      Agora uma thread vigia e faz o teardown + FreeLibraryAndExitThread.
 // ============================================================================
 #include <windows.h>
 #include <atomic>
@@ -27,6 +33,24 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// ---------------------------------------------------------------------------
+//  Vigia do unload. Precisa ser thread PROPRIA: se chamarmos
+//  FreeLibraryAndExitThread de dentro do swap hook, matamos a thread de render.
+// ---------------------------------------------------------------------------
+static DWORD WINAPI UnloadWatch(LPVOID) {
+    while (!g_unload.load()) Sleep(50);
+
+    Log("[bfi] descarregando...");
+    Sleep(200);            // deixa o frame atual terminar
+
+    Hooks::Shutdown();     // desabilita hooks, restaura wndproc, destroi ImGui
+    SDK::Shutdown();
+
+    Log("[bfi] tchau");
+    FreeLibraryAndExitThread(g_hModule, 0);
+    return 0;
+}
+
 static DWORD WINAPI Main(LPVOID) {
     LogInit();
 
@@ -44,6 +68,10 @@ static DWORD WINAPI Main(LPVOID) {
 
     g_phase = "resolve";
     if (!IL2CPP_API::Resolve()) { Log("[bfi] Resolve FALHOU"); return 0; }
+
+    // >>> FIX: a camada IL2CPP:: (il2cpp.cpp) nunca era inicializada.
+    g_phase = "resolve2";
+    Log("[bfi] IL2CPP::Init = %d", (int)IL2CPP::Init());
 
     g_phase = "domain";
     Il2CppDomain* dom = il2cpp_domain_get ? il2cpp_domain_get() : nullptr;
@@ -63,6 +91,8 @@ static DWORD WINAPI Main(LPVOID) {
 
     g_phase = "done";
     Log("[bfi] ===== pronto =====");
+
+    CreateThread(nullptr, 0, UnloadWatch, nullptr, 0, nullptr);
     return 0;
 }
 

@@ -1,6 +1,7 @@
 #pragma once
+#ifndef BFI_CONFIG_H
+#define BFI_CONFIG_H
 
-#include "common.h"
 #include <windows.h>
 
 struct Config {
@@ -34,9 +35,8 @@ struct Config {
     float espTextColor[4] = { 1.f, 1.f, 1.f, 1.f };
     float espSkelColor[4] = { 1.f, 1.f, 0.f, 1.f };
 
-    // ---- visual check: verde = visivel, vermelho = parede ----
     bool  espVisCheck = true;
-    bool  espVisLine = true;                 // desenha a linha do visual check
+    bool  espVisLine = true;
     float visColor[4] = { 0.f, 1.f, 0.f, 1.f };
     float noVisColor[4] = { 1.f, 0.f, 0.f, 1.f };
 
@@ -49,7 +49,7 @@ struct Config {
     int   aimBone = 0;
     int   aimMode = 0;
     bool  aimVisible = true;
-    bool  aimVisCheck = true;               // aim so em alvo visivel
+    bool  aimVisCheck = true;
     bool  aimTeam = false;
     bool  aimRotate = true;
     bool  showFovCircle = false;
@@ -85,11 +85,33 @@ struct Config {
     float crosshairColor[4] = { 0.f, 1.f, 0.f, 1.f };
     bool  watermark = true;
 
-    // >>> FIX: anti-cheat LIGADO por padrao (era false)
     bool  antiCheat = true;
     bool  blockedNoZone = false;
     bool  blockedUnlock = false;
     int   stage = 0;
+
+    // ---- UNLOCK ALL ----
+    bool  unlockAll = false;
+    bool  unlockWeapons = true;
+    bool  unlockSkins = true;
+    bool  unlockAttachments = true;
+    bool  unlockCurrency = true;
+    bool  fillLoadoutSlots = false;
+    bool  applySlots = false;
+    int   slotWeapon[3] = { -1, -1, -1 };
+    int   currencyValue = 999999;
+    float unlockInterval = 0.5f;
+    int   unlockLevel = 999;
+
+    // ---- NOMES (arma / skin / acessorio) ----
+    bool  forceNames = false;
+    char  weaponName[32] = "";
+    char  skinName[32] = "";
+    char  attachName[32] = "";
+
+    // ---- SKIN CHANGER (campos int, se existirem) ----
+    bool  skinChanger = false;
+    int   skinIndex = 0;
 
     bool  aimKeyDown = false;
     float lastHitTime = 0.f;
@@ -98,8 +120,15 @@ struct Config {
 extern Config  g_cfg;
 extern Config& C;
 
+#ifdef C
+#undef C
+#endif
+#define C(f) g_cfg.f
+
 namespace ConfigIO {
     void Init();
     void Save();
     void Load();
 }
+
+#endif // BFI_CONFIG_H

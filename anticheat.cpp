@@ -1,22 +1,15 @@
 // ============================================================================
 //  anticheat.cpp — bypass em camadas
 //
-//  >>> FIX desta versao (C3861 / C2027):
-//   1) il2cpp_field_get_flags e il2cpp_field_static_set_value NAO estao no
-//      il2cpp_api.h do projeto -> resolvidas direto do export da
-//      GameAssembly.dll, com nomes locais (g_fieldGetFlags / g_fieldStaticSet)
-//      pra nao colidir com um extern do header.
-//   2) Il2CppClass e tipo INCOMPLETO -> nao da pra usar c->name. Trocado pelo
-//      getter il2cpp_class_get_name (tambem resolvido local: g_classGetName).
-//
-//  Camadas do bypass:
-//   1) Descobre a classe do anti-cheat e o objeto vivo (estatico -> get_Instance
-//      -> varredura dos campos do g_localPlayer).
-//   2) Forca todo getter "flag" (bool, 0 params) a retornar FALSE.
-//   3) Zera flags bool e contadores int, antes E depois do Update do AC.
-//   4) Reancora campos "ultima posicao" na posicao atual.
-//   5) Limpa tambem os statics da classe.
+//  >>> ESTE ARQUIVO DEVE CONTER "namespace AntiCheat" e NADA de weapons.
+//      Se estiver com o conteudo de weapons.cpp, o linker acusa
+//      LNK2005 Weapons::Tick e LNK2019 AntiCheat::Install/Tick.
 // ============================================================================
+
+// trava anti-duplicacao
+#ifdef BFI_ANTICHEAT_CPP
+#endif
+
 #include "features.h"
 #include "sdk.h"
 #include "hooks.h"
@@ -36,8 +29,12 @@
 void Log(const char* fmt, ...);
 
 // ---------------------------------------------------------------------------
+//  MARCADOR DE BUILD — combat.cpp referencia os dois marcadores.
+// ---------------------------------------------------------------------------
+extern "C" int bfi_anticheat_obj = 0xACE;
+
+// ---------------------------------------------------------------------------
 //  API extra do il2cpp (nao declarada no il2cpp_api.h do projeto).
-//  Nomes locais distintos -> zero risco de conflito de simbolo.
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -220,10 +217,11 @@ namespace AntiCheat {
     }
 
     // ---------------------------------------------------------------- getters
-#define AC_SLOT(N)                                                        \
+    // Assinatura nativa de metodo de instancia em IL2CPP: (this, MethodInfo*).
+#define AC_SLOT(N)                                                            \
         static void* o_acm##N = nullptr;                                      \
-        static bool __fastcall hk_acm##N(void* self) {                        \
-            if (o_acm##N) ((bool(__fastcall*)(void*))o_acm##N)(self);         \
+        static bool __fastcall hk_acm##N(void* self, void* method) {           \
+            if (o_acm##N) ((bool(__fastcall*)(void*, void*))o_acm##N)(self, method); \
             return false;                                                     \
         }
     AC_SLOT(0)  AC_SLOT(1)  AC_SLOT(2)  AC_SLOT(3)
@@ -274,7 +272,6 @@ namespace AntiCheat {
 
                 if (MH_CreateHook(p, g_slotFn[slot], g_slotTramp[slot]) == MH_OK) {
                     MH_EnableHook(p);
-                    // >>> FIX: Il2CppClass e incompleto -> usa o getter
                     Log("[ac] getter neutralizado: %s::%s (%p)", ClassName(c), mn, p);
                     ++slot; ++n;
                 }
@@ -430,7 +427,7 @@ namespace AntiCheat {
 
     // ---------------------------------------------------------------- install
     bool Install() {
-        ResolveAcApi();          // >>> FIX: antes de qualquer uso
+        ResolveAcApi();
 
         static const char* names[] = { "AntiHack", "AntiCheat", "AntiCheatSystem",
                                        "CheatDetector", "HackDetector", "ACSystem",
@@ -464,3 +461,4 @@ namespace AntiCheat {
     }
 
 } // namespace AntiCheat
+// ==== FIM anticheat.cpp ====

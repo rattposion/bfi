@@ -1,7 +1,8 @@
 // ============================================================================
 //  esp.cpp — desenho do ESP (thread de render, sem chamada il2cpp)
-//  + visual check: verde = visivel, vermelho = parede
+//  + visual check: verde = visivel, vermelho = parede (SDK::HasLineOfSight)
 //  + linha do centro da mira ate o inimigo (toggle C.espVisLine)
+//  + snapline da base da tela ate os pes (toggle C.espSnapline)
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -28,17 +29,23 @@ namespace ESP {
 
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
 
+        // tamanho REAL do display do ImGui (nao depende do SDK)
+        ImVec2 disp = ImGui::GetIO().DisplaySize;
+        float scrW = disp.x > 1.f ? disp.x : (float)SDK::ScreenW();
+        float scrH = disp.y > 1.f ? disp.y : (float)SDK::ScreenH();
+
         ImU32 colBox = Col(C.espBoxColor);
         ImU32 colText = Col(C.espTextColor);
         ImU32 colSkel = Col(C.espSkelColor);
         ImU32 colVis = Col(C.visColor);
         ImU32 colNoVis = Col(C.noVisColor);
         float th = C.espThickness;
+        if (th < 1.f) th = 1.f;
 
-        int drawn = 0;
-        float cx = (float)SDK::ScreenW() * 0.5f;      // centro da mira
-        float cyMid = (float)SDK::ScreenH() * 0.5f;   // centro vertical (mira)
-        float cyBot = (float)SDK::ScreenH();          // base da tela (snapline)
+        int drawn = 0, visCount = 0, snapCount = 0;
+        float cx = scrW * 0.5f;      // centro horizontal
+        float cyMid = scrH * 0.5f;   // centro da mira
+        float cyBot = scrH;          // base da tela (snapline)
 
         SDK::LockTargets();
         int n = SDK::g_targetCount;
@@ -50,7 +57,6 @@ namespace ESP {
             if (t.player == SDK::g_localPlayer) continue;
             if (!t.alive) continue;
             if (C.espNpc && t.npc) continue;
-            // >>> FIX: sem o guard "!= 0" (time 0 tambem filtra) e unificado com o aim
             if ((C.teamCheck || C.aimTeam) && t.team == SDK::g_localTeam) continue;
             if (!t.onScreen) continue;
             if (C.espMaxDist > 1.f && t.dist > C.espMaxDist) continue;
@@ -65,17 +71,26 @@ namespace ESP {
             float x1 = t.scrHead.x + w * 0.5f;
             float y1 = top + h;
 
-            // ---- visual check: marcador verde/vermelho ----
+            const bool vis = t.visible;
+            if (vis) ++visCount;
+            ImU32 colState = vis ? colVis : colNoVis;
+
+            // ---- visual check: marcador + linha da mira ----
             if (C.espVisCheck) {
-                ImU32 vc = t.visible ? colVis : colNoVis;
-                if (C.espVisLine)   // <<< linha do centro ate o inimigo (opcional)
-                    dl->AddLine(ImVec2(cx, cyMid), ImVec2(t.scrHead.x, t.scrHead.y), vc, th);
-                dl->AddCircleFilled(ImVec2(t.scrHead.x, t.scrHead.y), 3.f, vc);
+                dl->AddCircleFilled(ImVec2(t.scrHead.x, t.scrHead.y), 3.f, colState, 12);
+                if (C.espVisLine)
+                    dl->AddLine(ImVec2(cx, cyMid), ImVec2(t.scrHead.x, t.scrHead.y), colState, th);
             }
 
-            // ---- caixa: verde/vermelho quando visCheck, senao cor normal ----
-            ImU32 boxCol = colBox;
-            if (C.espVisCheck) boxCol = t.visible ? colVis : colNoVis;
+            // ---- snapline: SEMPRE da base da tela ate os pes ----
+            //     (independente de espBox / espFill / visCheck)
+            if (C.espSnapline) {
+                dl->AddLine(ImVec2(cx, cyBot), ImVec2(t.scrFeet.x, t.scrFeet.y),
+                    C.espVisCheck ? colState : colBox, th);
+                ++snapCount;
+            }
+
+            ImU32 boxCol = C.espVisCheck ? colState : colBox;
 
             if (C.espFill)
                 dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), Col(C.espBoxColor, 0.20f));
@@ -83,16 +98,14 @@ namespace ESP {
             if (C.espBox)
                 dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), boxCol, 0.f, 0, th);
 
-            // ---- alvo atual da mira: marcador extra ----
-            if (t.player == SDK::g_aimTarget) {
-                ImU32 ac = t.visible ? colVis : colNoVis;
-                dl->AddRect(ImVec2(x0 - 2.f, y0 - 2.f), ImVec2(x1 + 2.f, y1 + 2.f), ac, 0.f, 0, th + 1.f);
-            }
+            // alvo atual da mira: marcador extra
+            if (t.player == SDK::g_aimTarget)
+                dl->AddRect(ImVec2(x0 - 2.f, y0 - 2.f), ImVec2(x1 + 2.f, y1 + 2.f),
+                    colState, 0.f, 0, th + 1.f);
 
             if (C.espHealth) {
                 float hp = t.health * 0.01f;
-                if (!(hp >= 0.f && hp <= 1.f)) hp = 1.f;     // lixo -> cheia
-                if (hp > 1.f) hp = 1.f;
+                if (!(hp >= 0.f && hp <= 1.f)) hp = 1.f;
 
                 float bw = 4.f;
                 float bx = x0 - bw - 2.f;
@@ -132,15 +145,21 @@ namespace ESP {
                 dl->AddText(ImVec2(t.scrHead.x - 16.f, y1 + C.espFontSize + 2.f), colText, buf);
             }
 
-            // ---- snapline "Linha" (base da tela ate os pes) ----
-            if (C.espSnapline)
-                dl->AddLine(ImVec2(cx, cyBot), ImVec2(t.scrFeet.x, t.scrFeet.y), boxCol, th);
-
             drawn++;
         }
 
         SDK::UnlockTargets();
         SDK::dbg_drawn = drawn;
+
+        // ---- diagnostico 1x por segundo (tira no BFInternal.log) ----
+        static ULONGLONG lastLog = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastLog >= 1000) {
+            lastLog = now;
+            Log("[esp] alvos=%d desenhados=%d visiveis=%d snap=%d/%d visCheck=%d los=%s",
+                SDK::g_targetCount, drawn, visCount, snapCount, C.espSnapline ? 1 : 0,
+                C.espVisCheck ? 1 : 0, SDK::LosReady() ? "OK" : "OFF");
+        }
     }
 
 } // namespace ESP

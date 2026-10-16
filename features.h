@@ -1,63 +1,68 @@
 #pragma once
 
-// ============================================================================
-//  features.h — contrato de todos os modulos do cheat.
-// ============================================================================
+#include <atomic>
+#include <cstdint>
 #include "common.h"
-#include "il2cpp.h"
-#include "il2cpp_api.h"
 #include "memory.h"
 #include "sdk.h"
 #include "config.h"
 
-#include <atomic>
-#include <cstring>
-#include <windows.h>
+// ---- leitura / escrita crua ----
+template<typename T> inline T    ReadAt(void* addr) { return addr ? *(T*)addr : (T)0; }
+template<typename T> inline T    ReadAt(uintptr_t addr) { return *(T*)addr; }
+template<typename T> inline T    ReadAt(void* base, uint32_t off) { return base ? *(T*)((uint8_t*)base + off) : (T)0; }
+template<typename T> inline T    ReadAt(uintptr_t base, uint32_t off) { return *(T*)(base + off); }
 
-extern Config g_cfg;
+template<typename T> inline void WriteAt(void* addr, T v) { if (addr) *(T*)addr = v; }
+template<typename T> inline void WriteAt(uintptr_t addr, T v) { *(T*)addr = v; }
+template<typename T> inline void WriteAt(void* base, uint32_t off, T v) { if (base) *(T*)((uint8_t*)base + off) = v; }
+template<typename T> inline void WriteAt(uintptr_t base, uint32_t off, T v) { *(T*)(base + off) = v; }
+
+// ---- estado global compartilhado ----
+extern const char* g_phase;              // setado pelo PHASE()
 extern std::atomic<bool> g_unload;
 
-void Log(const char* fmt, ...);
-
-// ---------------------------------------------------------------------------
-//  modulos
-// ---------------------------------------------------------------------------
-namespace Combat { void Tick(); }
-
-namespace Aimbot {
-    void Tick(); Il2CppObject* Best();
-    void Bone(Il2CppObject* p, Il2CppObject* target);
-    bool Install();
+namespace Hooks {
+    extern std::atomic<bool> g_imguiReady;
+    extern std::atomic<bool> g_hooksLive;
+    extern std::atomic<bool> g_sdkReady;
+    extern int g_viewW;
+    extern int g_viewH;
+    bool Init();
+    void Shutdown();
+    void ApplyFeatures();
+    void HandleKeys();
+    bool InstallSwap();
+    bool InstallMainThread();
+    bool InstallCursor();
+    bool InstallCombat();
 }
 
-namespace Triggerbot { void Tick(); bool Install(); }
-namespace Weapons { void Tick(); }
+namespace SDK { bool Init(); }
+namespace Menu { extern bool g_open; void Draw(); void Render(); }
+namespace ESP { void Draw(); }
+namespace Misc { void Panic(); void Draw(); void Tick(); }
+namespace Combat { void Tick(); }
+namespace Weapons { void Init(); void Tick(); }
 namespace Movement { void Tick(); }
 
-namespace Misc { void Tick(); void Draw(); void Panic(); }
-namespace ESP { void Draw(); }
+namespace Aimbot {
+    struct Quat { float x, y, z, w; };
+    Il2CppObject* Best();
+    bool  Install();
+    void  Tick();
+    Vec3  Sub(Vec3, Vec3);
+    float Dot(Vec3, Vec3);
+    Vec3  Norm(Vec3);
+    Quat  LookRot(Vec3);
+    Quat  Slerp(Quat, Quat, float);
+    Vec3  AimPoint(void*);
+    Vec3  LocalPos();
+    Vec3  CamForward();
+    namespace Silent { bool Override(Vec3 origin, Vec3& dir); }
+}
+
+namespace Recoil { void Install(); void Tick(); }
+namespace Unlock { bool Install(); void Tick(); void Dump(); }
+namespace Triggerbot { bool Install(); void Tick(); }
 namespace AntiCheat { bool Install(); void Tick(); }
-
-// Menu::Draw  -> menu.cpp
-// Menu::Render/ApplyStyle -> features.cpp
-namespace Menu { void Render(); void Draw(); void ApplyStyle(); }
-
-namespace ConfigIO { void Init(); void Save(); void Load(); }
-
-bool Menu_WantsMouse();
-
-// ---------------------------------------------------------------------------
-//  leitura/escrita tipada.
-// ---------------------------------------------------------------------------
-template <typename T>
-inline T ReadAt(uintptr_t addr, T def = T{}) {
-    T v = def;
-    __try { memcpy(&v, (const void*)addr, sizeof(T)); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { v = def; }
-    return v;
-}
-
-template <typename T>
-inline void WriteAt(uintptr_t addr, const T& v) {
-    SafeWrite(addr, (const void*)&v, sizeof(T));
-}

@@ -56,6 +56,7 @@ struct Target {
     float  hp = 100.f;
     float  dist = 0.f;
 
+    uint32_t slot = 0;      // slot estavel (nao muda enquanto o player existir)
     uint64_t lastSeen = 0;
 
     char   name[40]{};
@@ -122,6 +123,10 @@ namespace SDK {
     int           ScreenH();
     Il2CppObject* CameraObj();
 
+    // >>> FIX: raio do FOV em pixels derivado da camera REAL. Antes existiam duas
+    //     formulas divergentes (aimbot.cpp e visuals.cpp) e o circulo mentia.
+    float FovRadiusPx(float deg);
+
     bool Init();
     void Shutdown();
     void BuildCache();
@@ -181,11 +186,21 @@ namespace SDK {
     const char* MethodReturnName(MethodInfo* m);
 
     bool  HasLineOfSight(Vec3 eye, Vec3 aim);
+    bool  HasLineOfSightEx(Vec3 eye, Vec3 aim,
+        Il2CppObject* localTf, Il2CppObject* targetTf);
+    bool  LosReady();
+    const char* LosBackend();      // "off"/"Raycast4"/... para o menu
     bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);
     bool  RaycastTest(Vec3 from, Vec3 to, float& outHitDist);
     float CameraCotHalfFovY();
 
+    Il2CppClass* AntiHackClass();
+    Il2CppClass* FindAntiHackClass();
+    Il2CppObject* AntiHackInstance();
+    void  ListClassesContaining(const char* sub);
+
     Il2CppObject* FindGunStatsObj();
+    Il2CppObject* GetGunStatsLive();     // nunca devolve o clone em branco
 
     int  ResolveWeaponFields(Il2CppObject* stats, uint32_t& cur, uint32_t& max,
         uint32_t& reserve, uint32_t& reload, uint32_t& spread,
@@ -208,9 +223,13 @@ using SDK::GetTransform;
 using SDK::SafeReadObjPub;
 using SDK::VisibleLine;
 using SDK::HasLineOfSight;
+using SDK::HasLineOfSightEx;
+using SDK::LosReady;
+using SDK::LosBackend;
 using SDK::TargetVisible;
 using SDK::RaycastTest;
 using SDK::CameraCotHalfFovY;
+using SDK::FovRadiusPx;
 using SDK::LockTargets;
 using SDK::UnlockTargets;
 using SDK::FindBoneContains;
@@ -224,6 +243,7 @@ using SDK::GetName;
 using SDK::GetNameBuf;
 using SDK::GetVelocity;
 using SDK::GetGunStats;
+using SDK::GetGunStatsLive;
 using SDK::GetWeapon;
 using SDK::FindGunStatsObj;
 using SDK::ResolveWeaponFields;
@@ -241,3 +261,7 @@ using SDK::FireBulletReady;
 using SDK::FireBulletAt;
 using SDK::MuzzlePos;
 using SDK::MethodReturnName;
+using SDK::AntiHackClass;
+using SDK::FindAntiHackClass;
+using SDK::AntiHackInstance;
+using SDK::ListClassesContaining;

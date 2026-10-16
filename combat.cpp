@@ -6,6 +6,9 @@
 #include "hooks.h"
 #include "common.h"
 
+extern "C" int bfi_anticheat_obj;
+extern "C" int bfi_weapons_obj;
+
 namespace Combat {
 
     static uint64_t g_lastDbg = 0;
@@ -13,6 +16,9 @@ namespace Combat {
     void Tick() {
         PHASE("Combat::Tick");
         if (g_unload.load()) return;
+
+        // >>> ANTES do check de viewProj: o unlock precisa rodar tambem no lobby
+        PHASE("Combat::Unlock");         Unlock::Tick();
 
         PHASE("Combat::UpdateView");     SDK::UpdateView();
         if (!SDK::g_viewProjOk) return;
@@ -44,8 +50,9 @@ namespace Combat {
             }
             SDK::UnlockTargets();
 
-            Log("dbg: alvos=%d localTeam=%d teams=[%s] fase=%s",
-                SDK::g_targetCount, SDK::g_localTeam, tb, g_phase ? g_phase : "?");
+            Log("dbg: alvos=%d localTeam=%d teams=[%s] fase=%s obj=[ac=%d wp=%d]",
+                SDK::g_targetCount, SDK::g_localTeam, tb, g_phase ? g_phase : "?",
+                bfi_anticheat_obj, bfi_weapons_obj);
         }
     }
 

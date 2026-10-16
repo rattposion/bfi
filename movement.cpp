@@ -1,5 +1,6 @@
 // ============================================================================
-//  movement.cpp — speedhack, fly, super jump, teleport (baseado em tempo)
+//  movement.cpp — speedhack, fly, super jump, teleport
+//  >>> FIX: usa SDK::g_aimTarget em vez de chamar Aimbot::Best() de novo.
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -58,7 +59,7 @@ namespace Movement {
         }
 
         if (C.teleport && (GetAsyncKeyState('T') & 0x8000)) {
-            Il2CppObject* t = Aimbot::Best();
+            Il2CppObject* t = SDK::g_aimTarget;   // >>> FIX
             if (t) {
                 Il2CppObject* tt = SDK::GetTransform(t);
                 if (tt) InvokeSetPosition(tf, SDK::GetPos(tt));
