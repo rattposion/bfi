@@ -1,6 +1,9 @@
 // ============================================================================
 //  movement.cpp — speedhack, fly, super jump, teleport
 //  >>> FIX: usa SDK::g_aimTarget em vez de chamar Aimbot::Best() de novo.
+//  >>> FIX C4244: ReadAt<T>(base, off) tem 2 params -> o "1.f" era lido como
+//      OFFSET (uint32_t) e nao como valor padrao. A leitura ia pra +1 byte.
+//      Agora usa o overload de 1 argumento.
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -33,7 +36,7 @@ namespace Movement {
 
         if (SDK::O_speed && C.speedHack) {
             if (g_baseSpeed == 0.f)
-                g_baseSpeed = ReadAt<float>((uintptr_t)SDK::g_localPlayer + SDK::O_speed, 1.f);
+                g_baseSpeed = ReadAt<float>((uintptr_t)SDK::g_localPlayer + SDK::O_speed);
             if (g_baseSpeed > 0.f)
                 WriteAt<float>((uintptr_t)SDK::g_localPlayer + SDK::O_speed, g_baseSpeed * C.speedValue);
         }
@@ -59,7 +62,7 @@ namespace Movement {
         }
 
         if (C.teleport && (GetAsyncKeyState('T') & 0x8000)) {
-            Il2CppObject* t = SDK::g_aimTarget;   // >>> FIX
+            Il2CppObject* t = SDK::g_aimTarget;
             if (t) {
                 Il2CppObject* tt = SDK::GetTransform(t);
                 if (tt) InvokeSetPosition(tf, SDK::GetPos(tt));

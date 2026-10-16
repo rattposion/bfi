@@ -1,16 +1,12 @@
 // ============================================================================
-//  weapons.cpp — stats + ANTI-RECOIL por zeragem dos campos de origem
+//  weapons.cpp — stats + ANTI-RECOIL por neutralizacao dos campos de origem
 //
-//  >>> ESTE ARQUIVO DEVE CONTER "namespace Weapons" e apenas UMA vez.
-//      Se ele estiver com o conteudo de anticheat.cpp, o linker acusa
-//      LNK2019 AntiCheat::Install/Tick.
+//  >>> O arquivo inteiro esta dentro de #ifndef BFI_WEAPONS_CPP. Se ele for
+//      colado duas vezes no mesmo arquivo, a 2a copia e PULADA em silencio
+//      (antes era um #error que so reclamava). Tambem protege contra
+//      #include duplicado.
 // ============================================================================
-
-// trava anti-duplicacao: se o arquivo for colado duas vezes no mesmo .cpp,
-// dispara um erro claro em vez de C2084/C2086.
-#ifdef BFI_WEAPONS_CPP
-#error "weapons.cpp esta com o conteudo DUPLICADO (colado duas vezes)"
-#endif
+#ifndef BFI_WEAPONS_CPP
 #define BFI_WEAPONS_CPP
 
 #include "features.h"
@@ -23,11 +19,8 @@
 #include <cstring>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-//  MARCADOR DE BUILD — combat.cpp referencia os dois marcadores. Se o
-//  conteudo dos arquivos estiver trocado, o linker acusa estes nomes.
-// ---------------------------------------------------------------------------
-extern "C" int bfi_weapons_obj = 0xBF;
+// marcador de build. selectany = merge entre TUs (evita LNK2005 se incluido).
+extern "C" __declspec(selectany) int bfi_weapons_obj = 0xBF;
 
 namespace Weapons {
 
@@ -38,7 +31,11 @@ namespace Weapons {
     static bool g_ammoDumped = false;
 
     // ------------------------- anti-recoil -------------------------
-    struct RecField { uint32_t off; int kind; char name[48]; };
+    //  MODO_ZERO   = campo de KICK aditivo       -> zera (0.0)
+    //  MODO_NEUTRO = campo MULTIPLICADOR/escala  -> volta ao neutro (1.0)
+    enum { MODO_ZERO = 0, MODO_NEUTRO = 1 };
+
+    struct RecField { uint32_t off; int kind; int modo; char name[48]; };
 
     static std::vector<RecField> g_gunRec, g_viewRec, g_plRec;
     static bool g_gunRecDone = false, g_viewRecDone = false, g_plRecDone = false;
@@ -65,6 +62,17 @@ namespace Weapons {
         if (strstr(l, "speed") || strstr(l, "recovery") || strstr(l, "lerp") ||
             strstr(l, "smooth") || strstr(l, "time") || strstr(l, "rate")) return false;
         return true;
+    }
+
+    // campo tipo "recoilStability" e MULTIPLICADOR (normalmente 1.0-1.5).
+    // Zerar ele deixava a estabilidade em 0 -> agora vai pro neutro.
+    static int ModeForName(const char* n) {
+        char l[64];
+        Lower(l, sizeof(l), n);
+        if (strstr(l, "stability") || strstr(l, "scale") || strstr(l, "factor") ||
+            strstr(l, "mult") || strstr(l, "modifier") || strstr(l, "strength") ||
+            strstr(l, "damp") || strstr(l, "resist")) return MODO_NEUTRO;
+        return MODO_ZERO;
     }
 
     static void CollectRec(Il2CppClass* k, std::vector<RecField>& out,
@@ -101,11 +109,13 @@ namespace Weapons {
                     RecField rf{};
                     rf.off = off;
                     rf.kind = kind;
+                    rf.modo = ModeForName(n);
                     strncpy_s(rf.name, n, _TRUNCATE);
                     out.push_back(rf);
 
-                    Log("[recoil] %s: %s @0x%X (%s)", tag, n, off,
-                        kind == 0 ? "float" : (kind == 1 ? "vec2" : "vec3"));
+                    Log("[recoil] %s: %s @0x%X (%s, modo=%s)", tag, n, off,
+                        kind == 0 ? "float" : (kind == 1 ? "vec2" : "vec3"),
+                        rf.modo == MODO_NEUTRO ? "NEUTRO/1.0" : "ZERO/0.0");
                 }
             }
         }
@@ -135,20 +145,20 @@ namespace Weapons {
         }
     }
 
-    static void ZeroAll(Il2CppObject* o, const std::vector<RecField>& v) {
+    static void NeutralizeAll(Il2CppObject* o, const std::vector<RecField>& v) {
         if (!o) return;
         for (size_t i = 0; i < v.size(); ++i) {
             uintptr_t a = (uintptr_t)o + v[i].off;
+            float val = (v[i].modo == MODO_NEUTRO) ? 1.f : 0.f;
             if (v[i].kind == 0) {
-                float z = 0.f;
-                SafeWrite(a, (const void*)&z, sizeof(z));
+                SafeWrite(a, (const void*)&val, sizeof(float));
             }
             else if (v[i].kind == 1) {
-                float z[2] = { 0.f, 0.f };
+                float z[2] = { val, val };
                 SafeWrite(a, (const void*)z, sizeof(z));
             }
             else {
-                float z[3] = { 0.f, 0.f, 0.f };
+                float z[3] = { val, val, val };
                 SafeWrite(a, (const void*)z, sizeof(z));
             }
         }
@@ -191,10 +201,9 @@ namespace Weapons {
     static void DumpGunArray(const char* tag, void* arr) {
         if (!arr) return;
         __try {
-            // 0x18 = max_length. 0x10 e o ponteiro 'bounds'.
             int len = 0;
             if (il2cpp_array_length) len = (int)il2cpp_array_length((const Il2CppArray*)arr);
-            if (len <= 0) len = *(int*)((uintptr_t)arr + 0x18);
+            if (len <= 0) len = *(int*)((uintptr_t)arr + 0x18);   // 0x18 = max_length
 
             Log("[guns] %s: len=%d", tag, len);
             if (len < 0 || len > 64) len = 64;
@@ -203,13 +212,11 @@ namespace Weapons {
                 if (!e) { Log("[guns]   [%d] null", i); continue; }
                 Il2CppClass* k = il2cpp_object_get_class((Il2CppObject*)e);
                 const char* kn = k ? il2cpp_class_get_name(k) : "?";
-                Log("[guns]   [%d] %s @%p | RPM=%.1f magSize=%d ammo=%d climb=%.3f backKick=%.3f gunObj=%p",
+                Log("[guns]   [%d] %s @%p | RPM=%.1f magSize=%d ammo=%d gunObj=%p",
                     i, kn, e,
                     SafeRead<float>((uintptr_t)e + 0x48, -1.f),
                     SafeRead<int>((uintptr_t)e + 0xFC, -1),
                     SafeRead<int>((uintptr_t)e + 0x90, -1),
-                    SafeRead<float>((uintptr_t)e + 0x10C, -1.f),
-                    SafeRead<float>((uintptr_t)e + 0x1C8, -1.f),
                     SDK::SafeReadObjPub(e, 0x148));
             }
         }
@@ -252,12 +259,11 @@ namespace Weapons {
                     const char* ocn = ok ? il2cpp_class_get_name(ok) : "?";
 
                     if (ocn && (strstr(ocn, "gunStats") || strstr(ocn, "GunStats"))) {
-                        Log("[guns]   %-26s : %s @0x%X -> %s @%p | RPM=%.1f magSize=%d ammo=%d climb=%.3f gunObj=%p",
+                        Log("[guns]   %-26s : %s @0x%X -> %s @%p | RPM=%.1f magSize=%d ammo=%d gunObj=%p",
                             fn, tn, off, ocn, p,
                             SafeRead<float>((uintptr_t)p + 0x48, -1.f),
                             SafeRead<int>((uintptr_t)p + 0xFC, -1),
                             SafeRead<int>((uintptr_t)p + 0x90, -1),
-                            SafeRead<float>((uintptr_t)p + 0x10C, -1.f),
                             SDK::SafeReadObjPub(p, 0x148));
                         if (strstr(tn, "[]")) DumpGunArray(fn, p);
                     }
@@ -269,7 +275,6 @@ namespace Weapons {
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { Log("[guns] excecao na varredura"); }
 
-        // a viewmodel deve referenciar as stats vivas
         if (SDK::O_gunView) {
             Il2CppObject* view = SDK::SafeReadObjPub(lp, SDK::O_gunView);
             if (view) {
@@ -333,7 +338,7 @@ namespace Weapons {
             }
 
             if (C.noRecoil) {
-                ZeroAll(stats, g_gunRec);
+                NeutralizeAll(stats, g_gunRec);
 
                 ULONGLONG now = GetTickCount64();
                 if (g_recLogs < 8 && now - g_lastRecLog > 2000) {
@@ -350,7 +355,7 @@ namespace Weapons {
                     "player", g_plRecDone);
                 LogRecValues(SDK::g_localPlayer, g_plRec, "player");
             }
-            ZeroAll(SDK::g_localPlayer, g_plRec);
+            NeutralizeAll(SDK::g_localPlayer, g_plRec);
 
             if (SDK::O_gunView) {
                 Il2CppObject* view = SDK::SafeReadObjPub(SDK::g_localPlayer, SDK::O_gunView);
@@ -360,11 +365,12 @@ namespace Weapons {
                             "gunview", g_viewRecDone);
                         LogRecValues(view, g_viewRec, "gunview");
                     }
-                    ZeroAll(view, g_viewRec);
+                    NeutralizeAll(view, g_viewRec);
                 }
             }
         }
     }
 
 } // namespace Weapons
-// ==== FIM weapons.cpp ====
+
+#endif // BFI_WEAPONS_CPP

@@ -1,5 +1,15 @@
 // ============================================================
 //  menu.cpp - bfi / Bullet Force (ImGui)
+//
+//  >>> FIX (LNK2005):
+//   - Menu::Render() NAO e definido aqui. Ele vive em features.cpp
+//     (o hooks.cpp chama Render -> features.cpp -> ApplyStyle -> Draw).
+//     Definir nos dois dava: LNK2005 ?Render@Menu@@YAXXZ ja definida em
+//     features.obj + LNK1169.
+//   - O estilo bonito continua: Draw() chama ApplyStyleOnce() no inicio,
+//     uma unica vez (flag g_styled).
+//   - TabUnlock com combos de ARMA, ANEXOS (3 slots), SKIN e PERSONAGEM.
+//   - Guardas: lista vazia nao estoura o combo.
 // ============================================================
 #include "common.h"
 #include "config.h"
@@ -11,6 +21,9 @@
 #include <imgui.h>
 
 namespace Menu {
+
+    bool g_open = true;
+    static bool g_styled = false;
 
     // ---------- keybind ----------
     static const char* VkName(int vk)
@@ -68,11 +81,47 @@ namespace Menu {
     static void TabUnlock();
     static void TabMisc();
 
+    static void ApplyStyleOnce()
+    {
+        if (g_styled) return;
+        g_styled = true;
+
+        ImGuiStyle& s = ImGui::GetStyle();
+        s.WindowRounding = 6.f;
+        s.FrameRounding = 4.f;
+        s.GrabRounding = 4.f;
+        s.ScrollbarRounding = 4.f;
+        s.WindowBorderSize = 1.f;
+        s.FrameBorderSize = 0.f;
+        s.ItemSpacing = ImVec2(8, 6);
+        s.WindowPadding = ImVec2(10, 10);
+
+        ImVec4* c = s.Colors;
+        c[ImGuiCol_WindowBg] = ImVec4(0.07f, 0.07f, 0.09f, 0.94f);
+        c[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.10f, 0.13f, 1.f);
+        c[ImGuiCol_TitleBgActive] = ImVec4(0.13f, 0.13f, 0.17f, 1.f);
+        c[ImGuiCol_Button] = ImVec4(0.17f, 0.17f, 0.22f, 1.f);
+        c[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.24f, 0.31f, 1.f);
+        c[ImGuiCol_ButtonActive] = ImVec4(0.30f, 0.30f, 0.38f, 1.f);
+        c[ImGuiCol_Header] = ImVec4(0.17f, 0.17f, 0.22f, 1.f);
+        c[ImGuiCol_HeaderHovered] = ImVec4(0.24f, 0.24f, 0.31f, 1.f);
+        c[ImGuiCol_HeaderActive] = ImVec4(0.30f, 0.30f, 0.38f, 1.f);
+        c[ImGuiCol_CheckMark] = ImVec4(0.35f, 0.80f, 0.45f, 1.f);
+        c[ImGuiCol_SliderGrab] = ImVec4(0.35f, 0.80f, 0.45f, 1.f);
+        c[ImGuiCol_SliderGrabActive] = ImVec4(0.45f, 0.90f, 0.55f, 1.f);
+        c[ImGuiCol_Tab] = ImVec4(0.12f, 0.12f, 0.15f, 1.f);
+        c[ImGuiCol_TabHovered] = ImVec4(0.24f, 0.24f, 0.31f, 1.f);
+        c[ImGuiCol_TabActive] = ImVec4(0.20f, 0.20f, 0.26f, 1.f);
+        c[ImGuiCol_Separator] = ImVec4(0.24f, 0.24f, 0.30f, 1.f);
+    }
+
+    // >>> NAO existe Menu::Render() aqui. Ele esta em features.cpp.
     void Draw()
     {
+        ApplyStyleOnce();          // uma vez, no primeiro frame
         if (!C.menuOpen) return;
 
-        ImGui::SetNextWindowSize(ImVec2(580, 520), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(600, 560), ImGuiCond_FirstUseEver);
         if (!ImGui::Begin("bfi##main", &C.menuOpen))
         {
             ImGui::End();
@@ -104,9 +153,16 @@ namespace Menu {
     static void TabAimbot()
     {
         ImGui::Checkbox("Aimbot", &C.aimbot);
-        ImGui::Checkbox("So visivel", &C.aimVisible);
-        ImGui::Checkbox("Checar visao (LOS)", &C.aimVisCheck);
+        ImGui::SameLine();
         ImGui::Checkbox("Ignorar time", &C.aimTeam);
+
+        // MARCADO    = so mira em quem esta visivel (ninguem visivel -> nao gira)
+        // DESMARCADO = mira atraves da parede
+        ImGui::Checkbox("Checar visao (LOS) - so visivel", &C.aimVisCheck);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Marcado: so mira em alvo visivel.\n"
+                "Desmarcado: mira atraves da parede.");
+
         ImGui::Checkbox("Rotacionar camera", &C.aimRotate);
         ImGui::Checkbox("Circulo de FOV", &C.showFovCircle);
 
@@ -200,39 +256,112 @@ namespace Menu {
     }
 
     // ------------------------------------------------------------
+    static bool ComboIdx(const char* label, int* sel, int count, const char* const* list,
+        const char* vazio)
+    {
+        const char* cur = (*sel >= 0 && *sel < count && list) ? list[*sel] : vazio;
+        bool mudou = false;
+        if (ImGui::BeginCombo(label, cur)) {
+            for (int i = 0; i < count; i++)
+                if (ImGui::Selectable(list[i], *sel == i)) { *sel = i; mudou = true; }
+            ImGui::EndCombo();
+        }
+        return mudou;
+    }
+
+    // ------------------------------------------------------------
     static void TabUnlock()
     {
         ImGui::Checkbox("Unlock All", &C.unlockAll);
-        ImGui::Checkbox("Armas", &C.unlockWeapons);
-        ImGui::Checkbox("Skins", &C.unlockSkins);
+        ImGui::SameLine(); ImGui::Checkbox("Armas", &C.unlockWeapons);
+        ImGui::SameLine(); ImGui::Checkbox("Skins", &C.unlockSkins);
         ImGui::Checkbox("Acessorios", &C.unlockAttachments);
-        ImGui::Checkbox("Dinheiro", &C.unlockCurrency);
+        ImGui::SameLine(); ImGui::Checkbox("Personagens", &C.unlockChars);
+        ImGui::SameLine(); ImGui::Checkbox("Dinheiro", &C.unlockCurrency);
 
-        ImGui::SliderInt("Nivel", &C.unlockLevel, 0, 999);
+        ImGui::SliderInt("Nivel", &C.unlockLevel, 0, 9999);
         ImGui::InputInt("Dinheiro (valor)", &C.currencyValue);
         ImGui::SliderFloat("Intervalo", &C.unlockInterval, 0.05f, 2.0f, "%.2f");
 
         ImGui::Separator();
-        ImGui::Checkbox("Preencher slots", &C.fillLoadoutSlots);
-        ImGui::Checkbox("Aplicar slots", &C.applySlots);
-        ImGui::SliderInt("Slot 1", &C.slotWeapon[0], -1, 64);
-        ImGui::SliderInt("Slot 2", &C.slotWeapon[1], -1, 64);
-        ImGui::SliderInt("Slot 3", &C.slotWeapon[2], -1, 64);
+        if (ImGui::Button("DUMP COMPLETO (armas/skins/chars/anexos)")) Unlock::Dump();
+        ImGui::SameLine();
+        ImGui::Checkbox("Aplicar selecao", &C.applySelection);
 
-        if (ImGui::Button("Dump / Aplicar agora")) Unlock::Dump();
+        // ---------------- LOADOUT ----------------
+        if (ImGui::CollapsingHeader("Loadout", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::SliderInt("Slot do loadout", &C.loadoutSlot, 0, 2);
+
+            int wn = Unlock::WeaponCount();
+            const char* const* wl = Unlock::WeaponList();
+            if (wn > 0 && wl)
+                ComboIdx("Arma", &C.selWeapon, wn, wl, "(nenhuma)");
+            else
+                ImGui::TextDisabled("Arma: lista vazia (aperte o DUMP)");
+
+            for (int s = 0; s < Unlock::AttachSlotCount(); ++s) {
+                int an = Unlock::AttachCount(s);
+                const char* const* al = Unlock::AttachList(s);
+                ImGui::PushID(s);
+                if (an > 0 && al) {
+                    ComboIdx(Unlock::AttachSlotName(s), &C.selAttach[s], an, al, "(nenhum)");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("limpar")) C.selAttach[s] = -1;
+                }
+                else {
+                    ImGui::TextDisabled("%s: lista vazia", Unlock::AttachSlotName(s));
+                }
+                ImGui::PopID();
+            }
+        }
+
+        // ---------------- SKINS ----------------
+        if (ImGui::CollapsingHeader("Skins", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            int cn = Unlock::CamoCount();
+            const char* const* cl = Unlock::CamoList();
+            if (cn > 0 && cl) {
+                if (ComboIdx("Skin / Camo", &C.selCamo, cn, cl, "(nenhuma)")) {
+                    C.skinIndex = C.selCamo;
+                    strncpy_s(C.skinName, sizeof(C.skinName), cl[C.selCamo], _TRUNCATE);
+                }
+            }
+            else {
+                ImGui::TextDisabled("Skin: lista vazia");
+            }
+            ImGui::Checkbox("Skin changer", &C.skinChanger);
+            ImGui::SliderInt("Indice da skin", &C.skinIndex, 0, 255);
+            ImGui::InputText("Nome da skin", C.skinName, sizeof(C.skinName));
+        }
+
+        // ---------------- PERSONAGENS ----------------
+        if (ImGui::CollapsingHeader("Personagens", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            int pn = Unlock::CharCount();
+            const char* const* pl = Unlock::CharList();
+            if (pn > 0 && pl) {
+                if (ComboIdx("Personagem", &C.selChar, pn, pl, "(nenhum)"))
+                    strncpy_s(C.charName, sizeof(C.charName), pl[C.selChar], _TRUNCATE);
+            }
+            else {
+                ImGui::TextDisabled("Personagem: lista vazia");
+            }
+        }
 
         ImGui::Separator();
-        ImGui::Checkbox("Skin Changer", &C.skinChanger);
+        ImGui::TextDisabled("sel: arma=%d skin=%d char=%d anexos=%d/%d/%d",
+            C.selWeapon, C.selCamo, C.selChar,
+            C.selAttach[0], C.selAttach[1], C.selAttach[2]);
 
-        const char* const* camos = Unlock::CamoList();
-        int cc = Unlock::CamoCount();
-        int idx = C.skinIndex; if (idx < 0 || idx >= cc) idx = 0;
-        if (ImGui::BeginCombo("Skin", camos[idx]))
+        // ---------------- slots manuais ----------------
+        if (ImGui::CollapsingHeader("Slots manuais"))
         {
-            for (int i = 0; i < cc; i++)
-                if (ImGui::Selectable(camos[i], C.skinIndex == i))
-                    C.skinIndex = i;
-            ImGui::EndCombo();
+            ImGui::Checkbox("Preencher slots", &C.fillLoadoutSlots);
+            ImGui::Checkbox("Aplicar slots", &C.applySlots);
+            ImGui::SliderInt("Slot 1", &C.slotWeapon[0], -1, 64);
+            ImGui::SliderInt("Slot 2", &C.slotWeapon[1], -1, 64);
+            ImGui::SliderInt("Slot 3", &C.slotWeapon[2], -1, 64);
         }
 
         if (ImGui::CollapsingHeader("Forcar nomes (string)"))
@@ -258,6 +387,10 @@ namespace Menu {
         ImGui::Separator();
         ImGui::Checkbox("Anti-cheat bypass", &C.antiCheat);
         ImGui::Text("Stage: %d", C.stage);
+
+        ImGui::Separator();
+        ImGui::Checkbox("Log detalhado (probeLog)", &C.probeLog);
+        ImGui::Checkbox("Beat no log", &C.beatLog);
 
         ImGui::Separator();
         Keybind("Tecla do menu", &C.menuKey);

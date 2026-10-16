@@ -2,20 +2,9 @@
 //  features.cpp — Menu::Render / Menu::ApplyStyle / Aimbot::Bone / Menu_WantsMouse
 //  O menu de verdade vive em menu.cpp (Menu::Draw).
 //
-//  >>> CORRECOES desta versao:
-//   1) E0312: dentro de "namespace Aimbot" o nome 'Quat' sem qualificar
-//      resolve para Aimbot::Quat (declarado em features.h), nao para o
-//      ::Quat que SDK::LookRot devolve e SDK::SetPlayerRot espera. Agora
-//      tudo qualificado com ::Quat.
-//   2) Menu::Render aplicava o estilo UMA vez e chamava Draw, mas o
-//      hk_wglSwapBuffers chamava Menu::Draw direto -> ApplyStyle NUNCA rodava
-//      e o menu ficava com o estilo default. Render e o ponto de entrada.
-//   3) Menu_WantsMouse chamava ImGui::GetIO() sem checar se o contexto
-//      existe (crash se consultado antes do ImGui subir).
-//   4) ApplyStyle idem: guarda de contexto.
-//   5) Aimbot::Bone nao tratava campo de rotacao SyncVar (usava WriteAt
-//      direto no offset) e montava o LookRotation na mao quando o SDK ja
-//      tinha LookRot/SetPlayerRot prontos.
+//  >>> UNICO dono de Menu::Render(). O menu.cpp NAO define Render, senao:
+//        LNK2005 "void __cdecl Menu::Render(void)" ja definida em features.obj
+//        LNK1169
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -35,7 +24,6 @@
 #include "features.h"
 
 bool Menu_WantsMouse() {
-    // >>> FIX: GetIO() sem contexto e crash.
     if (!C.menuOpen || !Hooks::g_imguiReady.load()) return false;
     return ImGui::GetIO().WantCaptureMouse;
 }
@@ -56,8 +44,8 @@ namespace Menu {
         s.Colors[ImGuiCol_TitleBg] = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
     }
 
-    // >>> FIX: este e o ponto de entrada. O hooks.cpp tem que chamar Render(),
-    //     nao Draw(), senao o estilo nunca e aplicado.
+    // Ponto de entrada chamado pelo hk_wglSwapBuffers.
+    // O menu.cpp define Draw() e chama o estilo proprio dele depois deste.
     void Render() {
         static bool styled = false;
         if (!styled) {
@@ -85,7 +73,6 @@ namespace Aimbot {
         float L = dir.len();
         if (L < 0.0001f) return;
 
-        // >>> FIX E0312: 'Quat' aqui e Aimbot::Quat, nao ::Quat.
         ::Quat q = SDK::LookRot(dir * (1.f / L));
 
         // SetPlayerRot trata o caso do campo ser SyncVar<Quaternion>
@@ -93,4 +80,3 @@ namespace Aimbot {
     }
 
 } // namespace Aimbot
-// ==== FIM DO ARQUIVO ====

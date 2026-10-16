@@ -1,41 +1,42 @@
 // ============================================================================
-//  hooks.cpp
+//  hooks.cpp  (v2 — corrigido)
 //
-//  >>> CORRECOES desta versao:
-//   1) hk_fire7 era 'void' mas FireBullet retorna bool -> o retorno chegava
-//      corrompido no C# (AL clobberado por Log/GetRot/ApplyNoRecoil depois).
-//      Agora e bool e repassa o valor. hk_fireOne idem.
-//   2) JANELA/ESP: WindowFromDC podia devolver janela sem area cliente. O
-//      g_hwnd era sobrescrito, o backend Win32 ficava preso no hwnd velho,
-//      GetClientRect dava (0,0), io.DisplaySize ia a zero e
-//      ImGui_ImplOpenGL3_RenderDrawData faz early-return -> NADA desenhado.
+//  >>> NOVO NESTA VERSAO (alem de TODAS as correcoes anteriores):
+//  16) LOG THROTTLE: o [watch]/[probe]/[fire7] gerava centenas de milhares de
+//      linhas por partida (log de 400 KB). Agora tudo isso passa por
+//      C.probeLog. Desligado, o log fica so com o essencial.
+//  17) WATCH_MAX_LINES 60 -> 12, frameProbeFrames < 20 -> < 6,
+//      probeShots < 6 -> < 2, fireLogged < 3 -> < 1, e ProbeDiff agora
+//      limita a 8 linhas por tiro. Todos ajustaveis por config.
+//  18) hk_lateUpdate nao tinha __try em NADA. Um AV no watch/probe subia
+//      direto pro SetUnhandledExceptionFilter. Agora tem __try em volta do
+//      original E em volta do bloco watch/probe.
+//  19) RebindWindow e hk_wndProc usavam ImLock (objeto com destrutor). Sob
+//      SEH o destrutor NAO roda em AV -> critical section ficava travada pra
+//      sempre e o render morria. Agora usam Enter/LeaveCriticalSection
+//      manuais. O ImLock so sobrou no Shutdown, onde nao ha __try.
+//  20) Bloco pre-ImGui do swap (ResolveWindow/RebindWindow/HandleKeys/beat)
+//      agora esta dentro de __try. So POD ali -> seguro.
+//  21) Beat log gateado por C.beatLog.
+//  22) Shutdown zera g_lastTickFrame / contadores de log.
+//
+//  >>> CORRECOES ANTERIORES (mantidas):
+//   1) hk_fire7 era 'void' mas FireBullet retorna bool -> retorno corrompido.
+//   2) Janela/ESP: WindowFromDC podia devolver janela sem area cliente ->
+//      io.DisplaySize ia a zero -> nada desenhado.
 //   3) Shutdown destroi o ImGui e espera os detours antes de MH_Uninitialize.
-//   4) silent/magic agora chamam Aimbot::Silent::Override.
-//   5) hk_wndProc em reentrancia chamava DefWindowProcA em vez do proc do
-//      jogo -> o jogo perdia mensagens despachadas por SendMessage dentro do
-//      proprio proc (WM_SIZE/WM_KILLFOCUS). Agora repassa o o_wndProc.
-//   6) InitImGui nao era idempotente: se o OpenGL3_Init falhasse, o contexto
-//      ja tinha sido criado e a proxima chamada fazia CreateContext de novo.
-//      Agora contexto e backends tem flags separadas e o rollback e limpo.
-//   7) O bloco de frame do ImGui rodava dentro de __try COM objetos de
-//      destrutor (ImLock) -> em AV os destrutores NAO rodam, o critical
-//      section ficava travado e o render morria de vez. Agora o lock e
-//      manual e o __try so cobre POD.
-//   8) ResolveWindow era chamado TODO frame (WindowFromDC + GetAncestor +
-//      GetClientRect). Agora e throttled.
-//   9) ApplyNoRecoil era chamado 2x/frame (swap + LateUpdate) e o hk_fireOne
-//      aplicava no tiro de QUALQUER player. Agora tem guarda por frame e o
-//      fireOne so age no tiro local.
-//  10) CollectProbeFields passava nome de campo nulo direto pro strncpy_s.
-//  11) SDK::g_frameId tambem e atualizado no swap hook -> o cache de LOS nao
-//      congela com o jogo pausado / menu aberto.
-//  12) RebindWindow re-inicializava o ImGui mesmo com a mesma janela.
-//  13) InstallMainThread/FindMethodPtr usavam SDK::FindClass (match por
-//      SUFIXO) -> "Main" podia casar "DomainMain". Agora exige nome exato.
-//  14) Shutdown nao zerava g_hwnd/o_wndProc/trampolines.
-//  15) Passou a chamar Menu::Render() em vez de Menu::Draw() -> o Render e
-//      quem aplica o ApplyStyle uma vez; chamando Draw direto o estilo do
-//      menu NUNCA era aplicado.
+//   4) silent/magic chamam Aimbot::Silent::Override.
+//   5) hk_wndProc em reentrancia repassa o o_wndProc, nao DefWindowProcA.
+//   6) InitImGui idempotente (flags separadas por backend + rollback limpo).
+//   7) Bloco de frame do ImGui com lock manual e __try so em POD.
+//   8) ResolveWindow throttled (era 3 syscalls por frame).
+//   9) ApplyNoRecoil 1x por frame; fireOne so age no tiro local.
+//  10) CollectProbeFields nao passa nome nulo pro strncpy_s.
+//  11) SDK::g_frameId atualizado no swap hook (cache de LOS nao congela).
+//  12) RebindWindow nao re-inicializa o ImGui com a mesma janela.
+//  13) FindClassNamed exige nome EXATO (antes "Main" casava "DomainMain").
+//  14) Shutdown zera g_hwnd/o_wndProc/trampolines.
+//  15) Chama Menu::Render() (que aplica o ApplyStyle) em vez de Menu::Draw().
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -61,7 +62,8 @@
 
 #pragma comment(lib, "opengl32.lib")
 
-#define WATCH_MAX_LINES           60
+#define WATCH_MAX_LINES   12
+#define PROBE_DIFF_MAX    8
 
 namespace Hooks {
 
@@ -95,6 +97,12 @@ namespace Hooks {
         return r;
     }
 
+    // limite de linhas do watch, com sanidade
+    static int WatchMax() {
+        int v = C.watchMaxLines;
+        return (v > 0 && v < 4096) ? v : WATCH_MAX_LINES;
+    }
+
     static MethodInfo* FindMethodByArity(Il2CppClass* k, const char* name, uint32_t argc) {
         if (!k || !name) return nullptr;
         void* iter = nullptr;
@@ -119,8 +127,7 @@ namespace Hooks {
         return nullptr;
     }
 
-    // >>> FIX: SDK::FindClass casa por SUFIXO ("Main" -> "DomainMain"). Para
-    //     escolher o alvo do hook do main thread isso tem que ser exato.
+    // SDK::FindClass casa por SUFIXO ("Main" -> "DomainMain"). Aqui tem que ser exato.
     static Il2CppClass* FindClassNamed(const char* name) {
         if (!name) return nullptr;
         Il2CppClass* k = SDK::FindClass(name);
@@ -156,7 +163,7 @@ namespace Hooks {
         __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
-    // >>> FIX: antes isto era chamado no swap E no LateUpdate (2x/frame).
+    // antes isto era chamado no swap E no LateUpdate (2x/frame)
     static void ApplyNoRecoilFrame(uint32_t f) {
         static std::atomic<uint32_t> last{ 0xFFFFFFFF };
         uint32_t prev = last.exchange(f);
@@ -226,9 +233,9 @@ namespace Hooks {
 
     static thread_local int t_wndDepth = 0;
 
+    // >>> FIX 19: lock MANUAL (sem objeto com destrutor) -> seguro sob SEH.
     static LRESULT CALLBACK hk_wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-        // >>> FIX: reentrancia (SendMessage dentro do proc) tem que repassar
-        //     para o proc do JOGO, nao para o DefWindowProc.
+        // reentrancia (SendMessage dentro do proc) repassa pro proc do JOGO
         if (t_wndDepth > 0) {
             return o_wndProc ? CallWindowProcA(o_wndProc, h, msg, wp, lp)
                 : DefWindowProcA(h, msg, wp, lp);
@@ -237,12 +244,18 @@ namespace Hooks {
         ++t_wndDepth;
         LRESULT r;
 
-        if (g_imguiInit) {
-            { ImLock lk; ImGui_ImplWin32_WndProcHandler(h, msg, wp, lp); }
+        if (g_imguiInit && g_imCsInit) {
+            EnterCriticalSection(&g_imCs);
+            ImGui_ImplWin32_WndProcHandler(h, msg, wp, lp);
             if (C.menuOpen) {
                 ImGuiIO& io = ImGui::GetIO();
-                if (io.WantCaptureMouse || io.WantCaptureKeyboard) { --t_wndDepth; return TRUE; }
+                if (io.WantCaptureMouse || io.WantCaptureKeyboard) {
+                    LeaveCriticalSection(&g_imCs);
+                    --t_wndDepth;
+                    return TRUE;
+                }
             }
+            LeaveCriticalSection(&g_imCs);
         }
 
         r = o_wndProc ? CallWindowProcA(o_wndProc, h, msg, wp, lp)
@@ -254,8 +267,8 @@ namespace Hooks {
     typedef BOOL(WINAPI* tSwapBuffers)(HDC);
     static tSwapBuffers o_swap = nullptr;
 
-    // >>> FIX: nao era idempotente. Se o OpenGL3_Init falhasse, o contexto ja
-    //     existia e a proxima chamada fazia CreateContext de novo (leak/UB).
+    // nao era idempotente: se o OpenGL3_Init falhasse o contexto ja existia
+    // e a proxima chamada fazia CreateContext de novo (leak/UB).
     static bool InitImGui(HWND hwnd) {
         if (g_imguiInit) return true;
         if (!hwnd) return false;
@@ -311,79 +324,92 @@ namespace Hooks {
         return h;
     }
 
+    // >>> FIX 19: lock manual. Se der AV no meio, o caller consegue soltar a CS.
     static void RebindWindow(HWND hwnd) {
         if (!hwnd) return;
         HWND oldWnd = g_hwnd;
-        if (oldWnd == hwnd) return;   // >>> FIX: nao re-inicializa a toa
+        if (oldWnd == hwnd) return;   // nao re-inicializa a toa
 
-        {
-            ImLock lk;
-            if (oldWnd && o_wndProc)
-                SetWindowLongPtrA(oldWnd, GWLP_WNDPROC, (LONG_PTR)o_wndProc);
+        if (g_imCsInit) EnterCriticalSection(&g_imCs);
 
-            WNDPROC prev = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
-            if (prev && prev != hk_wndProc) o_wndProc = prev;
-        }
+        if (oldWnd && o_wndProc)
+            SetWindowLongPtrA(oldWnd, GWLP_WNDPROC, (LONG_PTR)o_wndProc);
+
+        WNDPROC prev = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
+        if (prev && prev != hk_wndProc) o_wndProc = prev;
 
         g_hwnd = hwnd;
         Log("[hooks] janela = %p (anterior=%p)", hwnd, oldWnd);
 
-        ImLock lk;
-        if (!g_imguiInit) { InitImGui(hwnd); return; }
-
-        if (g_win32Backend) { ImGui_ImplWin32_Shutdown(); g_win32Backend = false; }
-        if (!ImGui_ImplWin32_Init(hwnd)) {
-            Log("[hooks] ImGui_ImplWin32_Init FALHOU (rebind)");
-            g_imguiReady = false;
-            return;
+        if (!g_imguiInit) {
+            InitImGui(hwnd);
         }
-        g_win32Backend = true;
-        ImGui::GetIO().IniFilename = nullptr;
+        else if (g_win32Backend) {
+            ImGui_ImplWin32_Shutdown();
+            g_win32Backend = false;
+            if (!ImGui_ImplWin32_Init(hwnd)) {
+                Log("[hooks] ImGui_ImplWin32_Init FALHOU (rebind)");
+                g_imguiReady = false;
+            }
+            else {
+                g_win32Backend = true;
+                ImGui::GetIO().IniFilename = nullptr;
+            }
+        }
+
+        if (g_imCsInit) LeaveCriticalSection(&g_imCs);
     }
 
     static BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
         PHASE("hk_swap");
         g_frameCounter.fetch_add(1, std::memory_order_relaxed);
 
-        // >>> FIX: o cache de LOS nao pode congelar com o jogo pausado.
+        // o cache de LOS nao pode congelar com o jogo pausado
         SDK::g_frameId = g_frameCounter.load(std::memory_order_relaxed);
 
         if (!o_swap) return TRUE;
 
-        // >>> FIX: ResolveWindow era chamado todo frame (3 syscalls/frame).
-        static int winPoll = 0;
-        if (!g_hwnd || ++winPoll >= 8) {
-            winPoll = 0;
-            HWND hwnd = ResolveWindow(hdc);
-            if (hwnd && hwnd != g_hwnd) RebindWindow(hwnd);
-        }
+        // ---------------------------------------------------------------
+        // bloco 1: janela / wndproc / teclas / beat  (tudo POD -> SEH ok)
+        // ---------------------------------------------------------------
+        __try {
+            static int winPoll = 0;
+            if (!g_hwnd || ++winPoll >= 8) {
+                winPoll = 0;
+                HWND hwnd = ResolveWindow(hdc);
+                if (hwnd && hwnd != g_hwnd) RebindWindow(hwnd);
+            }
 
-        if (g_hwnd && o_wndProc) {
-            static ULONGLONG lastWndCheck = 0;
-            ULONGLONG nowc = GetTickCount64();
-            if (nowc - lastWndCheck > 500) {
-                lastWndCheck = nowc;
-                WNDPROC cur = (WNDPROC)GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
-                if (cur && cur != hk_wndProc) {
-                    WNDPROC prev = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
-                    if (prev && prev != hk_wndProc) o_wndProc = prev;
-                    Log("[hooks] wndproc reinstalado (estava %p)", cur);
+            if (g_hwnd && o_wndProc) {
+                static ULONGLONG lastWndCheck = 0;
+                ULONGLONG nowc = GetTickCount64();
+                if (nowc - lastWndCheck > 500) {
+                    lastWndCheck = nowc;
+                    WNDPROC cur = (WNDPROC)GetWindowLongPtrA(g_hwnd, GWLP_WNDPROC);
+                    if (cur && cur != hk_wndProc) {
+                        WNDPROC prev = (WNDPROC)SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndProc);
+                        if (prev && prev != hk_wndProc) o_wndProc = prev;
+                        Log("[hooks] wndproc reinstalado (estava %p)", cur);
+                    }
                 }
             }
+
+            ApplyNoRecoilFrame(g_frameCounter.load(std::memory_order_relaxed));
+
+            if (C.beatLog) {
+                static ULONGLONG lastBeat = 0;
+                ULONGLONG nb = GetTickCount64();
+                if (nb - lastBeat > 2000) {
+                    lastBeat = nb;
+                    Log("[hooks] beat: menu=%d sdk=%d alvos=%d local=%p fase=%s",
+                        (int)C.menuOpen, (int)g_sdkReady.load(), SDK::g_targetCount,
+                        SDK::g_localPlayer, g_phase ? g_phase : "?");
+                }
+            }
+
+            HandleKeys();
         }
-
-        ApplyNoRecoilFrame(g_frameCounter.load(std::memory_order_relaxed));
-
-        static ULONGLONG lastBeat = 0;
-        ULONGLONG nb = GetTickCount64();
-        if (nb - lastBeat > 2000) {
-            lastBeat = nb;
-            Log("[hooks] beat: menu=%d sdk=%d alvos=%d local=%p fase=%s",
-                (int)C.menuOpen, (int)g_sdkReady.load(), SDK::g_targetCount,
-                SDK::g_localPlayer, g_phase ? g_phase : "?");
-        }
-
-        HandleKeys();
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] swap pre-ImGui"); }
 
         if (!g_imguiInit || !g_hwnd) return o_swap(hdc);
 
@@ -393,9 +419,8 @@ namespace Hooks {
         if (w <= 0 || h <= 0) return o_swap(hdc);
         g_viewW = w; g_viewH = h;
 
-        // >>> FIX: lock MANUAL + __try. Com ImLock dentro do __try, um AV no
-        //     Draw() nao roda o destrutor -> o critical section ficava travado
-        //     para sempre e o render morria. Agora o __try so cobre POD.
+        // lock MANUAL + __try: com ImLock dentro do __try, um AV no Draw()
+        // nao roda o destrutor -> critical section travada pra sempre.
         if (g_imCsInit) EnterCriticalSection(&g_imCs);
         __try {
             if (g_frameOpen.exchange(true)) ImGui::EndFrame();
@@ -409,8 +434,7 @@ namespace Hooks {
 
             ImGui::NewFrame();
 
-            // >>> FIX: Render() aplica o ApplyStyle uma vez; Draw() direto
-            //     deixava o menu com o estilo default para sempre.
+            // Render() aplica o ApplyStyle uma vez
             Menu::Render();
             if (g_sdkReady.load()) { ESP::Draw(); Misc::Draw(); }
 
@@ -447,7 +471,7 @@ namespace Hooks {
     }
 
     // -----------------------------------------------------------------------
-    //  PROBE
+    //  PROBE  (tudo gateado por C.probeLog)
     // -----------------------------------------------------------------------
     struct FloatProbe { uint32_t off; char name[40]; };
     static FloatProbe g_probe[512];
@@ -471,7 +495,7 @@ namespace Hooks {
                     uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
                     if (!off) continue;
                     g_probe[g_probeN].off = off;
-                    // >>> FIX: o nome pode vir nulo e ia direto pro strncpy_s.
+                    // o nome pode vir nulo e ia direto pro strncpy_s
                     const char* fn = il2cpp_field_get_name(f);
                     strncpy_s(g_probe[g_probeN].name, fn ? fn : "?", _TRUNCATE);
                     ++g_probeN;
@@ -487,13 +511,19 @@ namespace Hooks {
             dst[i] = SafeRead<float>((uintptr_t)SDK::g_localPlayer + g_probe[i].off, 0.f);
     }
 
+    // >>> FIX 17: limitado a PROBE_DIFF_MAX linhas por tiro.
     static void ProbeDiff(const float* ref, const char* tag) {
         if (!SDK::g_localPlayer || g_probeN <= 0) return;
-        for (int i = 0; i < g_probeN; ++i) {
+        int lines = 0;
+        for (int i = 0; i < g_probeN && lines < PROBE_DIFF_MAX; ++i) {
             float now = SafeRead<float>((uintptr_t)SDK::g_localPlayer + g_probe[i].off, 0.f);
-            if (now != ref[i])
-                Log("[%s] float %s @0x%X %.4f -> %.4f", tag, g_probe[i].name, g_probe[i].off, ref[i], now);
+            if (now != ref[i]) {
+                Log("[%s] float %s @0x%X %.4f -> %.4f",
+                    tag, g_probe[i].name, g_probe[i].off, ref[i], now);
+                ++lines;
+            }
         }
+        if (lines == 0) Log("[%s] nenhum float mudou", tag);
     }
 
     // -----------------------------------------------------------------------
@@ -502,38 +532,48 @@ namespace Hooks {
     typedef void(__fastcall* tLateUpdate)(void* self, void* method);
     static tLateUpdate o_lateUpdate = nullptr;
 
+    // >>> FIX 18: __try em volta do original E do bloco watch/probe.
+    //     Locais aqui sao POD (Quat/ponteiros/bool) -> sem C2712.
     static void __fastcall hk_lateUpdate(void* self, void* method) {
         PHASE("hk_lateUpdate");
 
         const bool isLocalInst = (!g_mainIsPlayerClass.load() ||
             !SDK::g_localPlayer || self == SDK::g_localPlayer);
-        const bool watch = isLocalInst && g_lastShotMs.load() &&
-            (GetTickCount64() - g_lastShotMs.load() < 150) &&
-            g_frameProbeFrames < 20 && g_watchLines < WATCH_MAX_LINES;
 
-        if (o_lateUpdate) o_lateUpdate(self, method);
+        const bool wantWatch = isLocalInst && C.probeLog && g_lastShotMs.load() &&
+            (GetTickCount64() - g_lastShotMs.load() < 150) &&
+            g_frameProbeFrames < 6 && g_watchLines < WatchMax();
+
+        if (o_lateUpdate) {
+            __try { o_lateUpdate(self, method); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] LateUpdate original AV"); }
+        }
 
         if (isLocalInst) ApplyNoRecoilFrame(g_frameCounter.load(std::memory_order_relaxed));
 
         ::Quat r1{ 0.f, 0.f, 0.f, 1.f }, p1{ 0.f, 0.f, 0.f, 1.f };
         Il2CppObject* camTf = nullptr;
-        if (watch) {
-            if (g_probeN < 0) CollectProbeFields(ClassOf(SDK::g_localPlayer));
-            camTf = SDK::CamTfObj();
-            if (camTf) SDK::GetRot(camTf, r1);
-            if (SDK::g_localPlayer) p1 = SDK::GetPlayerRot(SDK::g_localPlayer);
 
-            ++g_frameProbeFrames;
-            ++g_watchLines;
+        __try {
+            if (wantWatch) {
+                if (g_probeN < 0) CollectProbeFields(ClassOf(SDK::g_localPlayer));
+                camTf = SDK::CamTfObj();
+                if (camTf) SDK::GetRot(camTf, r1);
+                if (SDK::g_localPlayer) p1 = SDK::GetPlayerRot(SDK::g_localPlayer);
 
-            Log("[watch] f%d camTf (%.4f,%.4f,%.4f,%.4f) playerRot (%.4f,%.4f,%.4f,%.4f) preTiroCam (%.4f,%.4f,%.4f,%.4f)",
-                g_frameProbeFrames,
-                r1.x, r1.y, r1.z, r1.w,
-                p1.x, p1.y, p1.z, p1.w,
-                g_pendingCam.x, g_pendingCam.y, g_pendingCam.z, g_pendingCam.w);
+                ++g_frameProbeFrames;
+                ++g_watchLines;
 
-            ProbeSnapshot(g_frameBefore);
+                Log("[watch] f%d camTf (%.4f,%.4f,%.4f,%.4f) playerRot (%.4f,%.4f,%.4f,%.4f) preTiroCam (%.4f,%.4f,%.4f,%.4f)",
+                    g_frameProbeFrames,
+                    r1.x, r1.y, r1.z, r1.w,
+                    p1.x, p1.y, p1.z, p1.w,
+                    g_pendingCam.x, g_pendingCam.y, g_pendingCam.z, g_pendingCam.w);
+
+                ProbeSnapshot(g_frameBefore);
+            }
         }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] watch/probe"); }
 
         if (g_mainIsPlayerClass.load() && SDK::g_localPlayer && self != SDK::g_localPlayer)
             return;
@@ -598,7 +638,9 @@ namespace Hooks {
         const bool aiming = (C.aimbot && C.aimKeyDown && SDK::g_aimTarget);
 
         __try {
-            if (g_fireLogged < 3) {
+            // >>> FIX 17: 3 linhas se probeLog, 1 se desligado.
+            const int fireLogMax = C.probeLog ? 3 : 1;
+            if (g_fireLogged < fireLogMax) {
                 ++g_fireLogged;
                 Log("[fire7] self=%p a1=%d(%p) a2=%.3f a3=(%.1f,%.1f,%.1f)|a3|=%.2f a4=(%.1f,%.1f,%.1f)|a4|=%.2f a5=%d a6=%.3f a7=%d",
                     self, a1, (void*)(intptr_t)a1, (double)a2,
@@ -642,7 +684,7 @@ namespace Hooks {
                 }
             }
 
-            if (isLocal && g_probeShots < 6) {
+            if (isLocal && C.probeLog && g_probeShots < 2) {
                 if (g_probeN < 0) CollectProbeFields(ClassOf(self));
                 ProbeSnapshot(g_probeBefore);
             }
@@ -660,9 +702,10 @@ namespace Hooks {
             g_frameProbeFrames = 0;
             g_watchLines = 0;
 
-            if (g_probeShots < 6 && camTf) {
+            if (C.probeLog && g_probeShots < 2 && camTf) {
                 ::Quat r1{ 0.f, 0.f, 0.f, 1.f };
-                SDK::GetRot(camTf, r1);
+                __try { SDK::GetRot(camTf, r1); }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
                 Log("[probe] camTf rot (%.4f,%.4f,%.4f,%.4f) -> (%.4f,%.4f,%.4f,%.4f)",
                     camBefore.x, camBefore.y, camBefore.z, camBefore.w, r1.x, r1.y, r1.z, r1.w);
                 ProbeDiff(g_probeBefore, "probe");
@@ -685,7 +728,8 @@ namespace Hooks {
         uint8_t a5, uint8_t a6, double a7, int32_t a8, int64_t a9) {
         PHASE("hk_fireOne");
 
-        if (g_fireOneLogged < 3) {
+        const int logMax = C.probeLog ? 3 : 1;
+        if (g_fireOneLogged < logMax) {
             ++g_fireOneLogged;
             Log("[fireOne] self=%p a1=%d(%p) a2=%.3f |a3|=%.2f |a4|=%.2f a5=%d a6=%d a7=%.2f a8=%d a9=%lld",
                 self, a1, (void*)(intptr_t)a1, (double)a2,
@@ -696,7 +740,7 @@ namespace Hooks {
         __try { ret = o_fireOne ? o_fireOne(self, a1, a2, a3, a4, a5, a6, a7, a8, a9) : false; }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
 
-        // >>> FIX: aplicava no tiro de QUALQUER player. Agora so no local.
+        // aplicava no tiro de QUALQUER player. Agora so no local.
         if (SDK::g_localPlayer && self == SDK::g_localPlayer)
             ApplyNoRecoil();
 
@@ -704,12 +748,11 @@ namespace Hooks {
     }
 
     // -----------------------------------------------------------------------
-    //  shoot (mantido)
+    //  shoot (mantido) — passthroughs tambem marcam o tiro
     // -----------------------------------------------------------------------
     typedef void(__fastcall* tShoot)(void* self, void* method);
     static tShoot o_shoot1 = nullptr, o_shoot2 = nullptr, o_shoot3 = nullptr, o_shoot4 = nullptr;
 
-    // >>> MELHORIA: os passthrough tambem marcam o tiro.
     static void __fastcall hk_shoot1(void* s, void* m) {
         if (s == SDK::g_localPlayer) ApplyNoRecoil();
         if (o_shoot1) o_shoot1(s, m);
@@ -785,9 +828,9 @@ namespace Hooks {
 
     // -----------------------------------------------------------------------
     void ApplyFeatures() {
-        Log("[hooks] ApplyFeatures: noRecoil=%d noSpread=%d infAmmo=%d rapidFire=%d noReload=%d silent=%d",
+        Log("[hooks] ApplyFeatures: noRecoil=%d noSpread=%d infAmmo=%d rapidFire=%d noReload=%d silent=%d probeLog=%d",
             (int)C.noRecoil, (int)C.noSpread, (int)C.infAmmo, (int)C.rapidFire,
-            (int)C.noReload, (int)C.silentAim);
+            (int)C.noReload, (int)C.silentAim, (int)C.probeLog);
     }
 
     bool Init() {
@@ -849,6 +892,16 @@ namespace Hooks {
         o_fire7 = nullptr;
         o_fireOne = nullptr;
         o_shoot1 = o_shoot2 = o_shoot3 = o_shoot4 = nullptr;
+
+        // >>> FIX 22
+        g_lastTickFrame = 0xFFFFFFFF;
+        g_lastShotMs.store(0);
+        g_frameProbeFrames = 0;
+        g_watchLines = 0;
+        g_probeShots = 0;
+        g_fireLogged = 0;
+        g_fireOneLogged = 0;
+        g_probeN = -1;
 
         Log("[hooks] Shutdown");
     }

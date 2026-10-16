@@ -39,23 +39,40 @@ namespace Hooks {
 }
 
 namespace SDK { bool Init(); }
-namespace Menu { extern bool g_open; void Draw(); void Render(); }
+
+// Menu_WantsMouse: definida em features.cpp, usada pelo hook de input.
+bool Menu_WantsMouse();
+
+namespace Menu {
+    extern bool g_open;
+    void Draw();            // menu.cpp
+    void Render();          // features.cpp — aplica o estilo 1x e chama Draw()
+}
+
 namespace ESP { void Draw(); }
 namespace Misc { void Panic(); void Draw(); void Tick(); }
 namespace Combat { void Tick(); }
 namespace Weapons { void Init(); void Tick(); }
 namespace Movement { void Tick(); }
 
+// ============================================================================
+//  AIMBOT
+//  NAO declare 'struct Quat' aqui dentro: cria Aimbot::Quat, um tipo distinto
+//  do ::Quat do common.h, e toda chamada de SDK que recebe Quat& quebra
+//  (E0312/E0349/E0434) alem de gerar LookRot sobrecarregado (E0308/C2668).
+//  Regra: '::Quat' explicito aqui e no aimbot.cpp.
+// ============================================================================
 namespace Aimbot {
-    struct Quat { float x, y, z, w; };
     Il2CppObject* Best();
     bool  Install();
     void  Tick();
+    void  Shutdown();
+    void  Bone(Il2CppObject* p, Il2CppObject* target);   // definida em features.cpp
     Vec3  Sub(Vec3, Vec3);
     float Dot(Vec3, Vec3);
     Vec3  Norm(Vec3);
-    Quat  LookRot(Vec3);
-    Quat  Slerp(Quat, Quat, float);
+    ::Quat LookRot(Vec3);
+    ::Quat Slerp(::Quat, ::Quat, float);
     Vec3  AimPoint(void*);
     Vec3  LocalPos();
     Vec3  CamForward();
@@ -63,6 +80,23 @@ namespace Aimbot {
 }
 
 namespace Recoil { void Install(); void Tick(); }
-namespace Unlock { bool Install(); void Tick(); void Dump(); }
+
+// ============================================================================
+//  UNLOCK — API usada pelo menu (ver tambem unlock.h)
+// ============================================================================
+namespace Unlock {
+    bool Install();
+    void Tick();
+    void Dump();
+
+    // listas pro menu (ponteiros estaveis, montadas 1x)
+    int WeaponCount();             const char* const* WeaponList();
+    int AttachSlotCount();         const char* AttachSlotName(int slot);
+    int AttachCount(int slot);     const char* const* AttachList(int slot);
+    int AttachValue(int slot, int idx);
+    int CamoCount();               const char* const* CamoList();
+    int CharCount();               const char* const* CharList();
+}
+
 namespace Triggerbot { bool Install(); void Tick(); }
 namespace AntiCheat { bool Install(); void Tick(); }

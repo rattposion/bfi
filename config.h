@@ -6,12 +6,14 @@
 
 struct Config {
 
+    // ---- JANELA / MENU ----
     bool  menuOpen = true;
     int   menuKey = VK_INSERT;
     int   panicKey = VK_DELETE;
     int   saveKey = VK_F5;
     int   unloadKey = VK_F8;
 
+    // ---- ESP ----
     bool  esp = true;
     bool  espBox = true;
     bool  espFill = false;
@@ -42,6 +44,7 @@ struct Config {
 
     bool  fps = false;
 
+    // ---- AIMBOT ----
     bool  aimbot = false;
     int   aimKey = VK_RBUTTON;
     float aimFov = 8.f;
@@ -49,7 +52,17 @@ struct Config {
     int   aimBone = 0;
     int   aimMode = 0;
     bool  aimVisible = true;
+
+    // Checar visao (LOS):
+    //   MARCADO   -> mira SOMENTE em quem esta visivel. Se ninguem estiver
+    //                visivel, NAO mira em ninguem (sem fallback).
+    //   DESMARCADO-> sem filtro, mira atraves da parede.
     bool  aimVisCheck = true;
+
+    // Nao e mais usado na decisao (visCheck ligado = so visivel). Mantido
+    // apenas para nao quebrar o menu.
+    bool  aimStrictVis = false;
+
     bool  aimTeam = false;
     bool  aimRotate = true;
     bool  showFovCircle = false;
@@ -59,16 +72,19 @@ struct Config {
     bool  silentAim = false;
     bool  magicBullets = false;
 
+    // ---- TRIGGERBOT ----
     bool  triggerbot = false;
     int   triggerKey = VK_MENU;
     float triggerDelay = 30.f;
 
+    // ---- ARMA ----
     bool  noRecoil = true;
     bool  noSpread = false;
     bool  infAmmo = false;
     bool  noReload = false;
     bool  rapidFire = false;
 
+    // ---- MOVIMENTO ----
     bool  speedHack = false;
     float speedValue = 8.f;
     bool  fly = false;
@@ -77,6 +93,7 @@ struct Config {
     float jumpPower = 6.f;
     bool  teleport = false;
 
+    // ---- MISC ----
     bool  godmode = false;
     bool  hitmarker = false;
     float camFov = 90.f;
@@ -85,13 +102,14 @@ struct Config {
     float crosshairColor[4] = { 0.f, 1.f, 0.f, 1.f };
     bool  watermark = true;
 
+    // ---- ANTICHEAT ----
     bool  antiCheat = true;
     bool  blockedNoZone = false;
     bool  blockedUnlock = false;
     int   stage = 0;
 
     // ---- UNLOCK ALL ----
-    bool  unlockAll = false;
+    bool  unlockAll = true;
     bool  unlockWeapons = true;
     bool  unlockSkins = true;
     bool  unlockAttachments = true;
@@ -115,14 +133,48 @@ struct Config {
 
     bool  aimKeyDown = false;
     float lastHitTime = 0.f;
+
+    // =======================================================================
+    //  SELECAO DO LOADOUT / SKINS / PERSONAGENS
+    //  Os indices sao os das listas Unlock::WeaponList() / CamoList() /
+    //  CharList() / AttachList(slot).  -1 = "nao mexer".
+    // =======================================================================
+    bool  unlockChars = true;               // destrava personagens
+    bool  applySelection = true;            // aplica o que voce escolheu abaixo
+    int   selWeapon = -1;                   // indice em Unlock::WeaponList()
+    int   selCamo = -1;                     // indice em Unlock::CamoList()
+    int   selChar = -1;                     // indice em Unlock::CharList()
+    int   selAttach[3] = { -1, -1, -1 };    // 0=sights 1=accessories 2=barrels
+    int   loadoutSlot = 0;                  // slot do loadout (0..2) que recebe selWeapon
+    char  charName[32] = "";                // nome do personagem escolhido
+
+    // =======================================================================
+    //  LOG / DUMP  (campos novos ficam no FIM de proposito)
+    // =======================================================================
+    bool  probeLog = false;                 // [watch] / [probe] / [fire7] / [aim]
+    bool  beatLog = true;                   // "[hooks] beat: ..." a cada 2s
+    bool  verboseUnlock = true;
+    int   watchMaxLines = 12;
+
+    bool  dumpOnce = true;
+    int   dumpIntervalMs = 5000;
+
+    bool  gunCustomizeUnlock = true;
+    bool  gunCustomizeAllSlots = true;
+
+    bool  showAimTargetName = false;
+    bool  showFpsGraph = false;
 };
 
 extern Config  g_cfg;
-extern Config& C;
 
 #ifdef C
 #undef C
 #endif
+extern Config& C;
+
+// C.menuOpen  -> funciona (macro function-like so expande com parenteses)
+// C(menuOpen) -> g_cfg.menuOpen
 #define C(f) g_cfg.f
 
 namespace ConfigIO {
@@ -131,4 +183,4 @@ namespace ConfigIO {
     void Load();
 }
 
-#endif // BFI_CONFIG_H
+#endif // BFI_CONFIG_Hs

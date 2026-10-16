@@ -10,7 +10,7 @@
     <Filter Include="core">
       <UniqueIdentifier>{9111c35b-9f20-4b1c-84f0-3bc3e5406d67}</UniqueIdentifier>
     </Filter>
-    <Filter Include="features.h">
+    <Filter Include="core\features.h">
       <UniqueIdentifier>{6abb4e08-0385-4233-be90-cdd0589c2e86}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
@@ -82,22 +82,22 @@
       <Filter>core</Filter>
     </ClInclude>
     <ClInclude Include="features.h">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClInclude>
     <ClInclude Include="hooks.h">
       <Filter>core</Filter>
     </ClInclude>
     <ClInclude Include="config.h">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClInclude>
     <ClInclude Include="il2cpp_api.h">
       <Filter>core</Filter>
     </ClInclude>
     <ClInclude Include="menu.h">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClInclude>
     <ClInclude Include="unlock.h">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -148,49 +148,49 @@
       <Filter>core</Filter>
     </ClCompile>
     <ClCompile Include="config.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="esp.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="aimbot.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="triggerbot.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="combat.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="weapons.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="movement.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="visuals.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="misc.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="anticheat.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="hooks.cpp">
       <Filter>core</Filter>
     </ClCompile>
     <ClCompile Include="menu.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="features.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="unlock.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
     <ClCompile Include="recoil.cpp">
-      <Filter>features.h</Filter>
+      <Filter>core\features.h</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>
