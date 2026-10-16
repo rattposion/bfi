@@ -1,9 +1,12 @@
 // ============================================================================
-//  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, value types como ponteiro cru
-//  + line of sight real via Physics.Raycast (distancia pelo m_Point)
-//  + time (g_localTeam) relido a cada scan/frame
-//  + visual check (t.visible) calculado na thread principal
-//  + weapon stats
+//  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
+//
+//  >>> FIX desta versao:
+//   1) FindGunStatsObj agora valida o candidato e, se ele for um clone em
+//      branco (mpCurrentGunStats apontando para template), procura no array
+//      de loadout (tipo "gunStats[]") o elemento com valores reais.
+//   2) O_gsMagSize/O_gsAmmo/O_gsGunObj/O_gunStatsArray resolvidos por nome.
+//   3) ResolveWeaponFields com os nomes reais do gunStats.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -14,6 +17,7 @@
 #include <vector>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 
 #include "il2cpp.h"
 #include "il2cpp_api.h"
@@ -61,6 +65,8 @@ extern "C" {
     Il2CppDomain* (*il2cpp_thread_attach)(const Il2CppDomain*) = nullptr;
     Il2CppObject* (*il2cpp_type_get_object)(const Il2CppType*) = nullptr;
     char* (*il2cpp_type_get_name)(const Il2CppType*) = nullptr;
+
+    Il2CppType* (*il2cpp_method_get_return_type)(const MethodInfo*) = nullptr;
 }
 
 namespace IL2CPP_API {
@@ -92,6 +98,7 @@ namespace IL2CPP_API {
             {"il2cpp_method_get_name", (void**)&il2cpp_method_get_name},
             {"il2cpp_method_get_param_count", (void**)&il2cpp_method_get_param_count},
             {"il2cpp_method_get_param", (void**)&il2cpp_method_get_param},
+            {"il2cpp_method_get_return_type", (void**)&il2cpp_method_get_return_type},
             {"il2cpp_object_get_class", (void**)&il2cpp_object_get_class},
             {"il2cpp_object_new", (void**)&il2cpp_object_new},
             {"il2cpp_object_unbox", (void**)&il2cpp_object_unbox},
@@ -301,6 +308,10 @@ namespace SDK {
     CRITICAL_SECTION g_targetCs;
     uint64_t g_frameId = 0;
 
+    std::atomic<int>  g_fireDirSlot{ -1 };
+    std::atomic<bool> g_recoilHookActive{ false };
+    bool g_rateIsRpm = false;
+
     bool  g_viewProjOk = false;
     float g_viewProj[16] = { 0 };
     static volatile LONG g_vpSeq = 0;
@@ -315,6 +326,10 @@ namespace SDK {
 
     static bool g_rotIsSyncVar = false;
     static Quat g_savedPlayerRot{ 0.f, 0.f, 0.f, 1.f };
+
+    // offsets do gunStats + campo do array de loadout
+    static uint32_t O_gsMagSize = 0, O_gsAmmo = 0, O_gsGunObj = 0;
+    static uint32_t O_gunStatsArray = 0;
 
     Il2CppClass* kEntity = nullptr;
     Il2CppClass* kPlayerScript = nullptr;
@@ -394,6 +409,13 @@ namespace SDK {
         const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
         const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
         return tn ? tn : "?";
+    }
+
+    const char* MethodReturnName(MethodInfo* m) {
+        if (!m || !il2cpp_method_get_return_type) return "?";
+        const Il2CppType* t = il2cpp_method_get_return_type(m);
+        const char* n = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+        return n ? n : "?";
     }
 
     // ======================= SyncVar (FishNet) =======================
@@ -725,6 +747,19 @@ namespace SDK {
 
     Vec3 GetBonePos(void* bone) { return GetPos((Il2CppObject*)bone); }
 
+    Vec3 MuzzlePos() {
+        Il2CppObject* camTf = CamTfObj();
+        if (camTf) {
+            Vec3 p = GetPos(camTf);
+            if (!p.zero()) return p;
+        }
+        if (g_localPlayer) {
+            Vec3 p = GetPos(g_localPlayer);
+            return Vec3(p.x, p.y + 1.5f, p.z);
+        }
+        return Vec3();
+    }
+
     bool IsA(Il2CppObject* o, Il2CppClass* c) {
         if (!o || !c) return false;
         for (Il2CppClass* k = se_object_get_class(o); k; k = se_class_parent(k))
@@ -1050,7 +1085,7 @@ namespace SDK {
         return inside(sa) && inside(sb);
     }
 
-    // ======================= LINE OF SIGHT (Physics.Raycast) =======================
+    // ======================= LINE OF SIGHT =======================
     static MethodInfo* FindRaycast4() {
         if (!kPhysics) kPhysics = FindClass("Physics", "UnityEngine");
         if (!kPhysics) return nullptr;
@@ -1121,7 +1156,6 @@ namespace SDK {
             void* pb = se_object_unbox(r);
             if (!pb || *(unsigned char*)pb == 0) return true;
 
-            // distancia pelo m_Point (offset 0) - confiavel (m_Distance em 0x2C le lixo)
             Vec3 hitPoint{ 0.f, 0.f, 0.f };
             se_read_bytes(hitBuf, &hitPoint, sizeof(Vec3));
             float hitDist = (hitPoint - sv).len();
@@ -1235,20 +1269,47 @@ namespace SDK {
     void DumpFields(const char* className) { DumpFields(FindClass(className), className); }
 
     // ======================= weapon stats =======================
+    static bool GunStatsLooksLive(Il2CppObject* s) {
+        if (!s) return false;
+        if (O_gsGunObj && SafeReadObjPub(s, O_gsGunObj)) return true;
+        if (O_gsMagSize && SafeRead<int>((uintptr_t)s + O_gsMagSize, 0) > 0) return true;
+        if (O_gsAmmo && SafeRead<int>((uintptr_t)s + O_gsAmmo, 0) > 0) return true;
+        return false;
+    }
+
     Il2CppObject* FindGunStatsObj() {
         if (!g_localPlayer) return nullptr;
 
-        if (O_gunStats) {
-            Il2CppObject* s = SafeReadObjPub(g_localPlayer, O_gunStats);
-            if (s) return s;
-        }
-        if (O_gunView && O_gunStatsOnView) {
-            Il2CppObject* gun = SafeReadObjPub(g_localPlayer, O_gunView);
-            if (gun) {
-                Il2CppObject* s = SafeReadObjPub(gun, O_gunStatsOnView);
-                if (s) return s;
+        // candidato direto (pode ser um clone em branco)
+        Il2CppObject* cand = nullptr;
+        if (O_gunStats) cand = SafeReadObjPub(g_localPlayer, O_gunStats);
+        if (GunStatsLooksLive(cand)) return cand;
+
+        // >>> FIX: procura no array de loadout um gunStats com valores reais
+        if (O_gunStatsArray) {
+            Il2CppObject* arr = SafeReadObjPub(g_localPlayer, O_gunStatsArray);
+            if (arr) {
+                int len = SafeRead<int>((uintptr_t)arr + 0x10, 0);
+                if (len > 0 && len <= 64) {
+                    for (int i = 0; i < len; ++i) {
+                        void* e = nullptr;
+                        if (!se_read_ptr(arr, 0x20 + (size_t)i * 8, &e) || !e) continue;
+                        if (GunStatsLooksLive((Il2CppObject*)e)) {
+                            static int lastIdx = -1;
+                            if (lastIdx != i) {
+                                lastIdx = i;
+                                Log("[sdk] gunStats vivo = loadout[%d] (%p)", i, e);
+                            }
+                            return (Il2CppObject*)e;
+                        }
+                    }
+                }
             }
         }
+
+        if (cand) return cand;
+
+        // fallback: varredura por tipo
         Il2CppClass* k = se_object_get_class(g_localPlayer);
         if (k) {
             void* it = nullptr;
@@ -1262,33 +1323,44 @@ namespace SDK {
                 uint32_t off = (uint32_t)se_field_offset(f);
                 if (!off) continue;
                 Il2CppObject* s = SafeReadObjPub(g_localPlayer, off);
-                if (s) return s;
+                if (GunStatsLooksLive(s)) return s;
             }
         }
         return nullptr;
     }
 
     int ResolveWeaponFields(Il2CppObject* stats,
-        uint32_t& cur, uint32_t& max, uint32_t& reload,
-        uint32_t& spread, uint32_t& rate, uint32_t& dmg) {
-        cur = max = reload = spread = rate = dmg = 0;
+        uint32_t& cur, uint32_t& max, uint32_t& reserve,
+        uint32_t& reload, uint32_t& spread, uint32_t& rate, uint32_t& dmg) {
+        cur = max = reserve = reload = spread = rate = dmg = 0;
+        g_rateIsRpm = false;
         if (!stats) return 0;
         Il2CppClass* k = se_object_get_class(stats);
         if (!k) return 0;
 
-        cur = PickFieldOff(k, { "currentAmmo", "curAmmo", "ammo", "bullets", "mCurrentAmmo", "magazineAmmo" }, "Int32");
-        max = PickFieldOff(k, { "maxAmmo", "ammoMax", "mMaxAmmo", "magazineSize", "clipSize" }, "Int32");
+        cur = PickFieldOff(k, { "ammoInMagazine", "currentAmmo", "curAmmo",
+                                "mCurrentAmmo", "magazineAmmo" }, "Int32");
+        max = PickFieldOff(k, { "magSize", "maxAmmo", "ammoMax",
+                                "mMaxAmmo", "magazineSize", "clipSize" }, "Int32");
+        reserve = PickFieldOff(k, { "totalAmmo", "reserveAmmo", "ammoReserve",
+                                    "spareAmmo", "totalMags" }, "Int32");
         reload = PickFieldOff(k, { "reloading", "isReloading", "mReloading" }, "Boolean");
-        spread = PickFieldOff(k, { "spread", "currentSpread", "mSpread" }, "Single");
-        rate = PickFieldOff(k, { "fireRate", "shotDelay", "mFireRate", "cooldown" }, "Single");
+        spread = PickFieldOff(k, { "hipMinSpread", "spread", "currentSpread", "mSpread" }, "Single");
+
+        rate = PickFieldOff(k, { "shotDelay", "fireDelay", "chamberTime", "cooldown" }, "Single");
+        if (!rate) {
+            rate = PickFieldOff(k, { "RPM" }, "Single");
+            g_rateIsRpm = (rate != 0);
+        }
         dmg = PickFieldOff(k, { "damage", "mDamage", "dmg", "damagePerShot" });
 
         int n = 0;
-        if (cur) ++n; if (max) ++n; if (reload) ++n;
+        if (cur) ++n; if (max) ++n; if (reserve) ++n; if (reload) ++n;
         if (spread) ++n; if (rate) ++n; if (dmg) ++n;
 
-        Log("[weapons] stats cls=%s cur=0x%X max=0x%X reload=0x%X spread=0x%X rate=0x%X dmg=0x%X",
-            se_class_name(k), cur, max, reload, spread, rate, dmg);
+        Log("[weapons] stats cls=%s cur=0x%X max=0x%X reserve=0x%X reload=0x%X spread=0x%X rate=0x%X(%s) dmg=0x%X",
+            se_class_name(k), cur, max, reserve, reload, spread, rate,
+            g_rateIsRpm ? "RPM" : "delay", dmg);
         return n;
     }
 
@@ -1644,6 +1716,9 @@ namespace SDK {
         float L = dir.len();
         if (L > 0.0001f) dir = dir * (1.f / L);
 
+        const int dirSlot = g_fireDirSlot.load();
+        const Vec3 muzzle = MuzzlePos();
+
         uint32_t np = il2cpp_method_get_param_count ? il2cpp_method_get_param_count(M_FireBullet) : 0;
         if (np == 0) np = 1;
 
@@ -1654,10 +1729,16 @@ namespace SDK {
         std::vector<unsigned char> bbuf(np, 0);
         std::vector<void*>  args(np, nullptr);
 
+        int vIndex = 0;
         for (uint32_t i = 0; i < np; ++i) {
             const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
             const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-            if (tn && strstr(tn, "Vector3")) { vbuf[i] = dir; args[i] = &vbuf[i]; }
+            if (tn && strstr(tn, "Vector3")) {
+                bool isDir = (dirSlot >= 0) ? (vIndex == dirSlot) : (vIndex == 1);
+                vbuf[i] = isDir ? dir : muzzle;
+                args[i] = &vbuf[i];
+                ++vIndex;
+            }
             else if (tn && strstr(tn, "Single"))  args[i] = &fbuf[i];
             else if (tn && strstr(tn, "Int32"))   args[i] = &ibuf[i];
             else if (tn && strstr(tn, "Double"))  args[i] = &dbuf[i];
@@ -1732,6 +1813,28 @@ namespace SDK {
             g_rotIsSyncVar = (rtE && strstr(rtE, "SyncVar")) || (rtP && strstr(rtP, "SyncVar"));
         }
 
+        // >>> FIX: offsets do gunStats + campo do array de loadout
+        if (!kGunStats) kGunStats = FindClass("gunStats");
+        if (kGunStats) {
+            O_gsMagSize = PickFieldOff(kGunStats, { "magSize", "magazineSize", "maxAmmo" }, "Int32");
+            O_gsAmmo = PickFieldOff(kGunStats, { "ammoInMagazine", "currentAmmo" }, "Int32");
+            O_gsGunObj = PickFieldOff(kGunStats, { "gunObject" });
+        }
+        if (kPlayerScript && !O_gunStatsArray) {
+            void* it = nullptr;
+            for (;;) {
+                FieldInfo* f = se_class_get_fields(kPlayerScript, &it);
+                if (!f) break;
+                const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                if (tn && strstr(tn, "gunStats[]")) {
+                    O_gunStatsArray = (uint32_t)se_field_offset(f);
+                    Log("[sdk] array de loadout = 0x%X (%s)", O_gunStatsArray, se_field_name(f));
+                    break;
+                }
+            }
+        }
+
         Log("[sdk] offsets: hp=0x%X(%s) name=0x%X(%s) team=0x%X(%s) rot=0x%X(%s) camTf=0x%X(%s) anim=0x%X syncRot=%d",
             O_health, FieldTypeOf(kPlayerScript, "_health"),
             O_name, FieldTypeOf(kPlayerScript, "username"),
@@ -1739,6 +1842,8 @@ namespace SDK {
             O_rotation, FieldTypeOf(kPlayerScript, "rotation"),
             O_camTf, FieldTypeOf(kPlayerScript, "cameraTransform"),
             O_humanMeshAnimator, (int)g_rotIsSyncVar);
+        Log("[sdk] gunStats: mag=0x%X ammo=0x%X gunObj=0x%X array=0x%X",
+            O_gsMagSize, O_gsAmmo, O_gsGunObj, O_gunStatsArray);
     }
 
     static void ResolveMethods() {
@@ -1759,7 +1864,8 @@ namespace SDK {
 
         if (M_FireBullet) {
             uint32_t np = il2cpp_method_get_param_count ? il2cpp_method_get_param_count(M_FireBullet) : 0;
-            Log("[sdk] FireBullet: %u params ready=%d", np, (int)FireBulletReady());
+            Log("[sdk] FireBullet: %u params ready=%d ret=%s", np, (int)FireBulletReady(),
+                MethodReturnName(M_FireBullet));
             for (uint32_t i = 0; i < np; ++i) {
                 const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
                 const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
@@ -1789,6 +1895,7 @@ namespace SDK {
         kTransform = FindClass("Transform", "UnityEngine");
         kCamera = FindClass("Camera", "UnityEngine");
         kGunStats = FindClass("GunStats");
+        if (!kGunStats) kGunStats = FindClass("gunStats");
         kVector3 = FindClass("Vector3", "UnityEngine");
         kQuaternion = FindClass("Quaternion", "UnityEngine");
         kAntiHack = FindClass("AntiHack");

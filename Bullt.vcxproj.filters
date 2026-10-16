@@ -93,6 +93,9 @@
     <ClInclude Include="il2cpp_api.h">
       <Filter>core</Filter>
     </ClInclude>
+    <ClInclude Include="menu.h">
+      <Filter>features.h</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="imgui\imgui.cpp">

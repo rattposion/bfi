@@ -85,7 +85,8 @@ struct Config {
     float crosshairColor[4] = { 0.f, 1.f, 0.f, 1.f };
     bool  watermark = true;
 
-    bool  antiCheat = false;
+    // >>> FIX: anti-cheat LIGADO por padrao (era false)
+    bool  antiCheat = true;
     bool  blockedNoZone = false;
     bool  blockedUnlock = false;
     int   stage = 0;

@@ -1,15 +1,16 @@
 // ============================================================================
-//  hooks.cpp — hooks + orquestracao de teclas.
-//  hk_lateUpdate chama SO Combat::Tick (sem tick duplicado).
+//  hooks.cpp
 //
-//  >>> FIX desta versao:
-//   1) hk_fire7 SEM o parametro MethodInfo* (o IL2CPP OMITE esse parametro no
-//      PlayerScript::FireBullet). Antes o "m" recebia 0,1,2,... e todos os
-//      argumentos ficavam deslocados -> AV + bala nao spawnava (arma atirava
-//      mas nao dava dano).
-//   2) hook de recoil (ComputeShotRecoil) DESLIGADO por padrao (ABI incerta).
-//      noRecoil segue funcionando pelo restore de rotacao do ShootBody.
-//   3) corpo do hk_fire7 dentro de __try/__except pra nao derrubar o jogo.
+//  >>> FIX desta versao (o log provou):
+//   1) FireOneShot NAO e chamado no cliente (zero linhas [fireOne]); fica como
+//      no-op informativo.
+//   2) O restore para camBefore era NO-OP: o kick cai ANTES do proximo tiro, e
+//      o camBefore (capturado na entrada do FireBullet) ja vinha chutado.
+//      preTiroCam(tiro N) == camTf chutado do tiro N-1.
+//   3) A mira LIMPA e o playerRot: ele fica cravado durante o burst inteiro
+//      enquanto o camTf acumula -0.0017/tiro. AGORA o camTf e forcado a seguir
+//      o playerRot todo frame (fim do LateUpdate e no present).
+//   4) Mantidos: FireBullet (silent aim + aim lock), probe/watch, ImGui blindado.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -35,14 +36,13 @@
 
 #pragma comment(lib, "opengl32.lib")
 
-// >>> FIX: liga/desliga o hook de recoil (ABI incerta). 0 = desligado.
-#define ENABLE_RECOIL_HOOK 0
+#define RECOIL_RESTORE_NEXT_FRAME 1
+#define WATCH_MAX_LINES           60
 
 // ---------------------------------------------------------------------------
-//  Estado exposto pelo aimbot.cpp (usado pelo hk_fire7)
+//  Estado exposto pelo aimbot.cpp
 // ---------------------------------------------------------------------------
 extern bool g_silentAimActive;
-extern bool g_magicBulletsActive;
 extern Vec3 g_silentAimDir;
 
 namespace Hooks {
@@ -57,8 +57,12 @@ namespace Hooks {
     static std::atomic<uint32_t> g_frameCounter{ 0 };
     static uint32_t g_lastTickFrame = 0xFFFFFFFF;
 
-    // o metodo hookado e uma instancia de player? (usado pelo hk_lateUpdate)
     static std::atomic<bool> g_mainIsPlayerClass{ false };
+
+    // ---- anti-recoil ----
+    static Quat     g_pendingCam{ 0.f, 0.f, 0.f, 1.f };   // so p/ log (preTiroCam)
+    static std::atomic<uint64_t> g_lastShotMs{ 0 };
+    static int      g_watchLines = 0;
 
     static bool KeyDown(int vk) { return vk ? (GetAsyncKeyState(vk) & 0x8000) != 0 : false; }
 
@@ -102,6 +106,25 @@ namespace Hooks {
         return m ? SDK::MethodPtr(m) : nullptr;
     }
 
+    static Il2CppClass* ClassOf(void* o) {
+        if (!o || !il2cpp_object_get_class) return nullptr;
+        return il2cpp_object_get_class((const Il2CppObject*)o);
+    }
+
+    // -----------------------------------------------------------------------
+    //  NO-RECOIL — o camTf tem que seguir o playerRot (mira limpa)
+    // -----------------------------------------------------------------------
+    static void ApplyNoRecoil() {
+        if (!C.noRecoil || !SDK::g_localPlayer) return;
+        __try {
+            Il2CppObject* ct = SDK::CamTfObj();
+            if (!ct) return;
+            Quat pr = SDK::GetPlayerRot(SDK::g_localPlayer);
+            SDK::SetRot(ct, pr);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
     // -----------------------------------------------------------------------
     //  teclas
     // -----------------------------------------------------------------------
@@ -142,8 +165,26 @@ namespace Hooks {
     static WNDPROC o_wndProc = nullptr;
     static bool    g_imguiInit = false;
 
+    static CRITICAL_SECTION  g_imCs;
+    static bool              g_imCsInit = false;
+    static std::atomic<bool> g_frameOpen{ false };
+
+    struct ImLock {
+        ImLock() { if (g_imCsInit) EnterCriticalSection(&g_imCs); }
+        ~ImLock() { if (g_imCsInit) LeaveCriticalSection(&g_imCs); }
+    };
+
+    ImFont* SafeFont(int idx) {
+        if (!g_imguiReady.load()) return nullptr;
+        ImGuiIO& io = ImGui::GetIO();
+        if (io.Fonts->Fonts.Size <= 0) return nullptr;
+        if (idx < 0 || idx >= io.Fonts->Fonts.Size) idx = 0;
+        return io.Fonts->Fonts[idx];
+    }
+
     static LRESULT CALLBACK hk_wndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_imguiInit) {
+            ImLock lk;
             ImGui_ImplWin32_WndProcHandler(h, msg, wp, lp);
             if (C.menuOpen) {
                 ImGuiIO& io = ImGui::GetIO();
@@ -158,6 +199,7 @@ namespace Hooks {
 
     static void InitImGui(HWND hwnd) {
         if (g_imguiInit) return;
+        if (!g_imCsInit) { InitializeCriticalSection(&g_imCs); g_imCsInit = true; }
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -167,7 +209,7 @@ namespace Hooks {
         if (!ImGui_ImplOpenGL3_Init("#version 130")) { Log("[hooks] ImGui_ImplOpenGL3_Init FALHOU"); return; }
         g_imguiInit = true;
         g_imguiReady = true;
-        Log("[hooks] ImGui inicializado (hwnd=%p)", hwnd);
+        Log("[hooks] ImGui inicializado (hwnd=%p fontes=%d)", hwnd, io.Fonts->Fonts.Size);
     }
 
     static BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
@@ -185,6 +227,10 @@ namespace Hooks {
             InitImGui(hwnd);
         }
 
+        // ultima palavra do frame: se algo reaplicou o kick depois do LateUpdate,
+        // zera aqui tambem.
+        ApplyNoRecoil();
+
         static ULONGLONG lastBeat = 0;
         ULONGLONG nb = GetTickCount64();
         if (nb - lastBeat > 2000) {
@@ -199,22 +245,31 @@ namespace Hooks {
 
         RECT rc;
         GetClientRect(g_hwnd, &rc);
-        g_viewW = (int)(rc.right - rc.left);
-        g_viewH = (int)(rc.bottom - rc.top);
+        int w = rc.right - rc.left, h = rc.bottom - rc.top;
+        if (w <= 0 || h <= 0) return o_swap(hdc);
+        g_viewW = w; g_viewH = h;
 
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplWin32_NewFrame();
-        ImGui::NewFrame();
+        {
+            ImLock lk;
 
-        Menu::Render();
-        if (g_sdkReady.load()) {
-            ESP::Draw();
-            Misc::Draw();
+            if (g_frameOpen.exchange(true)) ImGui::EndFrame();
+
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui::NewFrame();
+
+            Menu::Render();
+            if (g_sdkReady.load()) { ESP::Draw(); Misc::Draw(); }
+
+            ImGui::Render();
+            g_frameOpen = false;
+
+            ImDrawData* dd = ImGui::GetDrawData();
+            if (dd && dd->Valid && dd->CmdListsCount > 0) {
+                glViewport(0, 0, g_viewW, g_viewH);
+                ImGui_ImplOpenGL3_RenderDrawData(dd);
+            }
         }
-
-        ImGui::Render();
-        glViewport(0, 0, g_viewW, g_viewH);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         return o_swap(hdc);
     }
@@ -234,6 +289,54 @@ namespace Hooks {
     }
 
     // -----------------------------------------------------------------------
+    //  PROBE
+    // -----------------------------------------------------------------------
+    struct FloatProbe { uint32_t off; char name[40]; };
+    static FloatProbe g_probe[512];
+    static int        g_probeN = -1;
+    static float      g_probeBefore[512];
+    static int        g_probeShots = 0;
+    static float      g_frameBefore[512];
+    static int        g_frameProbeFrames = 0;
+
+    static void CollectProbeFields(Il2CppClass* k) {
+        g_probeN = 0;
+        __try {
+            for (Il2CppClass* c = k; c && g_probeN < 512; c = il2cpp_class_get_parent(c)) {
+                void* it = nullptr;
+                for (;;) {
+                    FieldInfo* f = il2cpp_class_get_fields(c, &it);
+                    if (!f || g_probeN >= 512) break;
+                    const Il2CppType* t = il2cpp_field_get_type(f);
+                    const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                    if (!tn || !strstr(tn, "Single")) continue;
+                    uint32_t off = (uint32_t)il2cpp_field_get_offset(f);
+                    if (!off) continue;
+                    g_probe[g_probeN].off = off;
+                    strncpy_s(g_probe[g_probeN].name, il2cpp_field_get_name(f), _TRUNCATE);
+                    ++g_probeN;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        Log("[probe] campos float em PlayerScript: %d", g_probeN);
+    }
+
+    static void ProbeSnapshot(float* dst) {
+        for (int i = 0; i < g_probeN; ++i)
+            dst[i] = SafeRead<float>((uintptr_t)SDK::g_localPlayer + g_probe[i].off, 0.f);
+    }
+
+    static void ProbeDiff(const float* ref, const char* tag) {
+        if (!SDK::g_localPlayer || g_probeN <= 0) return;
+        for (int i = 0; i < g_probeN; ++i) {
+            float now = SafeRead<float>((uintptr_t)SDK::g_localPlayer + g_probe[i].off, 0.f);
+            if (now != ref[i])
+                Log("[%s] float %s @0x%X %.4f -> %.4f", tag, g_probe[i].name, g_probe[i].off, ref[i], now);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     //  main thread — SO chama Combat::Tick
     // -----------------------------------------------------------------------
     typedef void(__fastcall* tLateUpdate)(void* self, void* method);
@@ -241,11 +344,39 @@ namespace Hooks {
 
     static void __fastcall hk_lateUpdate(void* self, void* method) {
         PHASE("hk_lateUpdate");
+
+        const bool isLocalInst = (!g_mainIsPlayerClass.load() ||
+            !SDK::g_localPlayer || self == SDK::g_localPlayer);
+        const bool watch = isLocalInst && g_lastShotMs.load() &&
+            (GetTickCount64() - g_lastShotMs.load() < 150) &&
+            g_frameProbeFrames < 20 && g_watchLines < WATCH_MAX_LINES;
+
         if (o_lateUpdate) o_lateUpdate(self, method);
 
-        // >>> FIX: so filtra por instancia se o hook for numa classe de player.
-        //     Se for singleton (GameManager/Game/HUD), self nunca == g_localPlayer
-        //     e o Combat::Tick morria inteiro.
+        // >>> FIX: mata o recoil. O camTf TEM que seguir o playerRot (mira
+        //     limpa). O kick deixa os dois diferentes e o camTf acumula.
+        if (isLocalInst) ApplyNoRecoil();
+
+        Quat r1{ 0.f, 0.f, 0.f, 1.f }, p1{ 0.f, 0.f, 0.f, 1.f };
+        Il2CppObject* camTf = nullptr;
+        if (watch) {
+            if (g_probeN < 0) CollectProbeFields(ClassOf(SDK::g_localPlayer));
+            camTf = SDK::CamTfObj();
+            if (camTf) SDK::GetRot(camTf, r1);
+            if (SDK::g_localPlayer) p1 = SDK::GetPlayerRot(SDK::g_localPlayer);
+
+            ++g_frameProbeFrames;
+            ++g_watchLines;
+
+            Log("[watch] f%d camTf (%.4f,%.4f,%.4f,%.4f) playerRot (%.4f,%.4f,%.4f,%.4f) preTiroCam (%.4f,%.4f,%.4f,%.4f)",
+                g_frameProbeFrames,
+                r1.x, r1.y, r1.z, r1.w,
+                p1.x, p1.y, p1.z, p1.w,
+                g_pendingCam.x, g_pendingCam.y, g_pendingCam.z, g_pendingCam.w);
+
+            ProbeSnapshot(g_frameBefore);
+        }
+
         if (g_mainIsPlayerClass.load() && SDK::g_localPlayer && self != SDK::g_localPlayer)
             return;
 
@@ -287,17 +418,10 @@ namespace Hooks {
     }
 
     // =======================================================================
-    //  FIRE BULLET
-    //  Assinatura NATIVA real (lida do metadata no log):
-    //      (self, Int32, Single, Vector3, Vector3, Boolean, Double, Int32)
-    //
-    //  >>> FIX: NAO existe parametro MethodInfo* aqui.
-    //  O IL2CPP OMITE o MethodInfo* quando o metodo nao usa esse parametro.
-    //  Antes, com o MethodInfo* declarado, o "m" recebia 0,1,2,... e TODOS os
-    //  argumentos ficavam deslocados um registrador -> o original dava AV e a
-    //  bala nunca spawnava (arma atirava mas nao dava dano).
+    //  FIRE BULLET — (self, Int32, Single, Vector3, Vector3, Boolean, Double,
+    //  Int32), retorna System.Boolean, sem MethodInfo*.
     // =======================================================================
-    typedef void(__fastcall* tFire7)(void* self, int32_t a1, float a2, Vec3 a3, Vec3 a4,
+    typedef bool(__fastcall* tFire7)(void* self, int32_t a1, float a2, Vec3 a3, Vec3 a4,
         bool a5, double a6, int32_t a7);
     static tFire7 o_fire7 = nullptr;
 
@@ -309,132 +433,122 @@ namespace Hooks {
         PHASE("hk_fire7");
         g_fireCalls.fetch_add(1, std::memory_order_relaxed);
 
+        const bool isLocal = (SDK::g_localPlayer && self == SDK::g_localPlayer);
+        Il2CppObject* camTf = isLocal ? SDK::CamTfObj() : nullptr;
+
+        Quat camBefore{ 0.f, 0.f, 0.f, 1.f };
+        bool haveRot = false;
+        const bool aiming = (C.aimbot && C.aimKeyDown && SDK::g_aimTarget);
+
         __try {
-            // loga os 3 primeiros tiros pra confirmar o layout dos parametros
-            // (|a3| ou |a4| tem que ser ~1 = vetor de direcao)
             if (g_fireLogged < 3) {
                 ++g_fireLogged;
-                Log("[fire7] self=%p a1=%d a2=%.3f a3=(%.1f,%.1f,%.1f)|a3|=%.2f a4=(%.1f,%.1f,%.1f)|a4|=%.2f a5=%d a6=%.3f a7=%d",
-                    self, a1, (double)a2,
+                Log("[fire7] self=%p a1=%d(%p) a2=%.3f a3=(%.1f,%.1f,%.1f)|a3|=%.2f a4=(%.1f,%.1f,%.1f)|a4|=%.2f a5=%d a6=%.3f a7=%d",
+                    self, a1, (void*)(intptr_t)a1, (double)a2,
                     a3.x, a3.y, a3.z, (double)a3.len(),
                     a4.x, a4.y, a4.z, (double)a4.len(),
                     (int)a5, a6, a7);
             }
 
-            // silent aim / magic bullets: sobrescreve o parametro que for a
-            // DIRECAO (o vetor unitario; o outro e a posicao de spawn)
-            bool isLocal = SDK::g_localPlayer && self == SDK::g_localPlayer;
+            if (isLocal && camTf) {
+                haveRot = SDK::GetRot(camTf, camBefore);
+
+                // aim lock
+                if (aiming && haveRot) {
+                    Vec3 me = SDK::GetPos(camTf);
+                    Vec3 tp = SDK::TargetAimPos(SDK::g_aimTarget, C.aimBone);
+                    if (tp.zero()) tp = SDK::GetPos(SDK::g_aimTarget);
+                    Vec3 d{ tp.x - me.x, tp.y - me.y, tp.z - me.z };
+                    float L = d.len();
+                    if (L > 0.0001f) {
+                        Quat q = SDK::LookRot(d * (1.f / L));
+                        SDK::SetRot(camTf, q);
+                        SDK::SetPlayerRot(SDK::g_localPlayer, q);
+                    }
+                }
+
+                if (C.noRecoil) g_pendingCam = camBefore;   // so p/ log
+            }
+
+            // silent aim / magic bullets
             if (isLocal && SDK::g_aimTarget && g_silentAimActive &&
                 (C.silentAim || C.magicBullets)) {
                 float d3 = fabsf(a3.len() - 1.f);
                 float d4 = fabsf(a4.len() - 1.f);
-                Vec3* dir = (d4 <= d3) ? &a4 : &a3;
                 if ((d4 <= d3 ? d4 : d3) < 0.30f) {
-                    *dir = g_silentAimDir;
-                    static uint32_t n = 0;
-                    if ((n++ % 25u) == 0)
-                        Log("[fire7] dir sobrescrita self=%p |a3|=%.2f |a4|=%.2f dir=%.2f,%.2f,%.2f",
-                            self, (double)a3.len(), (double)a4.len(),
-                            g_silentAimDir.x, g_silentAimDir.y, g_silentAimDir.z);
+                    int slot = (d4 <= d3) ? 1 : 0;
+                    if (SDK::g_fireDirSlot.load() != slot) {
+                        SDK::g_fireDirSlot.store(slot);
+                        Log("[fire7] direcao = param%d", slot + 3);
+                    }
+                    if (slot == 1) a4 = g_silentAimDir; else a3 = g_silentAimDir;
                 }
             }
+
+            if (isLocal && g_probeShots < 6) {
+                if (g_probeN < 0) CollectProbeFields(ClassOf(self));
+                ProbeSnapshot(g_probeBefore);
+            }
         }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("[crash] hk_fire7 pegou AV");
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] hk_fire7 pre"); }
+
+        bool ret = false;
+        __try { ret = o_fire7 ? o_fire7(self, a1, a2, a3, a4, a5, a6, a7) : false; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[crash] hk_fire7 original AV"); }
+
+        // mata o kick se ele cair dentro do FireBullet (e reforca a mira limpa)
+        if (isLocal) ApplyNoRecoil();
+
+        if (isLocal) {
+            g_lastShotMs.store(GetTickCount64());
+            g_frameProbeFrames = 0;
+            g_watchLines = 0;
+
+            if (g_probeShots < 6 && camTf) {
+                Quat r1{ 0.f, 0.f, 0.f, 1.f };
+                SDK::GetRot(camTf, r1);
+                Log("[probe] camTf rot (%.4f,%.4f,%.4f,%.4f) -> (%.4f,%.4f,%.4f,%.4f)",
+                    camBefore.x, camBefore.y, camBefore.z, camBefore.w, r1.x, r1.y, r1.z, r1.w);
+                ProbeDiff(g_probeBefore, "probe");
+                Log("[probe] ---- fim diff tiro %d ----", ++g_probeShots);
+            }
+        }
+    }
+
+    // =======================================================================
+    //  FIRE ONE SHOT — nao e chamado no cliente (no-op informativo)
+    // =======================================================================
+    typedef void(__fastcall* tFireOne)(void* self, int32_t a1, float a2, Vec3 a3, Vec3 a4,
+        uint8_t a5, uint8_t a6, double a7, int32_t a8, int64_t a9);
+    static tFireOne o_fireOne = nullptr;
+    static int      g_fireOneLogged = 0;
+
+    static void __fastcall hk_fireOne(void* self, int32_t a1, float a2, Vec3 a3, Vec3 a4,
+        uint8_t a5, uint8_t a6, double a7, int32_t a8, int64_t a9) {
+        PHASE("hk_fireOne");
+
+        if (g_fireOneLogged < 3) {
+            ++g_fireOneLogged;
+            Log("[fireOne] self=%p a1=%d(%p) a2=%.3f |a3|=%.2f |a4|=%.2f a5=%d a6=%d a7=%.2f a8=%d a9=%lld",
+                self, a1, (void*)(intptr_t)a1, (double)a2,
+                (double)a3.len(), (double)a4.len(), (int)a5, (int)a6, a7, a8, (long long)a9);
         }
 
-        if (o_fire7) o_fire7(self, a1, a2, a3, a4, a5, a6, a7);
+        if (o_fireOne) o_fireOne(self, a1, a2, a3, a4, a5, a6, a7, a8, a9);
 
-        static ULONGLONG lastLog = 0;
-        ULONGLONG now = GetTickCount64();
-        if (now - lastLog > 1000) {
-            lastLog = now;
-            Log("[fire7] chamadas=%u isLocal=%d alvo=%p silent=%d magic=%d",
-                g_fireCalls.load(), (int)(SDK::g_localPlayer && self == SDK::g_localPlayer),
-                SDK::g_aimTarget, (int)C.silentAim, (int)C.magicBullets);
-        }
+        ApplyNoRecoil();
     }
 
     // -----------------------------------------------------------------------
-    //  hooks de tiro 0-param (fallback, com rotacao da camera)
+    //  shoot (nunca chamado, mantido)
     // -----------------------------------------------------------------------
-    typedef void(__fastcall* tShoot)(void* self, const MethodInfo* m);
+    typedef void(__fastcall* tShoot)(void* self, void* method);
+    static tShoot o_shoot1 = nullptr, o_shoot2 = nullptr, o_shoot3 = nullptr, o_shoot4 = nullptr;
 
-    static std::atomic<uint32_t> g_shootCalls{ 0 };
-
-    static tShoot o_shoot1 = nullptr;
-    static tShoot o_shoot2 = nullptr;
-    static tShoot o_shoot3 = nullptr;
-    static tShoot o_shoot4 = nullptr;
-
-    static void ShootBody(void* self, const MethodInfo* m, tShoot orig) {
-        PHASE("hk_shoot");
-        g_shootCalls.fetch_add(1, std::memory_order_relaxed);
-
-        bool isLocal = (!SDK::g_localPlayer || self == SDK::g_localPlayer);
-
-        Quat original{};
-        bool has = false;
-        if (isLocal && C.aimbot && C.aimKeyDown && SDK::g_aimTarget && SDK::g_localPlayer) {
-            if (SDK::AimLock(SDK::g_aimTarget, original)) has = true;
-        }
-
-        if (orig) orig(self, m);
-
-        // magic bullets: atira no alvo (quando o FireBullet direto nao esta hookado)
-        if (isLocal && C.magicBullets && SDK::g_aimTarget && SDK::FireBulletReady()) {
-            Vec3 tp = SDK::TargetAimPos(SDK::g_aimTarget, C.aimBone);
-            if (!tp.zero()) SDK::FireBulletAt(tp);
-        }
-
-        if (has && SDK::g_localPlayer) SDK::RestoreAim(SDK::g_localPlayer, original);
-
-        static ULONGLONG lastLog = 0;
-        ULONGLONG now = GetTickCount64();
-        if (now - lastLog > 1000) {
-            lastLog = now;
-            Log("[shoot] chamadas=%u isLocal=%d aimTarget=%p keyDown=%d silent=%d magic=%d",
-                g_shootCalls.load(), (int)isLocal, SDK::g_aimTarget,
-                (int)C.aimKeyDown, (int)C.silentAim, (int)C.magicBullets);
-        }
-    }
-
-    static void __fastcall hk_shoot1(void* s, const MethodInfo* m) { ShootBody(s, m, o_shoot1); }
-    static void __fastcall hk_shoot2(void* s, const MethodInfo* m) { ShootBody(s, m, o_shoot2); }
-    static void __fastcall hk_shoot3(void* s, const MethodInfo* m) { ShootBody(s, m, o_shoot3); }
-    static void __fastcall hk_shoot4(void* s, const MethodInfo* m) { ShootBody(s, m, o_shoot4); }
-
-    // -----------------------------------------------------------------------
-    //  recoil (DESLIGADO por padrao — ABI incerta; ver #define no topo)
-    // -----------------------------------------------------------------------
-    typedef Quat(__fastcall* tRecoilF)(void*, const MethodInfo*, float, float, float, float);
-    typedef Quat(__fastcall* tRecoilP)(void*, const MethodInfo*, void*, void*, void*, void*);
-    static tRecoilF o_recoilF = nullptr;
-    static tRecoilP o_recoilP = nullptr;
-
-    static Quat __fastcall hk_recoil_f(void* self, const MethodInfo* m,
-        float a1, float a2, float a3, float a4) {
-        if (C.noRecoil) return Quat{ 0.f, 0.f, 0.f, 1.f };
-        return o_recoilF ? o_recoilF(self, m, a1, a2, a3, a4) : Quat{ 0.f, 0.f, 0.f, 1.f };
-    }
-
-    static Quat __fastcall hk_recoil_p(void* self, const MethodInfo* m,
-        void* a1, void* a2, void* a3, void* a4) {
-        if (C.noRecoil) return Quat{ 0.f, 0.f, 0.f, 1.f };
-        return o_recoilP ? o_recoilP(self, m, a1, a2, a3, a4) : Quat{ 0.f, 0.f, 0.f, 1.f };
-    }
-
-    static bool AllParamsFloat(const MethodInfo* m) {
-        uint32_t pc = il2cpp_method_get_param_count(m);
-        if (pc == 0) return false;
-        for (uint32_t i = 0; i < pc && i < 4; ++i) {
-            const Il2CppType* t = il2cpp_method_get_param(m, i);
-            if (!t) return false;
-            const char* tn = il2cpp_type_get_name(t);
-            if (!tn || !strstr(tn, "Single")) return false;
-        }
-        return true;
-    }
+    static void __fastcall hk_shoot1(void* s, void* m) { if (o_shoot1) o_shoot1(s, m); }
+    static void __fastcall hk_shoot2(void* s, void* m) { if (o_shoot2) o_shoot2(s, m); }
+    static void __fastcall hk_shoot3(void* s, void* m) { if (o_shoot3) o_shoot3(s, m); }
+    static void __fastcall hk_shoot4(void* s, void* m) { if (o_shoot4) o_shoot4(s, m); }
 
     bool InstallCombat() {
         PHASE("InstallCombat");
@@ -461,62 +575,50 @@ namespace Hooks {
                     if (++n >= 4) break;
                 }
             }
+
+            MethodInfo* fos = FindMethodByArity(ps, "FireOneShot", 9);
+            if (fos) {
+                void* p = SDK::MethodPtr(fos);
+                Log("[hooks] FireOneShot: ret=%s ptr=%p", SDK::MethodReturnName(fos), p);
+                if (p && MH_CreateHook(p, &hk_fireOne, (void**)&o_fireOne) == MH_OK) {
+                    MH_EnableHook(p);
+                    ok = true;
+                    Log("[hooks] hook FireOneShot OK (anti-recoil)");
+                }
+            }
+            else Log("[hooks] FireOneShot/9 nao encontrado");
         }
         else Log("[hooks] PlayerScript nulo");
 
-        // ---- FireBullet (silent aim / magic bullets) ----
         if (SDK::M_FireBullet) {
             uint32_t pc = il2cpp_method_get_param_count(SDK::M_FireBullet);
             void* p = SDK::MethodPtr(SDK::M_FireBullet);
-            Log("[hooks] FireBullet: params=%u ptr=%p", pc, p);
+            Log("[hooks] FireBullet: params=%u ret=%s ptr=%p", pc,
+                SDK::MethodReturnName(SDK::M_FireBullet), p);
             if (p && pc == 7 && MH_CreateHook(p, &hk_fire7, (void**)&o_fire7) == MH_OK) {
                 MH_EnableHook(p);
                 ok = true;
-                Log("[hooks] hook FireBullet OK (7 params, SEM MethodInfo)");
+                Log("[hooks] hook FireBullet OK (7 params, ret bool)");
             }
         }
         else Log("[hooks] M_FireBullet nulo");
-
-        // ---- recoil (informativo + hook opcional) ----
-        if (!SDK::M_recoil && ps) {
-            SDK::M_recoil = FindMethodAny(ps, "ComputeShotRecoil");
-            if (!SDK::M_recoil) SDK::M_recoil = FindMethodAny(ps, "ShotRecoil");
-        }
-
-        if (SDK::M_recoil) {
-            uint32_t pc = il2cpp_method_get_param_count(SDK::M_recoil);
-            void* p = SDK::MethodPtr(SDK::M_recoil);
-            Log("[hooks] recoil: params=%u ptr=%p allFloat=%d hook=%d",
-                pc, p, (int)AllParamsFloat(SDK::M_recoil), (int)ENABLE_RECOIL_HOOK);
-
-#if ENABLE_RECOIL_HOOK
-            if (p && AllParamsFloat(SDK::M_recoil) && pc > 0 && pc <= 4) {
-                if (MH_CreateHook(p, &hk_recoil_f, (void**)&o_recoilF) == MH_OK) {
-                    MH_EnableHook(p); ok = true; Log("[hooks] hook recoil OK (float)");
-                }
-            }
-            else if (p && MH_CreateHook(p, &hk_recoil_p, (void**)&o_recoilP) == MH_OK) {
-                MH_EnableHook(p); ok = true; Log("[hooks] hook recoil OK (ptr/0arg)");
-            }
-#else
-            (void)p; (void)pc;
-#endif
-        }
-        else Log("[hooks] M_recoil nulo");
 
         return ok;
     }
 
     // -----------------------------------------------------------------------
     void ApplyFeatures() {
-        Log("[hooks] ApplyFeatures: noRecoil=%d noSpread=%d infAmmo=%d speed=%d antiCheat=%d",
-            (int)C.noRecoil, (int)C.noSpread, (int)C.infAmmo, (int)C.speedHack, (int)C.antiCheat);
+        Log("[hooks] ApplyFeatures: noRecoil=%d noSpread=%d infAmmo=%d rapidFire=%d noReload=%d silent=%d",
+            (int)C.noRecoil, (int)C.noSpread, (int)C.infAmmo, (int)C.rapidFire,
+            (int)C.noReload, (int)C.silentAim);
     }
 
     bool Init() {
         if (g_mhInit) return true;
         if (MH_Initialize() != MH_OK) { Log("[hooks] MH_Initialize FALHOU"); return false; }
         g_mhInit = true;
+
+        if (!g_imCsInit) { InitializeCriticalSection(&g_imCs); g_imCsInit = true; }
 
         InstallSwap();
         InstallMainThread();
@@ -538,6 +640,8 @@ namespace Hooks {
         if (!g_mhInit) return;
         g_sdkReady = false;
         g_hooksLive = false;
+        SDK::g_recoilHookActive = false;
+        g_frameOpen = false;
 
         if (o_wndProc && g_hwnd) {
             SetWindowLongPtrA(g_hwnd, GWLP_WNDPROC, (LONG_PTR)o_wndProc);
@@ -546,6 +650,7 @@ namespace Hooks {
         MH_DisableHook(MH_ALL_HOOKS);
         MH_Uninitialize();
         g_mhInit = false;
+        g_imguiInit = false;
         Log("[hooks] Shutdown");
     }
 

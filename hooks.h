@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include "imgui.h"
 #include <atomic>
 
 namespace Hooks {
@@ -17,4 +18,6 @@ namespace Hooks {
     void Shutdown();
     void ApplyFeatures();
     void HandleKeys();
+
+    ImFont* SafeFont(int idx);
 }

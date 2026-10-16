@@ -10,7 +10,15 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
 #include <windows.h>
+
+// il2cpp_method_get_return_type — declarado aqui (extern "C" identico ao padrao
+// do il2cpp_api.h) para o hooks.cpp poder escolher a ABI do hook de recoil.
+// Se tambem adicionar em il2cpp_api.h, mantenha o MESMO tipo.
+extern "C" {
+    extern Il2CppType* (*il2cpp_method_get_return_type)(const MethodInfo*);
+}
 
 namespace Hooks { extern int g_viewW; extern int g_viewH; }
 
@@ -40,7 +48,7 @@ struct Target {
     bool   alive = false;
     bool   enemy = true;
     bool   npc = false;
-    bool   visible = false;          // visual check (LOS)
+    bool   visible = false;
 
     int    team = 0;
     int    weapon = 0;
@@ -55,7 +63,6 @@ struct Target {
 
 namespace SDK {
 
-    // cache de classes (usado pelo hooks p/ varredura global)
     extern std::unordered_map<std::string, Il2CppClass*> g_classes;
     extern std::mutex g_classesMx;
 
@@ -104,6 +111,13 @@ namespace SDK {
     extern bool  g_viewProjOk;
     extern float g_viewProj[16];
 
+    // slot do parametro que e a DIRECAO no FireBullet (0 = a3, 1 = a4)
+    extern std::atomic<int>  g_fireDirSlot;
+    // hook de recoil ativo (se true, noRecoil nao usa fallback de rotacao)
+    extern std::atomic<bool> g_recoilHookActive;
+    // o campo de cadencia resolvido e RPM (e nao um delay em segundos)
+    extern bool g_rateIsRpm;
+
     int           ScreenW();
     int           ScreenH();
     Il2CppObject* CameraObj();
@@ -125,6 +139,7 @@ namespace SDK {
     Vec3  GetPos(Il2CppObject* o);
     void  SetPos(Il2CppObject* o, Vec3 v);
     Vec3  GetVelocity(Il2CppObject* o);
+    Vec3  MuzzlePos();
 
     Il2CppObject* FindBoneContains(Il2CppObject* root, const char* sub, int budget = 8192);
     Vec3  GetBonePos(void* bone);
@@ -163,6 +178,7 @@ namespace SDK {
     void  LockTargets();
     void  UnlockTargets();
     void* MethodPtr(MethodInfo* m);
+    const char* MethodReturnName(MethodInfo* m);
 
     bool  HasLineOfSight(Vec3 eye, Vec3 aim);
     bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);
@@ -170,8 +186,10 @@ namespace SDK {
     float CameraCotHalfFovY();
 
     Il2CppObject* FindGunStatsObj();
+
     int  ResolveWeaponFields(Il2CppObject* stats, uint32_t& cur, uint32_t& max,
-        uint32_t& reload, uint32_t& spread, uint32_t& rate, uint32_t& dmg);
+        uint32_t& reserve, uint32_t& reload, uint32_t& spread,
+        uint32_t& rate, uint32_t& dmg);
     void DumpFieldsWithValues(Il2CppObject* o);
 }
 
@@ -221,3 +239,5 @@ using SDK::SetPlayerRot;
 using SDK::GetPlayerRot;
 using SDK::FireBulletReady;
 using SDK::FireBulletAt;
+using SDK::MuzzlePos;
+using SDK::MethodReturnName;
