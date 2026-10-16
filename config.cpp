@@ -1,6 +1,9 @@
 #include "config.h"
 #include "common.h"
 
+#include <cstdio>
+#include <cstring>
+
 extern HMODULE g_hModule;
 
 Config  g_cfg;
@@ -8,7 +11,7 @@ Config& C = g_cfg;
 
 // ---------------------------------------------------------------------
 static const char* CfgPath() {
-    static char buf[MAX_PATH] = {};
+    static char buf[MAX_PATH] = { 0 };
     if (!buf[0]) {
         GetModuleFileNameA(g_hModule, buf, MAX_PATH);
         char* p = strrchr(buf, '\\');
@@ -40,15 +43,19 @@ namespace ConfigIO {
         S_B(esp); S_B(espBox); S_B(espFill); S_B(espName); S_B(espHealth);
         S_B(espHealthNum); S_B(espWeapon); S_B(espDistance); S_B(espSnapline);
         S_B(espSkeleton); S_B(espNpc); S_B(teamCheck); S_B(fps);
+        // >>> visual check (verde/vermelho) + linha do centro ate o inimigo
+        S_B(espVisCheck); S_B(espVisLine);
         S_F(espThickness); S_F(espMaxDist); S_F(espFontSize);
         S_F(espOffY); S_F(espScaleY); S_F(espBodyH);
         WCol(f, "espColor", g_cfg.espColor);
         WCol(f, "espBoxColor", g_cfg.espBoxColor);
         WCol(f, "espTextColor", g_cfg.espTextColor);
         WCol(f, "espSkelColor", g_cfg.espSkelColor);
+        WCol(f, "visColor", g_cfg.visColor);
+        WCol(f, "noVisColor", g_cfg.noVisColor);
 
         S_B(aimbot); S_I(aimKey); S_F(aimFov); S_F(aimSmooth); S_I(aimBone);
-        S_I(aimMode); S_B(aimVisible); S_B(aimTeam); S_B(aimRotate);
+        S_I(aimMode); S_B(aimVisible); S_B(aimVisCheck); S_B(aimTeam); S_B(aimRotate);
         S_B(showFovCircle); S_F(aimMaxDist);
         WCol(f, "aimColor", g_cfg.aimColor);
 
@@ -102,12 +109,14 @@ namespace ConfigIO {
             L_B(esp); L_B(espBox); L_B(espFill); L_B(espName); L_B(espHealth);
             L_B(espHealthNum); L_B(espWeapon); L_B(espDistance); L_B(espSnapline);
             L_B(espSkeleton); L_B(espNpc); L_B(teamCheck); L_B(fps);
+            L_B(espVisCheck); L_B(espVisLine);
             L_F(espThickness); L_F(espMaxDist); L_F(espFontSize);
             L_F(espOffY); L_F(espScaleY); L_F(espBodyH);
             L_C(espColor); L_C(espBoxColor); L_C(espTextColor); L_C(espSkelColor);
+            L_C(visColor); L_C(noVisColor);
 
             L_B(aimbot); L_I(aimKey); L_F(aimFov); L_F(aimSmooth); L_I(aimBone);
-            L_I(aimMode); L_B(aimVisible); L_B(aimTeam); L_B(aimRotate);
+            L_I(aimMode); L_B(aimVisible); L_B(aimVisCheck); L_B(aimTeam); L_B(aimRotate);
             L_B(showFovCircle); L_F(aimMaxDist);
             L_C(aimColor);
 

@@ -87,7 +87,7 @@ namespace Menu {
                 ImGui::Checkbox("Magic bullets", &C.magicBullets);
 
                 ImGui::Separator();
-                ImGui::SliderFloat("FOV (graus)", &C.aimFov, 1.f, 90.f, "%.0f");
+                ImGui::SliderFloat("FOV", &C.aimFov, 1.f, 180.f, "%.0f");
                 ImGui::SliderFloat("Smooth", &C.aimSmooth, 1.f, 20.f, "%.1f");
                 ImGui::Combo("Osso", &C.aimBone, "Cabeca\0Pescoco\0Peito\0");
                 ImGui::Combo("Modo", &C.aimMode, "Mais perto da mira\0Menor vida\0Mais perto\0");
@@ -114,6 +114,15 @@ namespace Menu {
                 ImGui::Checkbox("Preenchido", &C.espFill);
                 ImGui::Checkbox("Ignorar time", &C.teamCheck);
                 ImGui::Checkbox("Ignorar NPCs", &C.espNpc);
+
+                // >>> NOVO: visual check + linha do centro ate o inimigo
+                ImGui::Separator();
+                ImGui::Checkbox("Visual check (verde/vermelho)", &C.espVisCheck);
+                if (C.espVisCheck) {
+                    ImGui::Checkbox("Linha do centro ate o inimigo", &C.espVisLine);
+                    ImGui::ColorEdit4("Cor visivel", C.visColor);
+                    ImGui::ColorEdit4("Cor parede", C.noVisColor);
+                }
 
                 ImGui::Separator();
                 ImGui::SliderFloat("Espessura", &C.espThickness, 0.5f, 6.f, "%.1f");
@@ -180,7 +189,7 @@ namespace Menu {
                 KeyBind("Tecla do menu", &C.menuKey);
                 KeyBind("Tecla panic", &C.panicKey);
                 KeyBind("Tecla salvar", &C.saveKey);
-                KeyBind("Tecla desacarregar", &C.unloadKey);
+                KeyBind("Tecla descarregar", &C.unloadKey);
                 ImGui::EndTabItem();
             }
 

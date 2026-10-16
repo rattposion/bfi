@@ -1,13 +1,22 @@
 // ============================================================================
 //  hooks.cpp — hooks + orquestracao de teclas.
 //  hk_lateUpdate chama SO Combat::Tick (sem tick duplicado).
-//  Filtro "self == g_localPlayer" so vale se o hook caiu numa classe
-//  por-instancia-de-player; se cair num singleton, roda 1x por frame.
+//
+//  >>> FIX desta versao:
+//   1) hk_fire7 SEM o parametro MethodInfo* (o IL2CPP OMITE esse parametro no
+//      PlayerScript::FireBullet). Antes o "m" recebia 0,1,2,... e todos os
+//      argumentos ficavam deslocados -> AV + bala nao spawnava (arma atirava
+//      mas nao dava dano).
+//   2) hook de recoil (ComputeShotRecoil) DESLIGADO por padrao (ABI incerta).
+//      noRecoil segue funcionando pelo restore de rotacao do ShootBody.
+//   3) corpo do hk_fire7 dentro de __try/__except pra nao derrubar o jogo.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <atomic>
+#include <cmath>
 #include <GL/gl.h>
 
 #include "MinHook.h"
@@ -26,6 +35,16 @@
 
 #pragma comment(lib, "opengl32.lib")
 
+// >>> FIX: liga/desliga o hook de recoil (ABI incerta). 0 = desligado.
+#define ENABLE_RECOIL_HOOK 0
+
+// ---------------------------------------------------------------------------
+//  Estado exposto pelo aimbot.cpp (usado pelo hk_fire7)
+// ---------------------------------------------------------------------------
+extern bool g_silentAimActive;
+extern bool g_magicBulletsActive;
+extern Vec3 g_silentAimDir;
+
 namespace Hooks {
 
     std::atomic<bool> g_imguiReady{ false };
@@ -38,7 +57,7 @@ namespace Hooks {
     static std::atomic<uint32_t> g_frameCounter{ 0 };
     static uint32_t g_lastTickFrame = 0xFFFFFFFF;
 
-    // o metodo hookado e uma instancia de player?
+    // o metodo hookado e uma instancia de player? (usado pelo hk_lateUpdate)
     static std::atomic<bool> g_mainIsPlayerClass{ false };
 
     static bool KeyDown(int vk) { return vk ? (GetAsyncKeyState(vk) & 0x8000) != 0 : false; }
@@ -152,6 +171,7 @@ namespace Hooks {
     }
 
     static BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
+        PHASE("hk_swap");
         g_frameCounter.fetch_add(1, std::memory_order_relaxed);
 
         HWND hwnd = WindowFromDC(hdc);
@@ -220,9 +240,12 @@ namespace Hooks {
     static tLateUpdate o_lateUpdate = nullptr;
 
     static void __fastcall hk_lateUpdate(void* self, void* method) {
+        PHASE("hk_lateUpdate");
         if (o_lateUpdate) o_lateUpdate(self, method);
 
-        // so filtra por instancia se o hook for numa classe de player.
+        // >>> FIX: so filtra por instancia se o hook for numa classe de player.
+        //     Se for singleton (GameManager/Game/HUD), self nunca == g_localPlayer
+        //     e o Combat::Tick morria inteiro.
         if (g_mainIsPlayerClass.load() && SDK::g_localPlayer && self != SDK::g_localPlayer)
             return;
 
@@ -263,8 +286,77 @@ namespace Hooks {
         return false;
     }
 
+    // =======================================================================
+    //  FIRE BULLET
+    //  Assinatura NATIVA real (lida do metadata no log):
+    //      (self, Int32, Single, Vector3, Vector3, Boolean, Double, Int32)
+    //
+    //  >>> FIX: NAO existe parametro MethodInfo* aqui.
+    //  O IL2CPP OMITE o MethodInfo* quando o metodo nao usa esse parametro.
+    //  Antes, com o MethodInfo* declarado, o "m" recebia 0,1,2,... e TODOS os
+    //  argumentos ficavam deslocados um registrador -> o original dava AV e a
+    //  bala nunca spawnava (arma atirava mas nao dava dano).
+    // =======================================================================
+    typedef void(__fastcall* tFire7)(void* self, int32_t a1, float a2, Vec3 a3, Vec3 a4,
+        bool a5, double a6, int32_t a7);
+    static tFire7 o_fire7 = nullptr;
+
+    static std::atomic<uint32_t> g_fireCalls{ 0 };
+    static int g_fireLogged = 0;
+
+    static void __fastcall hk_fire7(void* self, int32_t a1, float a2, Vec3 a3, Vec3 a4,
+        bool a5, double a6, int32_t a7) {
+        PHASE("hk_fire7");
+        g_fireCalls.fetch_add(1, std::memory_order_relaxed);
+
+        __try {
+            // loga os 3 primeiros tiros pra confirmar o layout dos parametros
+            // (|a3| ou |a4| tem que ser ~1 = vetor de direcao)
+            if (g_fireLogged < 3) {
+                ++g_fireLogged;
+                Log("[fire7] self=%p a1=%d a2=%.3f a3=(%.1f,%.1f,%.1f)|a3|=%.2f a4=(%.1f,%.1f,%.1f)|a4|=%.2f a5=%d a6=%.3f a7=%d",
+                    self, a1, (double)a2,
+                    a3.x, a3.y, a3.z, (double)a3.len(),
+                    a4.x, a4.y, a4.z, (double)a4.len(),
+                    (int)a5, a6, a7);
+            }
+
+            // silent aim / magic bullets: sobrescreve o parametro que for a
+            // DIRECAO (o vetor unitario; o outro e a posicao de spawn)
+            bool isLocal = SDK::g_localPlayer && self == SDK::g_localPlayer;
+            if (isLocal && SDK::g_aimTarget && g_silentAimActive &&
+                (C.silentAim || C.magicBullets)) {
+                float d3 = fabsf(a3.len() - 1.f);
+                float d4 = fabsf(a4.len() - 1.f);
+                Vec3* dir = (d4 <= d3) ? &a4 : &a3;
+                if ((d4 <= d3 ? d4 : d3) < 0.30f) {
+                    *dir = g_silentAimDir;
+                    static uint32_t n = 0;
+                    if ((n++ % 25u) == 0)
+                        Log("[fire7] dir sobrescrita self=%p |a3|=%.2f |a4|=%.2f dir=%.2f,%.2f,%.2f",
+                            self, (double)a3.len(), (double)a4.len(),
+                            g_silentAimDir.x, g_silentAimDir.y, g_silentAimDir.z);
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[crash] hk_fire7 pegou AV");
+        }
+
+        if (o_fire7) o_fire7(self, a1, a2, a3, a4, a5, a6, a7);
+
+        static ULONGLONG lastLog = 0;
+        ULONGLONG now = GetTickCount64();
+        if (now - lastLog > 1000) {
+            lastLog = now;
+            Log("[fire7] chamadas=%u isLocal=%d alvo=%p silent=%d magic=%d",
+                g_fireCalls.load(), (int)(SDK::g_localPlayer && self == SDK::g_localPlayer),
+                SDK::g_aimTarget, (int)C.silentAim, (int)C.magicBullets);
+        }
+    }
+
     // -----------------------------------------------------------------------
-    //  combate — hooka TODOS os metodos de tiro conhecidos
+    //  hooks de tiro 0-param (fallback, com rotacao da camera)
     // -----------------------------------------------------------------------
     typedef void(__fastcall* tShoot)(void* self, const MethodInfo* m);
 
@@ -276,11 +368,11 @@ namespace Hooks {
     static tShoot o_shoot4 = nullptr;
 
     static void ShootBody(void* self, const MethodInfo* m, tShoot orig) {
+        PHASE("hk_shoot");
         g_shootCalls.fetch_add(1, std::memory_order_relaxed);
 
         bool isLocal = (!SDK::g_localPlayer || self == SDK::g_localPlayer);
 
-        // silent aim: gira antes do tiro e restaura depois
         Quat original{};
         bool has = false;
         if (isLocal && C.aimbot && C.aimKeyDown && SDK::g_aimTarget && SDK::g_localPlayer) {
@@ -289,7 +381,7 @@ namespace Hooks {
 
         if (orig) orig(self, m);
 
-        // magic bullets: dispara um projetil no alvo
+        // magic bullets: atira no alvo (quando o FireBullet direto nao esta hookado)
         if (isLocal && C.magicBullets && SDK::g_aimTarget && SDK::FireBulletReady()) {
             Vec3 tp = SDK::TargetAimPos(SDK::g_aimTarget, C.aimBone);
             if (!tp.zero()) SDK::FireBulletAt(tp);
@@ -312,7 +404,9 @@ namespace Hooks {
     static void __fastcall hk_shoot3(void* s, const MethodInfo* m) { ShootBody(s, m, o_shoot3); }
     static void __fastcall hk_shoot4(void* s, const MethodInfo* m) { ShootBody(s, m, o_shoot4); }
 
-    // recoil: duas assinaturas (params float x params ponteiro)
+    // -----------------------------------------------------------------------
+    //  recoil (DESLIGADO por padrao — ABI incerta; ver #define no topo)
+    // -----------------------------------------------------------------------
     typedef Quat(__fastcall* tRecoilF)(void*, const MethodInfo*, float, float, float, float);
     typedef Quat(__fastcall* tRecoilP)(void*, const MethodInfo*, void*, void*, void*, void*);
     static tRecoilF o_recoilF = nullptr;
@@ -343,6 +437,7 @@ namespace Hooks {
     }
 
     bool InstallCombat() {
+        PHASE("InstallCombat");
         bool ok = false;
 
         Il2CppClass* ps = SDK::FindClass("PlayerScript");
@@ -369,18 +464,32 @@ namespace Hooks {
         }
         else Log("[hooks] PlayerScript nulo");
 
-        if (!SDK::M_recoil) {
-            if (ps) {
-                SDK::M_recoil = FindMethodAny(ps, "ComputeShotRecoil");
-                if (!SDK::M_recoil) SDK::M_recoil = FindMethodAny(ps, "ShotRecoil");
+        // ---- FireBullet (silent aim / magic bullets) ----
+        if (SDK::M_FireBullet) {
+            uint32_t pc = il2cpp_method_get_param_count(SDK::M_FireBullet);
+            void* p = SDK::MethodPtr(SDK::M_FireBullet);
+            Log("[hooks] FireBullet: params=%u ptr=%p", pc, p);
+            if (p && pc == 7 && MH_CreateHook(p, &hk_fire7, (void**)&o_fire7) == MH_OK) {
+                MH_EnableHook(p);
+                ok = true;
+                Log("[hooks] hook FireBullet OK (7 params, SEM MethodInfo)");
             }
+        }
+        else Log("[hooks] M_FireBullet nulo");
+
+        // ---- recoil (informativo + hook opcional) ----
+        if (!SDK::M_recoil && ps) {
+            SDK::M_recoil = FindMethodAny(ps, "ComputeShotRecoil");
+            if (!SDK::M_recoil) SDK::M_recoil = FindMethodAny(ps, "ShotRecoil");
         }
 
         if (SDK::M_recoil) {
             uint32_t pc = il2cpp_method_get_param_count(SDK::M_recoil);
             void* p = SDK::MethodPtr(SDK::M_recoil);
-            Log("[hooks] recoil: params=%u ptr=%p allFloat=%d", pc, p, (int)AllParamsFloat(SDK::M_recoil));
+            Log("[hooks] recoil: params=%u ptr=%p allFloat=%d hook=%d",
+                pc, p, (int)AllParamsFloat(SDK::M_recoil), (int)ENABLE_RECOIL_HOOK);
 
+#if ENABLE_RECOIL_HOOK
             if (p && AllParamsFloat(SDK::M_recoil) && pc > 0 && pc <= 4) {
                 if (MH_CreateHook(p, &hk_recoil_f, (void**)&o_recoilF) == MH_OK) {
                     MH_EnableHook(p); ok = true; Log("[hooks] hook recoil OK (float)");
@@ -389,6 +498,9 @@ namespace Hooks {
             else if (p && MH_CreateHook(p, &hk_recoil_p, (void**)&o_recoilP) == MH_OK) {
                 MH_EnableHook(p); ok = true; Log("[hooks] hook recoil OK (ptr/0arg)");
             }
+#else
+            (void)p; (void)pc;
+#endif
         }
         else Log("[hooks] M_recoil nulo");
 

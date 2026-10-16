@@ -34,15 +34,22 @@ struct Config {
     float espTextColor[4] = { 1.f, 1.f, 1.f, 1.f };
     float espSkelColor[4] = { 1.f, 1.f, 0.f, 1.f };
 
+    // ---- visual check: verde = visivel, vermelho = parede ----
+    bool  espVisCheck = true;
+    bool  espVisLine = true;                 // desenha a linha do visual check
+    float visColor[4] = { 0.f, 1.f, 0.f, 1.f };
+    float noVisColor[4] = { 1.f, 0.f, 0.f, 1.f };
+
     bool  fps = false;
 
     bool  aimbot = false;
     int   aimKey = VK_RBUTTON;
-    float aimFov = 15.f;                 // GRAUS (convertido pra pixels no aimbot)
+    float aimFov = 8.f;
     float aimSmooth = 5.f;
     int   aimBone = 0;
     int   aimMode = 0;
     bool  aimVisible = true;
+    bool  aimVisCheck = true;               // aim so em alvo visivel
     bool  aimTeam = false;
     bool  aimRotate = true;
     bool  showFovCircle = false;

@@ -8,6 +8,8 @@
 
 #include <vector>
 #include <string>
+#include <unordered_map>
+#include <mutex>
 #include <windows.h>
 
 namespace Hooks { extern int g_viewW; extern int g_viewH; }
@@ -38,6 +40,7 @@ struct Target {
     bool   alive = false;
     bool   enemy = true;
     bool   npc = false;
+    bool   visible = false;          // visual check (LOS)
 
     int    team = 0;
     int    weapon = 0;
@@ -51,6 +54,10 @@ struct Target {
 };
 
 namespace SDK {
+
+    // cache de classes (usado pelo hooks p/ varredura global)
+    extern std::unordered_map<std::string, Il2CppClass*> g_classes;
+    extern std::mutex g_classesMx;
 
     extern uint32_t O_health, O_alive, O_team, O_isLocal, O_name, O_weapon;
     extern uint32_t O_vel, O_speed, O_rot, O_rotation, O_cam, O_camTf;
@@ -103,6 +110,7 @@ namespace SDK {
 
     bool Init();
     void Shutdown();
+    void BuildCache();
 
     void UpdateView();
     void RefreshTargets();
@@ -127,13 +135,6 @@ namespace SDK {
     bool  VisibleLine(Vec3 a, Vec3 b);
     Vec3  TargetAimPos(Il2CppObject* p, int boneMode);
 
-    // ---- linha de visao real (Physics.Raycast) ----
-    bool  HasLineOfSight(Vec3 eye, Vec3 aim);          // true = caminho livre
-    bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);  // idem, com cache por frame
-    bool  RaycastTest(Vec3 from, Vec3 to, float& outHitDist);
-    float CameraCotHalfFovY();
-
-    // ---- camera transform + rotacao ----
     Il2CppObject* CamTfObj();
     Quat  LookRot(Vec3 dir);
     bool  GetRot(Il2CppObject* tf, Quat& out);
@@ -147,7 +148,7 @@ namespace SDK {
     bool  AimLock(Il2CppObject* p, Quat& savedOriginal);
     void  RestoreAim(Il2CppObject* p, const Quat& q);
     bool  FireBulletReady();
-    void  FireBulletAt(Vec3 pos);
+    void  FireBulletAt(Vec3 dir);
 
     void  DumpFields(const char* className);
     void  DumpFields(Il2CppClass* k, const char* tag);
@@ -162,6 +163,16 @@ namespace SDK {
     void  LockTargets();
     void  UnlockTargets();
     void* MethodPtr(MethodInfo* m);
+
+    bool  HasLineOfSight(Vec3 eye, Vec3 aim);
+    bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);
+    bool  RaycastTest(Vec3 from, Vec3 to, float& outHitDist);
+    float CameraCotHalfFovY();
+
+    Il2CppObject* FindGunStatsObj();
+    int  ResolveWeaponFields(Il2CppObject* stats, uint32_t& cur, uint32_t& max,
+        uint32_t& reload, uint32_t& spread, uint32_t& rate, uint32_t& dmg);
+    void DumpFieldsWithValues(Il2CppObject* o);
 }
 
 using SDK::g_targets;
@@ -196,6 +207,9 @@ using SDK::GetNameBuf;
 using SDK::GetVelocity;
 using SDK::GetGunStats;
 using SDK::GetWeapon;
+using SDK::FindGunStatsObj;
+using SDK::ResolveWeaponFields;
+using SDK::DumpFieldsWithValues;
 using SDK::GetLocalPlayer;
 using SDK::DumpFields;
 using SDK::TargetAimPos;

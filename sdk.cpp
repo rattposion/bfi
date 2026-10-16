@@ -1,6 +1,9 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, value types como ponteiro cru
-//  + line of sight real via Physics.Raycast
+//  + line of sight real via Physics.Raycast (distancia pelo m_Point)
+//  + time (g_localTeam) relido a cada scan/frame
+//  + visual check (t.visible) calculado na thread principal
+//  + weapon stats
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -202,8 +205,12 @@ static void se_field_static_get_value(FieldInfo* f, void* out) {
     SE_BEGIN{ if (il2cpp_field_static_get_value) il2cpp_field_static_get_value(f, out); } SE_END{}
 }
 static Il2CppClass* se_object_get_class(Il2CppObject* o) {
+    if (!o) return nullptr;
     Il2CppClass* r = nullptr;
-    SE_BEGIN{ if (il2cpp_object_get_class) r = il2cpp_object_get_class(o); } SE_END{ r = nullptr; }
+    SE_BEGIN{
+        auto fn = il2cpp_object_get_class;
+        if (fn) r = fn(o);
+    } SE_END{ r = nullptr; }
     return r;
 }
 static Il2CppObject* se_object_new(Il2CppClass* k) {
@@ -340,7 +347,6 @@ namespace SDK {
     static MethodInfo* M_camW2C = nullptr;
     static MethodInfo* M_camProj = nullptr;
 
-    // line of sight
     static Il2CppClass* kPhysics = nullptr;
     static MethodInfo* M_raycast = nullptr;
     static uint32_t     O_hitDist = 0;
@@ -1087,7 +1093,6 @@ namespace SDK {
         return O_hitDist;
     }
 
-    // true = caminho livre ate o alvo | false = tem parede no meio
     bool HasLineOfSight(Vec3 eye, Vec3 aim) {
         if (!M_raycast) M_raycast = FindRaycast4();
         if (!M_raycast) return true;
@@ -1109,19 +1114,20 @@ namespace SDK {
             Vec3 sv = eye + dir * travelled;
             Vec3 dv = dir;
             float lv = len;
-            void* args[4];
-            args[0] = &sv;
-            args[1] = &dv;
-            args[2] = (void*)hitBuf;
-            args[3] = &lv;
+            void* args[4] = { &sv, &dv, (void*)hitBuf, &lv };
 
             Il2CppObject* r = se_runtime_invoke(M_raycast, nullptr, args);
             if (!r) return true;
             void* pb = se_object_unbox(r);
             if (!pb || *(unsigned char*)pb == 0) return true;
 
-            float hitDist = 0.f;
-            se_read_bytes(hitBuf + O_hitDist, &hitDist, sizeof(float));
+            // distancia pelo m_Point (offset 0) - confiavel (m_Distance em 0x2C le lixo)
+            Vec3 hitPoint{ 0.f, 0.f, 0.f };
+            se_read_bytes(hitBuf, &hitPoint, sizeof(Vec3));
+            float hitDist = (hitPoint - sv).len();
+
+            if (hitDist < 0.01f)
+                se_read_bytes(hitBuf + O_hitDist, &hitDist, sizeof(float));
 
             if (hitDist < 0.30f) { travelled += hitDist + 0.05f; continue; }
             return hitDist >= (len - 0.5f);
@@ -1144,7 +1150,6 @@ namespace SDK {
         return vis;
     }
 
-    // teste cru: devolve se bateu e a distancia do hit (sem tolerancia)
     bool RaycastTest(Vec3 from, Vec3 to, float& outHitDist) {
         outHitDist = -1.f;
         if (!M_raycast) M_raycast = FindRaycast4();
@@ -1166,11 +1171,13 @@ namespace SDK {
         void* pb = se_object_unbox(r);
         if (!pb) return false;
         if (*(unsigned char*)pb == 0) return false;
-        se_read_bytes(hitBuf + O_hitDist, &outHitDist, sizeof(float));
+
+        Vec3 hitPoint{ 0.f, 0.f, 0.f };
+        se_read_bytes(hitBuf, &hitPoint, sizeof(Vec3));
+        outHitDist = (hitPoint - sv).len();
         return true;
     }
 
-    // P[5] = cot(fovY/2) -> converte graus em pixels
     float CameraCotHalfFovY() {
         if (!g_camera) return 1.732f;
         Il2CppClass* ck = se_object_get_class(g_camera);
@@ -1226,6 +1233,104 @@ namespace SDK {
     }
 
     void DumpFields(const char* className) { DumpFields(FindClass(className), className); }
+
+    // ======================= weapon stats =======================
+    Il2CppObject* FindGunStatsObj() {
+        if (!g_localPlayer) return nullptr;
+
+        if (O_gunStats) {
+            Il2CppObject* s = SafeReadObjPub(g_localPlayer, O_gunStats);
+            if (s) return s;
+        }
+        if (O_gunView && O_gunStatsOnView) {
+            Il2CppObject* gun = SafeReadObjPub(g_localPlayer, O_gunView);
+            if (gun) {
+                Il2CppObject* s = SafeReadObjPub(gun, O_gunStatsOnView);
+                if (s) return s;
+            }
+        }
+        Il2CppClass* k = se_object_get_class(g_localPlayer);
+        if (k) {
+            void* it = nullptr;
+            for (;;) {
+                FieldInfo* f = se_class_get_fields(k, &it);
+                if (!f) break;
+                const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
+                if (!tn) continue;
+                if (!strstr(tn, "Gun") && !strstr(tn, "Weapon")) continue;
+                uint32_t off = (uint32_t)se_field_offset(f);
+                if (!off) continue;
+                Il2CppObject* s = SafeReadObjPub(g_localPlayer, off);
+                if (s) return s;
+            }
+        }
+        return nullptr;
+    }
+
+    int ResolveWeaponFields(Il2CppObject* stats,
+        uint32_t& cur, uint32_t& max, uint32_t& reload,
+        uint32_t& spread, uint32_t& rate, uint32_t& dmg) {
+        cur = max = reload = spread = rate = dmg = 0;
+        if (!stats) return 0;
+        Il2CppClass* k = se_object_get_class(stats);
+        if (!k) return 0;
+
+        cur = PickFieldOff(k, { "currentAmmo", "curAmmo", "ammo", "bullets", "mCurrentAmmo", "magazineAmmo" }, "Int32");
+        max = PickFieldOff(k, { "maxAmmo", "ammoMax", "mMaxAmmo", "magazineSize", "clipSize" }, "Int32");
+        reload = PickFieldOff(k, { "reloading", "isReloading", "mReloading" }, "Boolean");
+        spread = PickFieldOff(k, { "spread", "currentSpread", "mSpread" }, "Single");
+        rate = PickFieldOff(k, { "fireRate", "shotDelay", "mFireRate", "cooldown" }, "Single");
+        dmg = PickFieldOff(k, { "damage", "mDamage", "dmg", "damagePerShot" });
+
+        int n = 0;
+        if (cur) ++n; if (max) ++n; if (reload) ++n;
+        if (spread) ++n; if (rate) ++n; if (dmg) ++n;
+
+        Log("[weapons] stats cls=%s cur=0x%X max=0x%X reload=0x%X spread=0x%X rate=0x%X dmg=0x%X",
+            se_class_name(k), cur, max, reload, spread, rate, dmg);
+        return n;
+    }
+
+    void DumpFieldsWithValues(Il2CppObject* o) {
+        if (!o) { Log("[dumpv] obj nulo"); return; }
+        Il2CppClass* k = se_object_get_class(o);
+        if (!k) return;
+        Log("[dumpv] ---- %s @ %p ----", se_class_name(k), o);
+
+        void* it = nullptr;
+        int n = 0;
+        for (;;) {
+            FieldInfo* f = se_class_get_fields(k, &it);
+            if (!f) break;
+            const char* fn = se_field_name(f);
+            if (!fn) continue;
+            const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
+            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
+            uint32_t off = (uint32_t)se_field_offset(f);
+            if (!off) continue;
+
+            if (tn && (strstr(tn, "Int32") || strstr(tn, "UInt32") || strstr(tn, "Int16") || strstr(tn, "Byte"))) {
+                int v = 0; se_read_int(o, off, &v);
+                Log("[dumpv]   %-28s : %-14s @0x%X = %d", fn, tn, off, v);
+            }
+            else if (tn && strstr(tn, "Single")) {
+                Log("[dumpv]   %-28s : %-14s @0x%X = %.3f", fn, tn, off, se_read_float(o, off));
+            }
+            else if (tn && strstr(tn, "Boolean")) {
+                Log("[dumpv]   %-28s : %-14s @0x%X = %d", fn, tn, off, (int)se_read_bool(o, off));
+            }
+            else {
+                void* p = nullptr;
+                if (se_read_ptr(o, off, &p))
+                    Log("[dumpv]   %-28s : %-14s @0x%X = %p", fn, tn, off, p);
+                else
+                    Log("[dumpv]   %-28s : %-14s @0x%X = -", fn, tn, off);
+            }
+            if (++n > 120) break;
+        }
+        Log("[dumpv] ---- fim ----");
+    }
 
     // ======================= local player =======================
     static Il2CppObject* FindLocalPlayer() {
@@ -1307,11 +1412,13 @@ namespace SDK {
     }
 
     static void AdoptLocal(Il2CppObject* e) {
-        if (!e || g_localPlayer) return;
+        if (!e) return;
+        const bool mudou = (e != g_localPlayer);
         g_localPlayer = e;
         g_local = e;
         g_localTeam = ReadTeam(e);
-        Log("[sdk] localPlayer encontrado no scan (%p) team=%d", e, g_localTeam);
+        if (mudou)
+            Log("[sdk] localPlayer adotado (%p) team=%d", e, g_localTeam);
     }
 
     static bool AlreadyAdded(Il2CppObject* e, int c) {
@@ -1321,6 +1428,7 @@ namespace SDK {
 
     void RefreshTargets() {
         if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
+        if (g_localPlayer) g_localTeam = ReadTeam(g_localPlayer);
 
         Il2CppClass* oc = FindClass("Object", "UnityEngine");
         if (!oc) return;
@@ -1445,6 +1553,10 @@ namespace SDK {
 
         if (!g_localPlayer) return;
         g_localPos = GetPos(g_localPlayer);
+        g_localTeam = ReadTeam(g_localPlayer);
+
+        Il2CppObject* camTf = CamTfObj();
+        Vec3 eye = camTf ? GetPos(camTf) : g_localPos;
 
         EnterCriticalSection(&g_targetCs);
         for (int i = 0; i < g_targetCount; ++i) {
@@ -1465,6 +1577,8 @@ namespace SDK {
             t.onScreen = okH && okF && (h > 1.f)
                 && t.scrFeet.y > -64.f
                 && t.scrHead.y < (float)ScreenH() + 64.f;
+
+            t.visible = HasLineOfSight(eye, t.head);
 
             SyncAliases(t);
         }
