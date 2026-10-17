@@ -16,6 +16,10 @@
 //
 //  >>> FIX C6011: ComboIdx checava 'list' na linha do 'cur' mas nao dentro do
 //  loop do combo; com lista nula, list[i] estourava.
+//
+//  >>> FIX v15 (novos controles):
+//   - aba Aimbot: "So visivel (sem fallback)" -> C.aimStrictVis
+//   - aba Visual: slider "LOS por frame" -> C.losPerFrame (custo de FPS do LOS)
 // ============================================================
 #include "common.h"
 #include "config.h"
@@ -170,6 +174,14 @@ namespace Menu {
             ImGui::SetTooltip("Marcado: so mira em alvo visivel.\n"
                 "Desmarcado: mira atraves da parede.");
 
+        // >>> FIX: sem isso, com o visCheck ligado o alvo caia no mais proximo
+        //     da mira quando ninguem estava visivel (mirar atras do muro).
+        ImGui::Checkbox("So visivel (sem fallback)", &C.aimStrictVis);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Marcado: se ninguem estiver visivel, nao mira\n"
+                "em ninguem. Nada de mirar atras do muro.\n"
+                "Desmarcado: cai no mais proximo da mira.");
+
         ImGui::Checkbox("Rotacionar camera", &C.aimRotate);
         ImGui::Checkbox("Circulo de FOV", &C.showFovCircle);
 
@@ -219,6 +231,14 @@ namespace Menu {
         ImGui::Separator();
         ImGui::Checkbox("Checar visao", &C.espVisCheck);
         ImGui::Checkbox("Linha de visao", &C.espVisLine);
+
+        // >>> FIX FPS: quantos alvos podem ser testados por frame (rodizio).
+        //     Baixo = mais FPS. A visibilidade atualiza em poucos frames.
+        ImGui::SliderInt("LOS por frame", &C.losPerFrame, 1, 32);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Quantos alvos sao testados por frame (rodizio).\n"
+                "Baixo = mais FPS. A visibilidade atualiza em poucos frames.\n"
+                "Isso e' o custo real do 'Checar visao'.");
 
         ImGui::SliderFloat("Espessura", &C.espThickness, 0.5f, 5.0f, "%.1f");
         ImGui::SliderFloat("Dist. max", &C.espMaxDist, 10.0f, 1000.0f, "%.0f");

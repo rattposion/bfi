@@ -5,6 +5,10 @@
 //      colado duas vezes no mesmo arquivo, a 2a copia e PULADA em silencio
 //      (antes era um #error que so reclamava). Tambem protege contra
 //      #include duplicado.
+//
+//  >>> FIX FPS: o Tick resolvia o objeto de gunStats TODO FRAME
+//      (FindGunStatsObj varre campos + array de loadout + get_activeInHierarchy).
+//      Agora a RESOLUCAO e' cacheada por 250 ms; as ESCRITAS continuam por frame.
 // ============================================================================
 #ifndef BFI_WEAPONS_CPP
 #define BFI_WEAPONS_CPP
@@ -291,7 +295,17 @@ namespace Weapons {
         if (!(C.infAmmo || C.noReload || C.noSpread || C.rapidFire || C.noRecoil)) return;
         if (!SDK::g_localPlayer) return;
 
-        Il2CppObject* stats = SDK::FindGunStatsObj();
+        // >>> FIX FPS: FindGunStatsObj varre campos + array de loadout e chama
+        //     get_activeInHierarchy. Resolver 1x a cada 250 ms basta — as
+        //     ESCRITAS continuam por frame, so a RESOLUCAO e' cacheada.
+        static Il2CppObject* s_stats = nullptr;
+        static ULONGLONG     s_statsNext = 0;
+        ULONGLONG nowStats = GetTickCount64();
+        if (nowStats >= s_statsNext) {
+            s_statsNext = nowStats + 250;
+            s_stats = SDK::FindGunStatsObj();
+        }
+        Il2CppObject* stats = s_stats;
         if (stats) {
             if (stats != g_stats) {
                 g_stats = stats;

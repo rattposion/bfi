@@ -1,7 +1,19 @@
 // ============================================================================
-//  aimbot.cpp — bfi  (v8)
+//  aimbot.cpp — bfi  (v9)
 //
-//  >>> FIX v8:
+//  >>> FIX v9:
+//   1) BestStrict: quando C.aimVisCheck esta LIGADO e NINGUEM tem linha de
+//      visao, o alvo NAO cai mais no mais-proximo-da-mira (o "mirar atras do
+//      muro"). Retorna nullptr e o aimbot simplesmente nao gira. O
+//      comportamento antigo volta com C.aimStrictVis = false.
+//   2) BestStrict: AimPointOf era chamado DUAS vezes por alvo (ScoreTarget +
+//      coleta). Agora e' UMA -> metade dos GetPos/il2cpp_runtime_invoke por
+//      frame no caminho do aim.
+//   3) BestStrict: removido o teto de 12 tentativas no teste de LOS (a lista
+//      ja esta ordenada do mais perto da mira pro mais longe).
+//   4) config.h: aimStrictVis agora nasce true.
+//
+//  >>> FIX v8 (mantido):
 //   1) struct Cand com inicializadores -> C26495 'Cand::obj' / 'Cand::score'
 //      nao inicializados (linha 180).
 //   2) O Log do probeLog tinha 7 formatos e 6 argumentos: 'dist' nem existia,
@@ -12,7 +24,6 @@
 //  C.aimVisCheck LIGADO  -> so visivel. Ninguem visivel = nao gira a camera.
 //  C.aimVisCheck DESLIGADO -> mira atraves da parede.
 //  C.aimStrictVis = false -> se ninguem estiver visivel, cai no mais perto.
-//  C.aimStrictVis = true  -> se ninguem estiver visivel, nao mira em ninguem.
 //
 //  >>> '::Quat' explicito em tudo, chamadas internas qualificadas
 //      (Aimbot::LookRot) porque o sdk.h faz 'using SDK::LookRot;' global.
@@ -141,8 +152,10 @@ namespace Aimbot {
 
     // =========================================================================
     //  score: <0 = descartado. Menor = mais perto da mira.
+    //
+    //  >>> FIX v9: o aim point entra por PARAMETRO (calculado 1x pelo caller).
     // =========================================================================
-    static float ScoreTarget(const Target& t, Vec3 eye, Vec3 fwd,
+    static float ScoreTarget(const Target& t, Vec3 aim, Vec3 eye, Vec3 fwd,
         float radius, bool screenMode, float cx, float cy)
     {
         if (!t.player || !t.alive) return -1.f;
@@ -150,7 +163,6 @@ namespace Aimbot {
         if (C.aimTeam && !t.enemy) return -1.f;
         if (C.aimMaxDist > 0.f && t.dist > C.aimMaxDist) return -1.f;
 
-        Vec3 aim = AimPointOf(t);
         if (aim.zero()) return -1.f;
 
         float score;
@@ -200,10 +212,15 @@ namespace Aimbot {
         int n = 0;
         for (int i = 0; i < SDK::g_targetCount && n < 64; ++i) {
             const Target& t = SDK::g_targets[i];
-            float s = ScoreTarget(t, eye, fwd, radius, screenMode, cx, cy);
-            if (s < 0.f) continue;
+
+            // >>> FIX v9: AimPointOf UMA vez por alvo (antes eram duas:
+            //     ScoreTarget + coleta -> o dobro de GetPos/invoke por frame).
             Vec3 ap = AimPointOf(t);
             if (ap.zero()) continue;
+
+            float s = ScoreTarget(t, ap, eye, fwd, radius, screenMode, cx, cy);
+            if (s < 0.f) continue;
+
             list[n].score = s;
             list[n].obj = t.player;
             list[n].aim = ap;
@@ -219,19 +236,20 @@ namespace Aimbot {
             list[j + 1] = key;
         }
 
-        // 3) visCheck desligado ou LOS indisponivel -> sem filtro
+        // 3) visCheck desligado ou LOS indisponivel -> sem filtro (mira no muro)
         const bool filtrar = (C.aimVisCheck != 0) && SDK::LosReady();
         if (!filtrar) return list[0].obj;
 
-        // 4) percorre na ordem e pega o PRIMEIRO com linha de visao de verdade.
-        int tentativas = 0;
-        for (int i = 0; i < n && tentativas < 12; ++i, ++tentativas) {
+        // 4) percorre a lista (ja ordenada: mais perto da mira primeiro) e pega
+        //    o PRIMEIRO com linha de visao de verdade.
+        //    >>> FIX v9: sem o teto de 12 tentativas.
+        for (int i = 0; i < n; ++i) {
             if (SDK::HasLineOfSight(eye, list[i].aim)) return list[i].obj;
         }
 
-        // 5) nenhum visivel:
-        //    strict = false (padrao) -> cai no mais perto (atras do muro)
-        //    strict = true          -> nao mira em ninguem
+        // 5) >>> FIX v9: NINGUEM visivel -> nao mira em ninguem.
+        //    Nada de mirar atras do muro.
+        //    (C.aimStrictVis = false restaura o fallback "mais perto".)
         return C.aimStrictVis ? nullptr : list[0].obj;
     }
 
@@ -253,7 +271,7 @@ namespace Aimbot {
                     Vec3 ap = Aimbot::AimPoint((void*)g_best);
                     Vec3 eye = EyePos();
                     Vec3 dv = Aimbot::Sub(ap, eye);
-                    float dist = Len(dv);                          // >>> FIX
+                    float dist = Len(dv);
                     Vec3 d = Aimbot::Norm(dv);
                     float ang = acosf(Aimbot::Dot(Aimbot::CamForward(), d)) * (180.f / 3.14159265f);
                     Vec2 s{};

@@ -44,6 +44,12 @@ struct Config {
 
     bool  fps = false;
 
+    // ---- PERFORMANCE ----
+    // LOS: quantos alvos podem ser testados por frame (rodizio).
+    //   8 = equilibrio bom.  0 = sem teto (todos, todo frame -> o que travava).
+    // Cada alvo e' reavaliado a cada ceil(nAlvos / losPerFrame) frames.
+    int   losPerFrame = 8;
+
     // ---- AIMBOT ----
     bool  aimbot = false;
     int   aimKey = VK_RBUTTON;
@@ -59,9 +65,10 @@ struct Config {
     //   DESMARCADO-> sem filtro, mira atraves da parede.
     bool  aimVisCheck = true;
 
-    // Nao e mais usado na decisao (visCheck ligado = so visivel). Mantido
-    // apenas para nao quebrar o menu.
-    bool  aimStrictVis = false;
+    // Nao mirar atras do muro:
+    //   true  -> se ninguem estiver visivel, NAO mira em ninguem (padrao).
+    //   false -> cai no mais proximo da mira (volta a mirar no muro).
+    bool  aimStrictVis = true;
 
     bool  aimTeam = false;
     bool  aimRotate = true;
@@ -183,4 +190,4 @@ namespace ConfigIO {
     void Load();
 }
 
-#endif // BFI_CONFIG_Hs
+#endif // BFI_CONFIG_H
