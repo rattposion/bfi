@@ -1,27 +1,20 @@
 // ============================================================================
-//  unlock.cpp — bfi (v24)
+//  unlock.cpp — bfi (v25)
+//
+//  >>> v25 (FPS): o Install() era RETENTADO TODO FRAME enquanto falhava (ex.:
+//      fora de partida) e o FindWeaponArray varre todos os campos do
+//      PlayerScript chamando il2cpp_type_get_name em cada um. Agora o retry e'
+//      no maximo 2x/s. Tambem: Dupe::EnsureLoaded() nao roda mais por frame.
 //
 //  >>> v24: a tela SELECIONE LOADOUT nao le o que pokeamos em memoria. O
-//  loadout de ALFA/BRAVO/CHARLIE vem dos PlayerPrefs do jogo
-//  (LoadoutManager::PrefsKey_WeaponToShowOnLoad). Entao agora:
-//   1) Resolve UnityEngine.PlayerPrefs e DESCOBRE todas as chaves de prefs
-//      (varre campos static String de todas as imagens + sonda chaves
-//      literais via HasKey). Tudo logado com prefixo [p].
-//   2) Escreve o weaponType (chave int) ou o nome da arma (chave string) nas
-//      chaves com cara de arma/loadout/slot, e chama Save().
-//   3) PROBE 1x o formato de cada chave (int ou string) pra sabermos o que e.
+//  loadout de ALFA/BRAVO/CHARLIE vem dos PlayerPrefs do jogo. Entao agora:
+//   1) Resolve UnityEngine.PlayerPrefs e DESCOBRE as chaves de prefs.
+//   2) Escreve o weaponType (chave int) ou o nome da arma (chave string).
+//   3) PROBE 1x o formato de cada chave (int ou string).
 //
-//  >>> v23: reaplica a cada 4s (sobrevive a respawn) e LOGA o readback [r] do
-//  que foi escrito, pra ver se a escrita fica ou se o jogo reescreve.
-//
-//  >>> v22: as escritas do loadout sao uma por FRAME, logadas como
-//  "[w] passo N/M: Classe::campo". A ultima linha antes de um travamento e' o
-//  culpado. Passos: 0..N-1 = um candidato cada; N = offsets fixos; N+1 =
-//  fpsGunView; fim = equip + prefs.
-//
-//  v21 mantido: is_valuetype no ELEMENTO do array (nao na classe do array),
-//  alvo enum recebe weaponType, alvo Int32/Byte recebe o indice, String[]
-//  recebe o ponteiro do nome.
+//  >>> v23: reaplica a cada 4s (sobrevive a respawn) e LOGA o readback [r].
+//  >>> v22: as escritas do loadout sao uma por FRAME, logadas "[w] passo N/M".
+//  v21 mantido: is_valuetype no ELEMENTO do array (nao na classe do array).
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -38,7 +31,7 @@
 #include <string>
 #include <vector>
 
-#define BFI_UNLOCK_VER "v24"
+#define BFI_UNLOCK_VER "v25"
 
 namespace Unlock {
 
@@ -67,6 +60,10 @@ namespace Unlock {
     static void* g_charArr = nullptr;
     static int   g_charLen = 0;
     static bool  g_charIsList = false;
+
+    // >>> v25: throttle do retry de Install + guarda do EnsureLoaded
+    static ULONGLONG g_nextInstallTry = 0;
+    static bool      g_dupeEnsured = false;
 
     // ================================================================= helpers
     typedef Il2CppClass* (*fn_elem)(Il2CppClass*);
@@ -115,7 +112,6 @@ namespace Unlock {
         p_typeGetObject = (fn_type_get_object)GetProcAddress(ga, "il2cpp_type_get_object");
     }
 
-    // wrapper blindado: unico ponto que toca p_typeGetObject
     static void* TypeGetObjectSafe(Il2CppType* t) {
         if (!t || !p_typeGetObject) return nullptr;
         void* r = nullptr;
@@ -751,7 +747,7 @@ namespace Unlock {
     }
 
     static int WeaponTypeOfList(int listIdx) {
-        Dupe::EnsureLoaded();
+        if (!g_dupeEnsured) { Dupe::EnsureLoaded(); g_dupeEnsured = true; }
         if (listIdx < 0 || listIdx >= (int)Dupe::g_weapons.size()) return 0;
         return Dupe::g_weapons[listIdx].aux;
     }
@@ -857,10 +853,7 @@ namespace Unlock {
     }
 
     // =====================================================================
-    //  v24 — PlayerPrefs. A tela SELECIONE LOADOUT (ALFA/BRAVO/CHARLIE) le o
-    //  loadout dos prefs do jogo (LoadoutManager::PrefsKey_WeaponToShowOnLoad).
-    //  Escrever so em memoria nao sobrevive a reabertura da tela: aqui a gente
-    //  DESCOBRE as chaves de prefs e escreve nelas.
+    //  v24 — PlayerPrefs (a tela SELECIONE LOADOUT le dos prefs do jogo)
     // =====================================================================
     typedef void* (*fn_dom_get)();
     typedef const void** (*fn_dom_asms)(void*, size_t*);
@@ -1094,7 +1087,6 @@ namespace Unlock {
         if (changed && g_ppSave) { void* a[1] = { nullptr }; InvokeRet(g_ppSave, nullptr, a); Log("[p] Save()"); }
     }
 
-    // >>> v23/v24: reaplica a cada 4s (sobrevive a respawn) + READBACK.
     static int       g_selTarget = -2;
     static int       g_selStep = -1;
     static ULONGLONG g_selNext = 0;
@@ -1126,7 +1118,7 @@ namespace Unlock {
     static void ApplySelection() {
         if (!C.applySelection || !SDK::g_localPlayer) return;
         if (!g_arr || g_arrLen <= 0) return;
-        Dupe::EnsureLoaded();
+        if (!g_dupeEnsured) { Dupe::EnsureLoaded(); g_dupeEnsured = true; }
 
         const int listIdx = C.selWeapon;
         if (listIdx < 0 || listIdx >= Dupe::WeaponCount()) return;
@@ -1157,7 +1149,6 @@ namespace Unlock {
         void* gun = ArrElem((Il2CppArray*)g_arr, live);
         if (LooksLikeObj(gun)) nameStr = SafeRead<void*>((uintptr_t)gun + g_offName, nullptr);
 
-        // passos 0..g_loCN-1: UM candidato por frame
         if (g_selStep < g_loCN) {
             const LoCand& c = g_loC[g_selStep];
             Log("[w] passo %d/%d: %s::%s (kind=%d type=%d useType=%d slot=%d off=0x%X)",
@@ -1167,7 +1158,6 @@ namespace Unlock {
             return;
         }
 
-        // passo N: offsets fixos do dump
         if (g_selStep == g_loCN) {
             Log("[w] passo %d/%d: PlayerScript offsets 0x144/0x145/0x10A4", g_selStep, total);
             uintptr_t b = (uintptr_t)SDK::g_localPlayer;
@@ -1178,7 +1168,6 @@ namespace Unlock {
             return;
         }
 
-        // passo N+1: fpsGunView
         if (g_selStep == g_loCN + 1) {
             Log("[w] passo %d/%d: fpsGunView+0x38=gun +0x48=%d", g_selStep, total, slot);
             void* fv = FpsGunView();
@@ -1200,7 +1189,7 @@ namespace Unlock {
     static void ApplyLoadout() {
         if (!C.fillLoadoutSlots && !C.applySlots) return;
         if (!SDK::g_localPlayer || !g_arr || g_arrLen <= 0) return;
-        Dupe::EnsureLoaded();
+        if (!g_dupeEnsured) { Dupe::EnsureLoaded(); g_dupeEnsured = true; }
         for (int s = 0; s < 3; ++s) {
             int idx = C.slotWeapon[s];
             if (idx < 0 || idx >= Dupe::WeaponCount()) continue;
@@ -1422,6 +1411,7 @@ namespace Unlock {
         ResolveEquipMethod();
         ResolvePlayerPrefs();
         Dupe::EnsureLoaded();
+        g_dupeEnsured = true;
         g_installed = true;
         Log("[unlock] install %s: arr@0x%X len=%d | armas=%d camos=%d chars=%d",
             BFI_UNLOCK_VER, g_offArr, g_arrLen,
@@ -1429,8 +1419,18 @@ namespace Unlock {
         return true;
     }
 
+    // >>> v25: retry no maximo 2x/s (fora de partida o Install falha sempre e
+    //     FindWeaponArray varre todos os campos do PlayerScript).
+    static bool EnsureInstalled() {
+        if (g_installed && g_arr && g_arrLen > 0) return true;
+        const ULONGLONG now = GetTickCount64();
+        if (now < g_nextInstallTry) return false;
+        g_nextInstallTry = now + 500;
+        return Install();
+    }
+
     static void TickInner() {
-        if (!g_installed || !g_arr || g_arrLen <= 0) { if (!Install()) return; }
+        if (!EnsureInstalled()) return;
         ApplyAll();
     }
 
@@ -1440,12 +1440,12 @@ namespace Unlock {
             C.skinChanger || C.applySlots || C.fillLoadoutSlots;
         if (!any && !Dupe::Wants()) return;
         if (!SDK::g_localPlayer) return;
+
         if (Dupe::Wants()) {
-            if (!g_installed || !g_arr || g_arrLen <= 0) { if (!Install()) return; }
+            if (!EnsureInstalled()) return;
             BuildStep();
             return;
         }
-        if (!g_installed || !g_arr || g_arrLen <= 0) { if (!Install()) return; }
         __try { TickInner(); }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             static int n = 0;

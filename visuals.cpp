@@ -1,9 +1,8 @@
 // ============================================================================
 //  visuals.cpp
-//  >>> FIX: o circulo do FOV usava uma formula propria com constante fixa
-//  (0.4142 = tan(22.5 graus)) enquanto o aim usava a matriz de projecao da
-//  camera. Os dois nao batiam (~2.4x de diferenca). Agora ambos usam
-//  SDK::FovRadiusPx.
+//  >>> FIX: o circulo do FOV usava formula propria; agora usa SDK::FovRadiusPx.
+//  >>> FIX: em modo ANGULO (C.aimMode == 1) o circulo em px mente -> nao desenha.
+//  >>> NOVO: profiler por passo (C.showFpsGraph).
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -40,6 +39,27 @@ static void DrawFps(ImDrawList* dl) {
     dl->AddText(ImVec2(12.f, 30.f), IM_COL32(180, 220, 180, 220), buf);
 }
 
+// ---------------------------------------------------------------------------
+//  >>> NOVO: profiler. Mostra o ms de cada passo do Combat::Tick (media).
+// ---------------------------------------------------------------------------
+static void DrawProfiler(ImDrawList* dl) {
+    if (!C.showFpsGraph) return;
+
+    char buf[80];
+    float y = 54.f;
+
+    sprintf_s(buf, "tick %.2f ms", (double)Combat::g_tickMs);
+    dl->AddText(ImVec2(12.f, y), IM_COL32(255, 210, 120, 235), buf);
+    y += 16.f;
+
+    for (int i = 0; i < Combat::g_statsN; ++i) {
+        sprintf_s(buf, "%-14s %6.2f ms", Combat::g_stats[i].name,
+            (double)Combat::g_stats[i].ms);
+        dl->AddText(ImVec2(12.f, y), IM_COL32(200, 220, 200, 225), buf);
+        y += 14.f;
+    }
+}
+
 static void DrawCrosshair(ImDrawList* dl, float cx, float cy) {
     float s = C.crosshairSize;
     float g = 2.f;
@@ -53,8 +73,10 @@ static void DrawCrosshair(ImDrawList* dl, float cx, float cy) {
 static void DrawFovCircle(ImDrawList* dl, float cx, float cy, float H) {
     if (!C.showFovCircle) return;
     if (!SDK::g_viewProjOk) return;
+    if (C.aimMode == 1) return;                  // >>> FIX: modo angulo
+    if (!C.aimbot) return;
 
-    float r = SDK::FovRadiusPx(C.aimFov);   // >>> FIX: mesma formula do aim
+    float r = SDK::FovRadiusPx(C.aimFov);        // mesma formula do aim
     if (r < 3.f || r > H) return;
     dl->AddCircle(ImVec2(cx, cy), r, C4(C.aimColor, 0.8f), 64, 1.5f);
 }
@@ -83,6 +105,7 @@ namespace Misc {
         float cy = H * 0.5f;
 
         if (C.watermark) { DrawWatermark(dl); if (C.fps) DrawFps(dl); }
+        DrawProfiler(dl);
         if (C.crosshair) DrawCrosshair(dl, cx, cy);
         DrawFovCircle(dl, cx, cy, H);
         DrawHitmarker(dl, cx, cy);

@@ -1,3 +1,7 @@
+// ============================================================================
+//  config.cpp — ini texto (chave=valor). Campo novo = chave nova; se a chave
+//  nao existir no arquivo, o valor PADRAO do struct e' mantido.
+// ============================================================================
 #include "config.h"
 #include "common.h"
 
@@ -44,6 +48,7 @@ namespace ConfigIO {
         S_B(espHealthNum); S_B(espWeapon); S_B(espDistance); S_B(espSnapline);
         S_B(espSkeleton); S_B(espNpc); S_B(teamCheck); S_B(fps);
         S_B(espVisCheck); S_B(espVisLine);
+        S_I(losPerFrame);
         S_F(espThickness); S_F(espMaxDist); S_F(espFontSize);
         S_F(espOffY); S_F(espScaleY); S_F(espBodyH);
         WCol(f, "espColor", g_cfg.espColor);
@@ -54,13 +59,14 @@ namespace ConfigIO {
         WCol(f, "noVisColor", g_cfg.noVisColor);
 
         S_B(aimbot); S_I(aimKey); S_F(aimFov); S_F(aimSmooth); S_I(aimBone);
-        S_I(aimMode); S_B(aimVisible); S_B(aimVisCheck); S_B(aimTeam); S_B(aimRotate);
+        S_I(aimMode); S_B(aimVisible); S_B(aimVisCheck); S_B(aimStrictVis);
+        S_B(aimTeam); S_B(aimRotate);
         S_B(showFovCircle); S_F(aimMaxDist);
         WCol(f, "aimColor", g_cfg.aimColor);
 
         S_B(silentAim); S_B(magicBullets);
 
-        S_B(triggerbot); S_I(triggerKey); S_F(triggerDelay);
+        S_B(triggerbot); S_I(triggerKey); S_F(triggerDelay); S_F(triggerRadius);
 
         S_B(noRecoil); S_B(noSpread); S_B(infAmmo); S_B(noReload); S_B(rapidFire);
 
@@ -77,10 +83,17 @@ namespace ConfigIO {
         // ---- UNLOCK ----
         S_B(unlockAll); S_B(unlockWeapons); S_B(unlockSkins);
         S_B(unlockAttachments); S_B(unlockCurrency);
+        S_B(unlockChars);
         S_B(fillLoadoutSlots); S_B(applySlots);
         S_I(slotWeapon[0]); S_I(slotWeapon[1]); S_I(slotWeapon[2]);
         S_I(currencyValue); S_F(unlockInterval);
         S_B(skinChanger); S_I(skinIndex); S_I(unlockLevel);
+
+        // ---- SELECAO / LOG ----
+        S_B(applySelection); S_I(loadoutSlot);
+        S_I(selWeapon); S_I(selCamo); S_I(selChar);
+        S_I(selAttach[0]); S_I(selAttach[1]); S_I(selAttach[2]);
+        S_B(probeLog); S_B(beatLog); S_B(showFpsGraph);
 
 #undef S_B
 #undef S_I
@@ -117,19 +130,21 @@ namespace ConfigIO {
             L_B(espHealthNum); L_B(espWeapon); L_B(espDistance); L_B(espSnapline);
             L_B(espSkeleton); L_B(espNpc); L_B(teamCheck); L_B(fps);
             L_B(espVisCheck); L_B(espVisLine);
+            L_I(losPerFrame);
             L_F(espThickness); L_F(espMaxDist); L_F(espFontSize);
             L_F(espOffY); L_F(espScaleY); L_F(espBodyH);
             L_C(espColor); L_C(espBoxColor); L_C(espTextColor); L_C(espSkelColor);
             L_C(visColor); L_C(noVisColor);
 
             L_B(aimbot); L_I(aimKey); L_F(aimFov); L_F(aimSmooth); L_I(aimBone);
-            L_I(aimMode); L_B(aimVisible); L_B(aimVisCheck); L_B(aimTeam); L_B(aimRotate);
+            L_I(aimMode); L_B(aimVisible); L_B(aimVisCheck); L_B(aimStrictVis);
+            L_B(aimTeam); L_B(aimRotate);
             L_B(showFovCircle); L_F(aimMaxDist);
             L_C(aimColor);
 
             L_B(silentAim); L_B(magicBullets);
 
-            L_B(triggerbot); L_I(triggerKey); L_F(triggerDelay);
+            L_B(triggerbot); L_I(triggerKey); L_F(triggerDelay); L_F(triggerRadius);
 
             L_B(noRecoil); L_B(noSpread); L_B(infAmmo); L_B(noReload); L_B(rapidFire);
 
@@ -146,10 +161,17 @@ namespace ConfigIO {
             // ---- UNLOCK ----
             L_B(unlockAll); L_B(unlockWeapons); L_B(unlockSkins);
             L_B(unlockAttachments); L_B(unlockCurrency);
+            L_B(unlockChars);
             L_B(fillLoadoutSlots); L_B(applySlots);
             L_I(slotWeapon[0]); L_I(slotWeapon[1]); L_I(slotWeapon[2]);
             L_I(currencyValue); L_F(unlockInterval);
             L_B(skinChanger); L_I(skinIndex); L_I(unlockLevel);
+
+            // ---- SELECAO / LOG ----
+            L_B(applySelection); L_I(loadoutSlot);
+            L_I(selWeapon); L_I(selCamo); L_I(selChar);
+            L_I(selAttach[0]); L_I(selAttach[1]); L_I(selAttach[2]);
+            L_B(probeLog); L_B(beatLog); L_B(showFpsGraph);
 
 #undef L_B
 #undef L_I

@@ -1,12 +1,22 @@
 // ============================================================================
 //  log.cpp
 //  Log unico do projeto. Thread-safe. LogInit() e idempotente.
+//
+//  >>> FIX FPS: o Log fazia fprintf + fflush POR LINHA, segurando o
+//      CriticalSection durante os DOIS syscalls. Com probeLog ligado isso e'
+//      syscall por chamada, e a chamada vem da thread do JOGO.
+//      Agora: fila + thread de escrita. O fflush passa a ser a cada 200 ms.
+//      Se a thread nao subir, cai no modo sincrono antigo (fallback).
 // ============================================================================
 
 #include <windows.h>
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <atomic>
 
 extern HMODULE g_hModule;
 
@@ -16,45 +26,106 @@ static FILE* g_log = nullptr;
 static CRITICAL_SECTION g_cs;
 static bool             g_csReady = false;
 
+static std::vector<std::string> g_q;
+static std::mutex               g_qMx;
+static std::atomic<bool>        g_stop{ false };
+static HANDLE                   g_ev = nullptr;
+static HANDLE                   g_th = nullptr;
+
+static const size_t kMaxQueue = 8192;
+
+// ---------------------------------------------------------------------------
+static void BuildPath(char* path, size_t n) {
+    path[0] = 0;
+    HMODULE mod = g_hModule ? g_hModule : GetModuleHandleA(nullptr);
+    GetModuleFileNameA(mod, path, (DWORD)n);
+
+    char* s = strrchr(path, '\\');
+    if (s) s[1] = 0; else path[0] = 0;
+    strncat_s(path, n, "BFInternal.log", _TRUNCATE);
+}
+
+// ---------------------------------------------------------------------------
+static DWORD WINAPI LogThread(LPVOID) {
+    std::vector<std::string> local;
+
+    for (;;) {
+        WaitForSingleObject(g_ev, 200);
+
+        local.clear();
+        {
+            std::lock_guard<std::mutex> lk(g_qMx);
+            local.swap(g_q);
+        }
+
+        if (g_log && !local.empty()) {
+            for (size_t i = 0; i < local.size(); ++i) fputs(local[i].c_str(), g_log);
+            fflush(g_log);
+        }
+
+        if (g_stop.load()) {
+            bool more = false;
+            { std::lock_guard<std::mutex> lk(g_qMx); more = !g_q.empty(); }
+            if (!more) break;
+        }
+    }
+
+    if (g_log) fflush(g_log);
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 void LogInit() {
-    if (g_log) return;                       // <-- idempotente: nao reinicializa nada
+    if (g_log) return;                       // idempotente
 
     if (!g_csReady) { InitializeCriticalSection(&g_cs); g_csReady = true; }
 
     char path[MAX_PATH] = { 0 };
-
-    HMODULE mod = g_hModule ? g_hModule : GetModuleHandleA(nullptr);
-    GetModuleFileNameA(mod, path, MAX_PATH);
-
-    char* s = strrchr(path, '\\');
-    if (s) s[1] = 0; else path[0] = 0;
-    strncat_s(path, "BFInternal.log", _TRUNCATE);
+    BuildPath(path, sizeof(path));
 
     fopen_s(&g_log, path, "w");
     if (!g_log) return;
+
+    // sobe a thread ANTES de logar, para o "log aberto" ja passar pela fila
+    if (!g_ev) g_ev = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    if (g_ev && !g_th) {
+        DWORD id = 0;
+        g_th = CreateThread(nullptr, 0, &LogThread, nullptr, 0, &id);
+    }
 
     Log("log aberto: %s", path);
 }
 
 // ---------------------------------------------------------------------------
+static void WriteSync(const char* line) {
+    if (!g_log) return;
+    if (g_csReady) EnterCriticalSection(&g_cs);
+    fputs(line, g_log);
+    fflush(g_log);
+    if (g_csReady) LeaveCriticalSection(&g_cs);
+}
+
 void Log(const char* fmt, ...) {
     if (!g_log) return;
-
-    if (g_csReady) EnterCriticalSection(&g_cs);
 
     SYSTEMTIME st;
     GetLocalTime(&st);
 
-    char buf[1024];
+    char body[900];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    vsnprintf_s(body, sizeof(body), _TRUNCATE, fmt, ap);
     va_end(ap);
 
-    fprintf(g_log, "[%02d:%02d:%02d.%03d] %s\n",
-        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, buf);
-    fflush(g_log);
+    char line[1024];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "[%02d:%02d:%02d.%03d] %s\n",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, body);
 
-    if (g_csReady) LeaveCriticalSection(&g_cs);
+    if (!g_th) { WriteSync(line); return; }   // fallback sincrono
+
+    {
+        std::lock_guard<std::mutex> lk(g_qMx);
+        if (g_q.size() < kMaxQueue) g_q.emplace_back(line);
+    }
+    SetEvent(g_ev);
 }

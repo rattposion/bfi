@@ -1,64 +1,61 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
 //
-//  >>> CORRECOES DESTA VERSAO (v3 — anti-lag de LOS):
-//   P1) Auto-hit: o raio nascia dentro do collider do proprio player, acertava
-//       o proprio corpo, OwnerKind devolvia 1 e o loop do HasLineOfSightEx
-//       gastava ATE 10 raycasts por chamada. Era isso que fazia
-//       "visiveis=0 sempre" E que multiplicava o custo por 10. Agora o raio
-//       comeca 45 cm a frente do olho.
-//   P2) OwnerKind: o fallback de posicao usava 1.5 m contra g_localPos (pe do
-//       player), mas o olho/camera fica a ~1.6 m do pe -> o heurístico nunca
-//       reconhecia o proprio corpo e devolvia "obstaculo" para todo mundo.
-//       Agora 2.5 m, igual ao que ja era usado para o alvo.
-//   P3) Cache de LOS por frame (ring buffer de 64, tolerancia 0.5 m): ESP,
-//       aimbot e silent aim compartilham o mesmo resultado no mesmo frame.
-//   P4) Cache de dono de collider por frame: o walk de ancestralidade do
-//       OwnerKind custa ate 10 il2cpp_runtime_invoke por raio. Quando varios
-//       alvos estao atras do MESMO muro, o segundo em diante vira hit de cache.
-//   P5) LOS agora roda UMA vez por frame, para todos os alvos, dentro do
-//       UpdateTargets. Antes o aimbot fazia ate 12 chamadas proprias e o
-//       Silent::Override ate 128 por tiro. Agora todos leem t.visible.
-//   P6) Orcamento opcional de raycasts COM ROTACAO por slot (kLosBudget).
-//       Sem rotacao, "os N primeiros vencem" e o resto morre de fome.
-//   P7) ++g_frameId NAO foi adicionado ao UpdateView: ja e' incrementado uma
-//       vez por frame no UpdateTargets.
+//  >>> v5 — FPS:
+//   P11) Cache de MethodInfo (get_position/set_position/get_rotation/set_rotation
+//        /get_transform/get_name/get_childCount/GetChild/get_main). Era lookup
+//        de metadata do il2cpp a CADA chamada, e GetPos/SetRot rodam varias
+//        vezes por frame.
+//   P12) Cache de il2cpp_type_get_name. Ela ALOCA uma string nova a cada
+//        chamada e ninguem libera — e era usada em loops de varredura de campo.
+//   P13) CameraObj nao re-escaneia get_main todo frame.
+//   P14) RefreshTargets cacheia classe/metodo do FindObjectsOfType e PULA a
+//        varredura de Entity quando PlayerScript deriva de Entity (era o dobro
+//        de FindObjectsOfType, que aloca array gerenciado).
+//   P15) PruneTfCache em vez de ClearTfCache periodico (nao joga fora os
+//        transforms validos).
+//   P16) FireBulletAt sem std::vector (sem heap no caminho do tiro).
+//   P17) BonePoint: mapeamento de osso compartilhado com o aimbot.
+//   P18) ColliderFromHit com cache id->objeto por frame.
+//
+//  >>> v4 — ANTI-LAG DE LOS:
+//   P8) O bloco de LOS do UpdateTargets rodava para TODOS os alvos, TODO frame,
+//       com ate 10 raycasts por alvo. Cada raycast custa 1 runtime_invoke +
+//       1 FindObjectFromInstanceID + ate 10 get_parent. Com 10 alvos isso
+//       passava de mil invokes/frame; com Entity/NPCs (ate 128 alvos) chegava
+//       a ~10 mil. Roda no LateUpdate do JOGO -> o jogo travava junto.
+//       Agora: so alvos vivos/na tela/dentro do alcance, no maximo
+//       C.losPerFrame por frame em rodizio; quem nao foi processado mantem o
+//       ultimo t.visible.
+//   P9) Cache id->objeto do collider por frame.
+//   P10) CameraObj cacheado.
 //
 //  >>> CORRECOES ANTERIORES (mantidas):
-//   A) PlausibleObj/SafeClass/SafeObjField: valida TODO ponteiro antes de
-//      entrega-lo ao il2cpp. Um campo que nao e ponteiro (int, enum, struct)
-//      ou um objeto morto por troca de cena devolve lixo tipo
-//      0xFFFFFFFFFFFFFFFF ou 0x0000003900000031; entregar isso pro
-//      il2cpp_object_get_class AVa DENTRO do GameAssembly com o endereco igual
-//      ao proprio "ponteiro" (obj->klass em offset 0). Era o [veh] AV.
-//   B) ShootRayEx: Linecast recebe PONTO INICIAL e PONTO FINAL, nao
-//      direcao+comprimento. Antes passavamos o vetor unitario como 2o argumento
-//      em TODOS os backends -> em Linecast o raio virava uma linha de 1 METRO,
-//      nao batia em nada e o HasLineOfSightEx caia no "return true" ->
-//      tudo "visivel" e aimbot mirando atraves da parede.
-//      Agora o retorno e tri-state: 0=falhou | 1=sem hit | 2=hit.
-//   C) HasLineOfSightExRaw: distingue falha de invoke de "sem hit", com
-//      contadores e log detalhado (gate C.probeLog) pra diagnostico.
-//   D) UpdateView valida a camera; UpdateTargets re-resolve o local player se
-//      ele morrer numa troca de cena.
-//   E) RefreshTargets: diagnostico a cada 2s e checagem de plausibilidade nos
-//      objetos vindos de FindObjectsOfType.
-//
-//  1) FindGunStatsObj lia o TAMANHO do array em 0x10 ('bounds'). Fica em 0x18.
-//  2) se_runtime_invoke garante il2cpp_thread_attach por thread.
-//  3) il2cpp_class_from_type ganhou fallback para o nome longo do export.
-//  4) ReadTeam retorna -1 quando NAO conseguiu ler.
-//  5) O_rotationIsQuat deixou de ser hardcoded.
-//  6) FovRadiusPx centralizado.
-//  7) g_frameId nunca era incrementado -> cache de TargetVisible preso.
-//  8) Offsets do gunStats resolvidos PELA CLASSE DA INSTANCIA.
-//  9) Slots de alvo estaveis + cache de bones por player.
-//  10) LOS identifica o dono do collider por ANCESTRALIDADE (nao por posicao).
-//  11) ReadHealth/ReadTeam nao leem bytes de ponteiro como float.
-//  12) Arma equipada detectada por gunObject.activeInHierarchy.
-//  13) AntiHack: FindClassExact (o match de sufixo casava StoreAntiHack).
-//  14) FireBullet: direcao = ULTIMO Vector3, nao indice fixo.
-//  15) WorldToScreen: 'm' podia sair nao inicializado (C6001).
+//   P1) Anti auto-hit (raio comeca 45 cm a frente do olho).
+//   P2) OwnerKind: fallback 2.5 m.
+//   P3) Cache de LOS por frame.
+//   P4) Cache de dono de collider por frame.
+//   P5) LOS uma vez por frame dentro do UpdateTargets.
+//   A) PlausibleObj/SafeClass/SafeObjField (o [veh] AV).
+//   B) ShootRayEx: Linecast com PONTO INICIAL e PONTO FINAL (tri-state).
+//   C) HasLineOfSightExRaw: distingue falha de invoke de "sem hit".
+//   D) UpdateView valida camera; UpdateTargets re-resolve o local player.
+//   E) RefreshTargets: diagnostico e plausibilidade.
+//   1) FindGunStatsObj: tamanho do array em 0x18.
+//   2) se_runtime_invoke garante il2cpp_thread_attach.
+//   3) il2cpp_class_from_type com fallback de nome longo.
+//   4) ReadTeam retorna -1 quando nao conseguiu ler.
+//   5) O_rotationIsQuat nao e hardcoded.
+//   6) FovRadiusPx centralizado.
+//   7) g_frameId incrementado (cache de TargetVisible).
+//   8) Offsets de gunStats resolvidos pela CLASSE DA INSTANCIA.
+//   9) Slots de alvo estaveis + cache de bones.
+//  10) LOS identifica o dono do collider por ANCESTRALIDADE.
+//  11) ReadHealth/ReadTeam nao leem ponteiro como float.
+//  12) Arma equipada por gunObject.activeInHierarchy.
+//  13) AntiHack: FindClassExact.
+//  14) FireBullet: direcao = ULTIMO Vector3.
+//  15) WorldToScreen: 'm' inicializado.
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -371,14 +368,39 @@ static bool se_read_vec3(void* base, size_t off, Vec3* out) {
 }
 
 // ===========================================================================
+//  >>> FIX P11/P12: caches que faltavam
+//
+//  se_class_get_method_from_name faz lookup na metadata do il2cpp.
+//  il2cpp_type_get_name ALOCA uma string nova a CADA chamada (nunca liberada).
+//  GetPos/SetPos/GetRot/SetRot rodam varias vezes por frame e chamavam os dois.
+//
+//  ATENCAO: 'name' tem que ser LITERAL (o cache compara ponteiro).
+//  Uso single-thread (thread do jogo).
+// ===========================================================================
+static MethodInfo* MethodCached(Il2CppClass* k, const char* name, int argc) {
+    if (!k || !name) return nullptr;
+    struct Ent { Il2CppClass* k; const char* n; int a; MethodInfo* m; };
+    static Ent c[96]; static int n = 0;
+    for (int i = 0; i < n; ++i)
+        if (c[i].k == k && c[i].a == argc && c[i].n == name) return c[i].m;
+    MethodInfo* m = se_class_get_method_from_name(k, name, argc);
+    if (n < 96) { c[n].k = k; c[n].n = name; c[n].a = argc; c[n].m = m; ++n; }
+    return m;
+}
+
+static const char* TypeNameCached(const Il2CppType* t) {
+    if (!t || !il2cpp_type_get_name) return "?";
+    struct Ent { const Il2CppType* t; const char* n; };
+    static Ent c[512]; static int n = 0;
+    for (int i = 0; i < n; ++i) if (c[i].t == t) return c[i].n;
+    const char* nm = il2cpp_type_get_name(t);
+    if (!nm) nm = "?";
+    if (n < 512) { c[n].t = t; c[n].n = nm; ++n; }
+    return nm;
+}
+
+// ===========================================================================
 //  >>> FIX A: VALIDACAO DE PONTEIRO
-//  Um campo que NAO e ponteiro (int, enum, struct de 8 bytes) ou um objeto
-//  morto por troca de cena devolve lixo tipo 0xFFFFFFFFFFFFFFFF ou
-//  0x0000003900000031 (dois int32 empacotados). Entregar isso pro
-//  il2cpp_object_get_class AVa DENTRO do GameAssembly, e o endereco do AV
-//  fica IGUAL ao proprio "ponteiro" (obj->klass em offset 0).
-//  PlausibleObj barra na faixa, no alinhamento (ponteiro de objeto e
-//  8-alinhado) e na paginacao.
 // ===========================================================================
 static bool PlausibleObj(const void* p) {
     uintptr_t v = (uintptr_t)p;
@@ -471,7 +493,6 @@ namespace SDK {
     MethodInfo* M_get_fov = nullptr;
     MethodInfo* M_set_fov = nullptr;
 
-    static MethodInfo* M_get_transform = nullptr;
     static MethodInfo* M_get_name = nullptr;
     static MethodInfo* M_get_childCount = nullptr;
     static MethodInfo* M_GetChild = nullptr;
@@ -499,7 +520,6 @@ namespace SDK {
 
     static std::mutex g_tfMx;
     static std::unordered_map<Il2CppObject*, Il2CppObject*> g_tfCache;
-    static std::unordered_map<Il2CppClass*, MethodInfo*>     g_getPosMx;
 
     static std::vector<uint32_t> g_strOffs;
     static uint32_t g_pickedNameOff = 0;
@@ -524,8 +544,8 @@ namespace SDK {
                 if (!f) continue;
                 if (typeSub) {
                     const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
-                    const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-                    if (!tn || !strstr(tn, typeSub)) continue;
+                    const char* tn = TypeNameCached(t);
+                    if (!strstr(tn, typeSub)) continue;
                 }
                 if (outName) *outName = n;
                 uint32_t o = (uint32_t)se_field_offset(f);
@@ -544,15 +564,13 @@ namespace SDK {
         FieldInfo* f = k ? se_class_get_field_from_name(k, name) : nullptr;
         if (!f) return "?";
         const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
-        const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-        return tn ? tn : "?";
+        return TypeNameCached(t);
     }
 
     const char* MethodReturnName(MethodInfo* m) {
         if (!m || !il2cpp_method_get_return_type) return "?";
         const Il2CppType* t = il2cpp_method_get_return_type(m);
-        const char* n = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-        return n ? n : "?";
+        return TypeNameCached(t);
     }
 
     // ======================= SyncVar (FishNet) =======================
@@ -570,8 +588,8 @@ namespace SDK {
             if (!f) break;
             const char* fn = se_field_name(f);
             const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
-            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-            Log("[sync]   %-22s : %s @0x%X", fn ? fn : "?", tn ? tn : "?", (unsigned)se_field_offset(f));
+            Log("[sync]   %-22s : %s @0x%X", fn ? fn : "?", TypeNameCached(t),
+                (unsigned)se_field_offset(f));
             if (++n > 40) break;
         }
         Log("[sync] ---- fim ----");
@@ -738,7 +756,7 @@ namespace SDK {
     int ScreenH() { return Hooks::g_viewH; }
 
     Il2CppObject* SafeReadObjPub(void* base, unsigned int off) {
-        return SafeObjField(base, off);          // <<< FIX A
+        return SafeObjField(base, off);
     }
 
     Il2CppClass* AntiHackClass() { return kAntiHack; }
@@ -770,9 +788,9 @@ namespace SDK {
         if (!obj) return nullptr;
         Il2CppClass* k = SafeClass(obj);
         if (!k) return nullptr;
-        if (!M_get_transform) M_get_transform = se_class_get_method_from_name(k, "get_transform", 0);
-        if (!M_get_transform) return nullptr;
-        Il2CppObject* r = se_runtime_invoke(M_get_transform, obj, nullptr);
+        MethodInfo* m = MethodCached(k, "get_transform", 0);
+        if (!m) return nullptr;
+        Il2CppObject* r = se_runtime_invoke(m, obj, nullptr);
         return (r && PlausibleObj(r)) ? r : nullptr;
     }
 
@@ -793,6 +811,17 @@ namespace SDK {
         g_tfCache.clear();
     }
 
+    // >>> FIX P15: em vez de jogar TODOS os transforms fora a cada 2 s (e
+    //     re-invokar get_transform de todo mundo), remove so os mortos.
+    static void PruneTfCache() {
+        std::lock_guard<std::mutex> lk(g_tfMx);
+        for (auto it = g_tfCache.begin(); it != g_tfCache.end(); ) {
+            Il2CppObject* o = it->first;
+            if (!o || !PlausibleObj(o)) it = g_tfCache.erase(it);
+            else ++it;
+        }
+    }
+
     static bool IsTransformClass(Il2CppClass* k) {
         if (!k) return false;
         for (Il2CppClass* c = k; c; c = se_class_parent(c)) {
@@ -802,19 +831,9 @@ namespace SDK {
         return false;
     }
 
-    static MethodInfo* GetPositionMethod(Il2CppClass* k) {
-        if (!k) return nullptr;
-        std::lock_guard<std::mutex> lk(g_tfMx);
-        auto it = g_getPosMx.find(k);
-        if (it != g_getPosMx.end()) return it->second;
-        MethodInfo* m = se_class_get_method_from_name(k, "get_position", 0);
-        g_getPosMx[k] = m;
-        return m;
-    }
-
     Vec3 GetPos(Il2CppObject* obj) {
         Vec3 out{ 0.f, 0.f, 0.f };
-        if (!obj || !PlausibleObj(obj)) return out;      // <<< FIX A
+        if (!obj || !PlausibleObj(obj)) return out;
 
         Il2CppClass* k = SafeClass(obj);
         if (!k) return out;
@@ -827,7 +846,8 @@ namespace SDK {
             if (!k) return out;
         }
 
-        MethodInfo* m = GetPositionMethod(k);
+        // >>> FIX P11: cache de metadata
+        MethodInfo* m = MethodCached(k, "get_position", 0);
         if (!m) return out;
 
         Il2CppObject* boxed = se_runtime_invoke(m, node, nullptr);
@@ -848,7 +868,7 @@ namespace SDK {
             k = SafeClass(node);
             if (!k) return;
         }
-        MethodInfo* sp = se_class_get_method_from_name(k, "set_position", 1);
+        MethodInfo* sp = MethodCached(k, "set_position", 1);
         if (!sp) return;
 
         Vec3 vv = v;
@@ -859,7 +879,7 @@ namespace SDK {
     // ======================= rotacao =======================
     Il2CppObject* CamTfObj() {
         if (!g_localPlayer || !O_camTf) return nullptr;
-        Il2CppObject* tf = SafeObjField(g_localPlayer, O_camTf);   // <<< FIX A
+        Il2CppObject* tf = SafeObjField(g_localPlayer, O_camTf);
         if (!tf) return nullptr;
         if (kTransform && !IsA(tf, kTransform)) return nullptr;
         return tf;
@@ -885,7 +905,8 @@ namespace SDK {
         if (!tf) return false;
         Il2CppClass* k = SafeClass(tf);
         if (!k) return false;
-        MethodInfo* gr = se_class_get_method_from_name(k, "get_rotation", 0);
+        // >>> FIX P11
+        MethodInfo* gr = MethodCached(k, "get_rotation", 0);
         if (!gr) return false;
         Il2CppObject* b = se_runtime_invoke(gr, tf, nullptr);
         if (!b) return false;
@@ -899,7 +920,8 @@ namespace SDK {
         if (!tf) return false;
         Il2CppClass* k = SafeClass(tf);
         if (!k) return false;
-        MethodInfo* sr = se_class_get_method_from_name(k, "set_rotation", 1);
+        // >>> FIX P11
+        MethodInfo* sr = MethodCached(k, "set_rotation", 1);
         if (!sr) return false;
         void* a[1]; a[0] = &q;
         se_runtime_invoke(sr, tf, a);
@@ -950,7 +972,7 @@ namespace SDK {
 
     bool IsA(Il2CppObject* o, Il2CppClass* c) {
         if (!o || !c) return false;
-        for (Il2CppClass* k = SafeClass(o); k; k = se_class_parent(k))   // <<< FIX A
+        for (Il2CppClass* k = SafeClass(o); k; k = se_class_parent(k))
             if (k == c) return true;
         return false;
     }
@@ -974,8 +996,7 @@ namespace SDK {
             FieldInfo* f = se_class_get_fields(kPlayerScript, &it);
             if (!f) break;
             const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
-            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-            if (!tn || !strstr(tn, "String")) continue;
+            if (!strstr(TypeNameCached(t), "String")) continue;
             uint32_t o = (uint32_t)se_field_offset(f);
             if (o) g_strOffs.push_back(o);
         }
@@ -1038,8 +1059,7 @@ namespace SDK {
             const char* fn = se_field_name(f);
             if (!fn) continue;
             const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
-            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-            if (!tn || !strstr(tn, "String")) continue;
+            if (!strstr(TypeNameCached(t), "String")) continue;
             uint32_t off = (uint32_t)se_field_offset(f);
             if (!off) continue;
             if (ReadStringField(inst, off, buf, sizeof(buf)))
@@ -1065,14 +1085,14 @@ namespace SDK {
             if (!k) continue;
 
             char nm[128] = "?";
-            MethodInfo* gn = se_class_get_method_from_name(k, "get_name", 0);
+            MethodInfo* gn = MethodCached(k, "get_name", 0);
             if (gn) {
                 Il2CppObject* s = se_runtime_invoke(gn, cur, nullptr);
                 if (s) StrToUtf8((Il2CppString*)s, nm, sizeof(nm));
             }
 
             int cc = 0;
-            MethodInfo* gc = se_class_get_method_from_name(k, "get_childCount", 0);
+            MethodInfo* gc = MethodCached(k, "get_childCount", 0);
             if (gc) {
                 Il2CppObject* b = se_runtime_invoke(gc, cur, nullptr);
                 if (b) { void* p = se_object_unbox(b); if (p) cc = *(int*)p; }
@@ -1080,7 +1100,7 @@ namespace SDK {
 
             Log("[hier] %-40s filhos=%d", nm, cc);
 
-            MethodInfo* gch = se_class_get_method_from_name(k, "GetChild", 1);
+            MethodInfo* gch = MethodCached(k, "GetChild", 1);
             if (!gch) continue;
 
             for (int i = 0; i < cc && top < 1024; ++i) {
@@ -1119,7 +1139,7 @@ namespace SDK {
             Il2CppClass* k = SafeClass(cur);
             if (!k) continue;
 
-            if (!M_get_name) M_get_name = se_class_get_method_from_name(k, "get_name", 0);
+            if (!M_get_name) M_get_name = MethodCached(k, "get_name", 0);
             if (M_get_name) {
                 Il2CppObject* s = se_runtime_invoke(M_get_name, cur, nullptr);
                 if (s) {
@@ -1129,8 +1149,8 @@ namespace SDK {
                 }
             }
 
-            if (!M_get_childCount) M_get_childCount = se_class_get_method_from_name(k, "get_childCount", 0);
-            if (!M_GetChild) M_GetChild = se_class_get_method_from_name(k, "GetChild", 1);
+            if (!M_get_childCount) M_get_childCount = MethodCached(k, "get_childCount", 0);
+            if (!M_GetChild) M_GetChild = MethodCached(k, "GetChild", 1);
             if (!M_get_childCount || !M_GetChild) continue;
 
             int cc = 0;
@@ -1209,8 +1229,11 @@ namespace SDK {
         if (!kCamera) kCamera = FindClass("Camera", "UnityEngine");
         if (!kCamera) return nullptr;
 
-        if (MethodInfo* m = se_class_get_method_from_name(kCamera, "get_main", 0)) {
-            Il2CppObject* c = se_runtime_invoke(m, nullptr, nullptr);
+        // >>> FIX P13: get_main era re-escaneado TODO frame.
+        static MethodInfo* mMain = nullptr;
+        if (!mMain) mMain = se_class_get_method_from_name(kCamera, "get_main", 0);
+        if (mMain) {
+            Il2CppObject* c = se_runtime_invoke(mMain, nullptr, nullptr);
             if (c && PlausibleObj(c)) return c;
         }
         if (g_localPlayer && O_mCamera) {
@@ -1222,7 +1245,7 @@ namespace SDK {
             if (tf) {
                 Il2CppClass* tk = SafeClass(tf);
                 if (tk) {
-                    if (!M_GetComponent) M_GetComponent = se_class_get_method_from_name(tk, "GetComponent", 1);
+                    if (!M_GetComponent) M_GetComponent = MethodCached(tk, "GetComponent", 1);
                     if (M_GetComponent) {
                         Il2CppType* t = se_class_get_type(kCamera);
                         if (t) {
@@ -1264,12 +1287,11 @@ namespace SDK {
         g_camera = CameraObj();
         if (!g_camera) { g_viewProjOk = false; return; }
 
-        // >>> FIX D: camera morta numa troca de cena
         Il2CppClass* ck = SafeClass(g_camera);
         if (!ck) { g_camera = nullptr; g_viewProjOk = false; return; }
 
-        if (!M_camW2C)  M_camW2C = se_class_get_method_from_name(ck, "get_worldToCameraMatrix", 0);
-        if (!M_camProj) M_camProj = se_class_get_method_from_name(ck, "get_projectionMatrix", 0);
+        if (!M_camW2C)  M_camW2C = MethodCached(ck, "get_worldToCameraMatrix", 0);
+        if (!M_camProj) M_camProj = MethodCached(ck, "get_projectionMatrix", 0);
 
         float V[16] = {}, P[16] = {};
         if (!ReadMatrix(g_camera, M_camW2C, V) || !ReadMatrix(g_camera, M_camProj, P)) {
@@ -1289,9 +1311,7 @@ namespace SDK {
         g_viewProjOk = true;
         InterlockedIncrement(&g_vpSeq);
 
-        // >>> g_frameId NAO e' incrementado aqui: ja e' feito no UpdateTargets,
-        //     uma vez por frame. Incrementar nos dois lugares invalidaria o
-        //     cache de LOS no meio do frame.
+        // g_frameId NAO e' incrementado aqui: ja e' feito no UpdateTargets.
     }
 
     bool WorldToScreen(Vec3 w, Vec2& out) {
@@ -1338,13 +1358,6 @@ namespace SDK {
     }
 
     // ======================= LINE OF SIGHT =======================
-    // Backends, em ordem de preferencia:
-    //   1 Raycast(Vector3,Vector3,out RaycastHit,float)
-    //   2 Raycast(Vector3,Vector3,out RaycastHit,float,int)
-    //   3 Linecast(Vector3,Vector3,out RaycastHit)
-    //   4 Linecast(Vector3,Vector3,out RaycastHit,int)
-    //   5 Raycast(Ray,out RaycastHit,float)
-    //   6 Raycast(Ray,out RaycastHit,float,int)
     static MethodInfo* FindPhysicsRay(const char* name, int nParams, int kind,
         const char* t0, const char* t1, const char* t2) {
         if (!kPhysics) kPhysics = FindClass("Physics", "UnityEngine");
@@ -1359,18 +1372,15 @@ namespace SDK {
 
             const Il2CppType* p0 = il2cpp_method_get_param(m, 0);
             if (!p0) continue;
-            const char* n0 = il2cpp_type_get_name(p0);
-            if (!n0 || !strstr(n0, t0)) continue;
+            if (!strstr(TypeNameCached(p0), t0)) continue;
 
             if (t1) {
                 const Il2CppType* p1 = il2cpp_method_get_param(m, 1);
-                const char* n1 = p1 ? il2cpp_type_get_name(p1) : nullptr;
-                if (!n1 || !strstr(n1, t1)) continue;
+                if (!p1 || !strstr(TypeNameCached(p1), t1)) continue;
             }
             if (t2) {
                 const Il2CppType* p2 = il2cpp_method_get_param(m, 2);
-                const char* n2 = p2 ? il2cpp_type_get_name(p2) : nullptr;
-                if (!n2 || !strstr(n2, t2)) continue;
+                if (!p2 || !strstr(TypeNameCached(p2), t2)) continue;
             }
             g_rayKind = kind;
             return (MethodInfo*)m;
@@ -1390,8 +1400,8 @@ namespace SDK {
             if (!fc) fc = se_class_get_field_from_name(kRaycastHit, "collider");
             if (fc) {
                 const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(fc) : nullptr;
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-                g_hitColIsId = !tn || (strstr(tn, "Int32") != nullptr) || (strstr(tn, "Int") != nullptr);
+                const char* tn = TypeNameCached(t);
+                g_hitColIsId = (strstr(tn, "Int32") != nullptr) || (strstr(tn, "Int") != nullptr);
                 O_hitCollider = (uint32_t)se_field_offset(fc);
             }
         }
@@ -1441,9 +1451,9 @@ namespace SDK {
     static int ShootRayEx(Vec3 from, Vec3 dir, float len, unsigned char* hitBuf) {
         if (g_rayKind == 0) return 0;
 
-        Vec3 sv = from;                  // start
-        Vec3 dv = dir;                   // direction (Raycast)
-        Vec3 ev = from + dir * len;      // end       (Linecast)
+        Vec3 sv = from;
+        Vec3 dv = dir;
+        Vec3 ev = from + dir * len;
         float lv = len;
         int mask = -1;
         RayS ray{ from, dir };
@@ -1452,8 +1462,8 @@ namespace SDK {
         switch (g_rayKind) {
         case 1: args[0] = &sv;  args[1] = &dv; args[2] = hitBuf; args[3] = &lv; break;
         case 2: args[0] = &sv;  args[1] = &dv; args[2] = hitBuf; args[3] = &lv; args[4] = &mask; break;
-        case 3: args[0] = &sv;  args[1] = &ev; args[2] = hitBuf; break;                  // <<< FIX
-        case 4: args[0] = &sv;  args[1] = &ev; args[2] = hitBuf; args[3] = &mask; break;  // <<< FIX
+        case 3: args[0] = &sv;  args[1] = &ev; args[2] = hitBuf; break;
+        case 4: args[0] = &sv;  args[1] = &ev; args[2] = hitBuf; args[3] = &mask; break;
         case 5: args[0] = &ray; args[1] = hitBuf; args[2] = &lv; break;
         case 6: args[0] = &ray; args[1] = hitBuf; args[2] = &lv; args[3] = &mask; break;
         default: return 0;
@@ -1470,9 +1480,6 @@ namespace SDK {
         return ShootRayEx(from, dir, len, hitBuf) == 2;
     }
 
-    // =========================================================================
-    //  >>> FIX C: contadores + log do LOS (gate C.probeLog)
-    // =========================================================================
     static uint32_t g_losOk = 0, g_losSemHit = 0, g_losFalhou = 0, g_losBloqueado = 0;
 
     static void LosLog(const char* tag, Vec3 sv, float hit, float dist, int kind) {
@@ -1503,9 +1510,18 @@ namespace SDK {
         if (!tf) return nullptr;
         Il2CppClass* k = SafeClass(tf);
         if (!k) return nullptr;
-        if (!M_get_parent) M_get_parent = se_class_get_method_from_name(k, "get_parent", 0);
+        if (!M_get_parent) M_get_parent = MethodCached(k, "get_parent", 0);
         if (!M_get_parent) return nullptr;
         return se_runtime_invoke(M_get_parent, tf, nullptr);
+    }
+
+    // =========================================================================
+    //  >>> FIX P18: cache id->objeto do collider, por frame.
+    // =========================================================================
+    namespace {
+        struct IdEnt { int id; Il2CppObject* obj; uint64_t stamp; };
+        static IdEnt    g_idCache[64];
+        static uint32_t g_idRing = 0;
     }
 
     static Il2CppObject* ColliderFromHit(unsigned char* hitBuf) {
@@ -1513,7 +1529,18 @@ namespace SDK {
         if (g_hitColIsId) {
             int id = 0;
             if (!se_read_int(hitBuf, O_hitCollider, &id) || id <= 0) return nullptr;
-            return ObjectFromInstanceID(id);
+
+            for (int i = 0; i < 64; ++i)
+                if (g_idCache[i].stamp == g_frameId && g_idCache[i].id == id)
+                    return g_idCache[i].obj;
+
+            Il2CppObject* o = ObjectFromInstanceID(id);
+            if (o) {
+                IdEnt* e = &g_idCache[g_idRing];
+                g_idRing = (g_idRing + 1) % 64;
+                e->id = id; e->obj = o; e->stamp = g_frameId;
+            }
+            return o;
         }
         void* p = nullptr;
         if (!se_read_ptr(hitBuf, O_hitCollider, &p) || !p) return nullptr;
@@ -1522,18 +1549,6 @@ namespace SDK {
 
     // =========================================================================
     //  >>> P3/P4: CACHES POR FRAME
-    //
-    //  g_losCache  — chave = posicao mirada (tolerancia 0.5 m). ESP, aimbot e
-    //                silent aim pedem o mesmo alvo no mesmo frame -> hit.
-    //  g_okCache   — chave = (collider, transform do alvo). O walk de
-    //                ancestralidade do OwnerKind custa ate 10 il2cpp_runtime_
-    //                invoke POR RAIO. Varios alvos atras do MESMO muro repetem
-    //                o mesmo collider; do segundo em diante vira hit.
-    //
-    //  Ambos sao carimbados com g_losStamp (frame) e se invalidam sozinhos.
-    //  kLosBudget = 0 -> so dedup. > 0 -> no maximo N raycasts reais por frame,
-    //  com ROTACAO por slot (sem rotacao, "os N primeiros vencem" sempre e os
-    //  alvos do fim da lista morrem de fome).
     // =========================================================================
     namespace {
 
@@ -1606,9 +1621,6 @@ namespace SDK {
         Vec3 op = GetPos(tf);
         if (op.zero()) return 0;
         if (!targetTf && (op - aim).len() < 2.5f) return 2;
-        // >>> P2: o olho/camera fica a ~1.6 m do PE do player (g_localPos).
-        //     Com 1.5 m o heurístico nunca reconhecia o proprio corpo e
-        //     devolvia 0 (obstaculo) -> "visiveis=0" em todo mundo.
         if (!localTf && (op - g_localPos).len() < 2.5f) return 1;
         return 0;
     }
@@ -1637,11 +1649,6 @@ namespace SDK {
         if (dist < 2.0f) { ++g_losOk; return true; }
         Vec3 dir{ d.x / dist, d.y / dist, d.z / dist };
 
-        // >>> P1: ANTI AUTO-HIT.
-        //     O raio nascia dentro do collider do proprio player, acertava o
-        //     proprio corpo, OwnerKind devolvia 1, o loop avancava 0.30 m e
-        //     repetia — ate 10 raycasts por chamada, e no fim tudo "bloqueado".
-        //     Comecar 45 cm a frente resolve os DOIS problemas de uma vez.
         float adv = 0.45f;
         if (adv > dist * 0.4f) adv = dist * 0.4f;
         eye = eye + dir * adv;
@@ -1696,17 +1703,12 @@ namespace SDK {
 
     bool HasLineOfSightEx(Vec3 eye, Vec3 aim, Il2CppObject* lt, Il2CppObject* tt)
     {
-        // novo frame -> zera o orcamento
         if (g_frameId != g_losStamp) { g_losStamp = g_frameId; g_losBudget = 0; }
 
         LosEnt* e = LosFind(aim);
-
-        // ja fizemos esse raio NESTE frame (ESP, aimbot e silent compartilham)
         if (e && e->stamp == g_losStamp) return e->res;
 
         if (kLosBudget > 0 && e) {
-            // rotacao por slot: cada entrada renova a cada kLosBudget frames,
-            // escalonada. Sem isso os primeiros da ordem de chamada monopolizam.
             if (((e->slot + (uint32_t)g_losStamp) % (uint32_t)kLosBudget) != 0) return e->res;
             if (g_losBudget >= kLosBudget) return e->res;
         }
@@ -1732,6 +1734,8 @@ namespace SDK {
         g_losBudget = 0;
         g_losFrame = (uint64_t)-1;
         memset(g_losState, 0xFF, sizeof(g_losState));
+        memset(g_idCache, 0, sizeof(g_idCache));
+        g_idRing = 0;
     }
 
     bool TargetVisible(int idx, Vec3 eye, Vec3 aim) {
@@ -1776,7 +1780,7 @@ namespace SDK {
         if (!g_camera) return 1.732f;
         Il2CppClass* ck = SafeClass(g_camera);
         if (!ck) return 1.732f;
-        if (!M_camProj) M_camProj = se_class_get_method_from_name(ck, "get_projectionMatrix", 0);
+        if (!M_camProj) M_camProj = MethodCached(ck, "get_projectionMatrix", 0);
         float P[16] = {};
         if (!ReadMatrix(g_camera, M_camProj, P)) return 1.732f;
         if (P[5] <= 0.0001f) return 1.732f;
@@ -1790,6 +1794,28 @@ namespace SDK {
         return (h * 0.5f) * tanf(deg * 0.01745329252f) * cot;
     }
 
+    // =========================================================================
+    //  >>> FIX P17: mapeamento de osso compartilhado (aimbot + TargetAimPos).
+    //  0=auto 1=cabeca 2=peito 3=estomago 4=perna 5=aleatorio
+    // =========================================================================
+    Vec3 BonePoint(Vec3 head, Vec3 feet, int boneMode) {
+        const float dy = head.y - feet.y;
+        switch (boneMode) {
+        case 2: return Vec3(head.x, feet.y + dy * 0.85f, head.z);
+        case 3: return Vec3(head.x, feet.y + dy * 0.65f, head.z);
+        case 4: return Vec3(head.x, feet.y + dy * 0.30f, head.z);
+        case 5: {
+            static int pick = 0;
+            static uint64_t last = 0;
+            const uint64_t now = GetTickCount64();
+            if (now - last > 250) { last = now; pick = (int)(now % 3); }
+            const float t = (pick == 0) ? 0.85f : (pick == 1 ? 0.65f : 0.30f);
+            return Vec3(head.x, feet.y + dy * t, head.z);
+        }
+        default: return head;
+        }
+    }
+
     Vec3 TargetAimPos(Il2CppObject* p, int boneMode) {
         if (!p) return Vec3();
         EnterCriticalSection(&g_targetCs);
@@ -1799,9 +1825,7 @@ namespace SDK {
             Vec3 h = t.headBone ? GetPos(t.headBone) : t.head;
             Vec3 f = t.footBone ? GetPos(t.footBone) : t.feet;
             LeaveCriticalSection(&g_targetCs);
-            if (boneMode == 0) return h;
-            if (boneMode == 2) return Vec3(h.x, (h.y + f.y) * 0.5f, h.z);
-            return Vec3(h.x, h.y - (h.y - f.y) * 0.25f, h.z);
+            return BonePoint(h, f, boneMode);
         }
         LeaveCriticalSection(&g_targetCs);
         return Vec3();
@@ -1855,7 +1879,7 @@ namespace SDK {
 
     static bool GunStatsLooksLive(Il2CppObject* s) {
         if (!s) return false;
-        Il2CppClass* k = SafeClass(s);            // <<< FIX A
+        Il2CppClass* k = SafeClass(s);
         if (!k) return false;
         EnsureGunOffsets(k);
 
@@ -1871,7 +1895,7 @@ namespace SDK {
         if (!go) return false;
         Il2CppClass* gk = SafeClass(go);
         if (!gk) return false;
-        MethodInfo* m = se_class_get_method_from_name(gk, "get_activeInHierarchy", 0);
+        MethodInfo* m = MethodCached(gk, "get_activeInHierarchy", 0);
         if (!m) return false;
         Il2CppObject* r = se_runtime_invoke(m, go, nullptr);
         if (!r) return false;
@@ -1961,9 +1985,7 @@ namespace SDK {
                 FieldInfo* f = se_class_get_fields(k, &it);
                 if (!f) break;
                 const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-                if (!tn) continue;
-                if (!strstr(tn, "Gun") && !strstr(tn, "Weapon")) continue;
+                if (!strstr(TypeNameCached(t), "Gun") && !strstr(TypeNameCached(t), "Weapon")) continue;
                 uint32_t off = (uint32_t)se_field_offset(f);
                 if (!off) continue;
                 Il2CppObject* s = SafeObjField(g_localPlayer, off);
@@ -2032,18 +2054,18 @@ namespace SDK {
             const char* fn = se_field_name(f);
             if (!fn) continue;
             const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
-            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
+            const char* tn = TypeNameCached(t);
             uint32_t off = (uint32_t)se_field_offset(f);
             if (!off) continue;
 
-            if (tn && (strstr(tn, "Int32") || strstr(tn, "UInt32") || strstr(tn, "Int16") || strstr(tn, "Byte"))) {
+            if (strstr(tn, "Int32") || strstr(tn, "UInt32") || strstr(tn, "Int16") || strstr(tn, "Byte")) {
                 int v = 0; se_read_int(o, off, &v);
                 Log("[dumpv]   %-28s : %-14s @0x%X = %d", fn, tn, off, v);
             }
-            else if (tn && strstr(tn, "Single")) {
+            else if (strstr(tn, "Single")) {
                 Log("[dumpv]   %-28s : %-14s @0x%X = %.3f", fn, tn, off, se_read_float(o, off));
             }
-            else if (tn && strstr(tn, "Boolean")) {
+            else if (strstr(tn, "Boolean")) {
                 Log("[dumpv]   %-28s : %-14s @0x%X = %d", fn, tn, off, (int)se_read_bool(o, off));
             }
             else {
@@ -2153,15 +2175,44 @@ namespace SDK {
         if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
         if (g_localPlayer) g_localTeam = ReadTeam(g_localPlayer);
 
-        Il2CppClass* oc = FindClass("Object", "UnityEngine");
-        if (!oc) return;
-        MethodInfo* fot = se_class_get_method_from_name(oc, "FindObjectsOfType", 1);
-        if (!fot) return;
+        // >>> FIX P14: cacheia a classe e o metodo (eram re-resolvidos a cada
+        //     200 ms, e o FindClass segura o mutex varrendo a tabela inteira).
+        static Il2CppClass* sObjCls = nullptr;
+        static MethodInfo* sFindObjs = nullptr;
+        if (!sObjCls) {
+            sObjCls = FindClass("Object", "UnityEngine");
+            if (!sObjCls) return;
+            sFindObjs = se_class_get_method_from_name(sObjCls, "FindObjectsOfType", 1);
+            if (!sFindObjs) return;
+        }
 
-        Il2CppClass* scans[2] = {
-            kPlayerScript ? kPlayerScript : FindClass("PlayerScript"),
-            kEntity ? kEntity : FindClass("Entity")
-        };
+        // >>> FIX P14: se PlayerScript DERIVA de Entity, varrer Entity ja traz os
+        //     players. Varrer os dois dobrava o FindObjectsOfType.
+        static int sOnlyEntity = -1;
+        if (sOnlyEntity < 0) {
+            sOnlyEntity = 0;
+            if (kPlayerScript && kEntity) {
+                for (Il2CppClass* c = kPlayerScript; c; c = se_class_parent(c))
+                    if (c == kEntity) { sOnlyEntity = 1; break; }
+            }
+            Log("[sdk] scan: %s", sOnlyEntity ? "so Entity (PlayerScript deriva)" : "PlayerScript + Entity");
+        }
+
+        Il2CppClass* scans[2];
+        int nScan = 0;
+        if (sOnlyEntity) {
+            Il2CppClass* e = kEntity ? kEntity : FindClass("Entity");
+            if (e) scans[nScan++] = e;
+        }
+        else {
+            Il2CppClass* p = kPlayerScript ? kPlayerScript : FindClass("PlayerScript");
+            Il2CppClass* e = kEntity ? kEntity : FindClass("Entity");
+            if (p) scans[nScan++] = p;
+            if (e && e != p) scans[nScan++] = e;
+        }
+        if (nScan == 0) return;
+
+        MethodInfo* fot = sFindObjs;
 
         ++g_slotGen;
 
@@ -2169,10 +2220,9 @@ namespace SDK {
         found.reserve(MAX_TARGETS);
         int totalObjs = 0;
 
-        for (int s = 0; s < 2; ++s) {
+        for (int s = 0; s < nScan; ++s) {
             Il2CppClass* sc = scans[s];
             if (!sc) continue;
-            if (s == 1 && scans[0] == scans[1]) break;
 
             Il2CppType* t = se_class_get_type(sc);
             if (!t) continue;
@@ -2188,7 +2238,7 @@ namespace SDK {
 
             for (uint32_t i = 0; i < n; ++i) {
                 Il2CppObject* e = (Il2CppObject*)se_array_at(arr, i);
-                if (!e || !PlausibleObj(e)) continue;      // <<< FIX A
+                if (!e || !PlausibleObj(e)) continue;
                 if (IsLocalEntity(e)) { AdoptLocal(e); continue; }
 
                 bool dup = false;
@@ -2248,7 +2298,6 @@ namespace SDK {
         g_targetCount = c;
         LeaveCriticalSection(&g_targetCs);
 
-        // >>> DIAGNOSTICO: alem do log "on change", um resumo a cada 2s
         static ULONGLONG lastScan2 = 0;
         ULONGLONG nows = GetTickCount64();
         if (nows - lastScan2 >= 2000) {
@@ -2278,15 +2327,14 @@ namespace SDK {
 
     void UpdateTargets() {
         static ULONGLONG lastRefresh = 0;
-        static ULONGLONG lastTfClear = 0;
+        static ULONGLONG lastTfPrune = 0;
         ULONGLONG now = GetTickCount64();
         if (now - lastRefresh > 200) { lastRefresh = now; RefreshTargets(); }
-        if (now - lastTfClear > 2000) { lastTfClear = now; ClearTfCache(); }
+        if (now - lastTfPrune > 2000) { lastTfPrune = now; PruneTfCache(); }
 
         if (!g_localPlayer) { g_localPlayer = FindLocalPlayer(); g_local = g_localPlayer; }
         if (!g_localPlayer) return;
 
-        // >>> FIX D: ponteiro do local pode ficar pendurado numa troca de cena
         if (!SafeClass(g_localPlayer)) {
             Log("[sdk] localPlayer morto (%p), re-resolvendo", g_localPlayer);
             g_localPlayer = FindLocalPlayer();
@@ -2294,7 +2342,7 @@ namespace SDK {
             if (!g_localPlayer) return;
         }
 
-        ++g_frameId;                       // <<< UMA vez por frame. NAO incrementar no UpdateView.
+        ++g_frameId;                       // UMA vez por frame.
         g_localPos = GetPos(g_localPlayer);
         g_localTeam = ReadTeam(g_localPlayer);
 
@@ -2328,16 +2376,11 @@ namespace SDK {
         LeaveCriticalSection(&g_targetCs);
 
         // =====================================================================
-        //  >>> P5: LOS UMA VEZ POR FRAME, PARA TODOS OS ALVOS.
-        //
-        //  Antes o aimbot fazia ate 12 chamadas proprias e o Silent::Override
-        //  ate 128 por tiro. Agora ninguem chama: todos leem t.visible.
-        //
-        //  O HasLineOfSightEx tem cache por frame, entao qualquer chamada
-        //  extra (ESP com visCheck, aimbot, silent) e' hit O(1) sem raycast.
-        //
-        //  Fora do critical section de proposito: e' o mesmo comportamento do
-        //  round-robin antigo e nao prende a thread de render.
+        //  >>> FIX P8: LOS com ORCAMENTO POR FRAME + filtro de quem importa.
+        //  So alvos vivos, NA TELA e dentro do alcance; no maximo
+        //  C.losPerFrame por frame, em rodizio; quem nao foi processado mantem
+        //  o ultimo t.visible. O aimbot continua correto (HasLineOfSightEx tem
+        //  cache por frame e faz o raio na hora se precisar).
         // =====================================================================
         if ((C.espVisCheck || C.aimVisCheck) && LosReady()) {
             float cap = C.espMaxDist > C.aimMaxDist ? C.espMaxDist : C.aimMaxDist;
@@ -2346,14 +2389,28 @@ namespace SDK {
 
             Il2CppObject* localTf = g_localPlayer ? CachedTransform(g_localPlayer) : nullptr;
 
-            int n = g_targetCount;
-            for (int i = 0; i < n; ++i) {
+            const int n = g_targetCount;
+            int budget = C.losPerFrame > 0 ? C.losPerFrame : 8;
+            if (budget > n) budget = n;
+
+            static int losCursor = 0;
+            if (n > 0) losCursor %= n;
+
+            int done = 0;
+            for (int k = 0; k < n && done < budget; ++k) {
+                int i = losCursor + k;
+                if (i >= n) i -= n;
+
                 Target& t = g_targets[i];
-                if (!t.player || !t.alive) { t.visible = false; continue; }
-                if (t.dist > cap) { t.visible = false; continue; }
+                if (!t.player || !t.alive) { t.visible = false; ++done; continue; }
+                if (!t.onScreen) continue;
+                if (t.dist > cap) { t.visible = false; ++done; continue; }
+
                 Il2CppObject* ttf = CachedTransform(t.player);
                 t.visible = HasLineOfSightEx(eye, t.head, localTf, ttf);
+                ++done;
             }
+            if (n > 0) losCursor = (losCursor + budget) % n;
         }
     }
 
@@ -2399,8 +2456,7 @@ namespace SDK {
         if (np == 0) return false;
         for (uint32_t i = 0; i < np; ++i) {
             const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
-            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-            if (!tn) return false;
+            const char* tn = TypeNameCached(t);
             if (strstr(tn, "Vector3") || strstr(tn, "Single") || strstr(tn, "Int32") ||
                 strstr(tn, "Boolean") || strstr(tn, "Double") || strstr(tn, "Int64")) continue;
             return false;
@@ -2408,6 +2464,7 @@ namespace SDK {
         return true;
     }
 
+    // >>> FIX P16: sem std::vector (sem heap no caminho do tiro)
     void FireBulletAt(Vec3 pos) {
         if (!M_FireBullet || !g_localPlayer) return;
 
@@ -2421,39 +2478,38 @@ namespace SDK {
 
         uint32_t np = il2cpp_method_get_param_count ? il2cpp_method_get_param_count(M_FireBullet) : 0;
         if (np == 0) np = 1;
+        if (np > 16) np = 16;
 
         int vCount = 0;
         for (uint32_t i = 0; i < np; ++i) {
             const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
-            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-            if (tn && strstr(tn, "Vector3")) ++vCount;
+            if (strstr(TypeNameCached(t), "Vector3")) ++vCount;
         }
         const int dirVIndex = (dirSlot >= 0) ? dirSlot : (vCount > 0 ? vCount - 1 : 0);
 
-        std::vector<Vec3>   vbuf(np);
-        std::vector<float>  fbuf(np, 0.f);
-        std::vector<int>    ibuf(np, 0);
-        std::vector<double> dbuf(np, 0.0);
-        std::vector<unsigned char> bbuf(np, 0);
-        std::vector<void*>  args(np, nullptr);
+        Vec3          vbuf[16]{};
+        float         fbuf[16]{};
+        int32_t       ibuf[16]{};
+        double        dbuf[16]{};
+        unsigned char bbuf[16]{};
+        void* args[16]{};
 
         int vIndex = 0;
         for (uint32_t i = 0; i < np; ++i) {
             const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
-            const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-            if (tn && strstr(tn, "Vector3")) {
-                bool isDir = (vIndex == dirVIndex);
-                vbuf[i] = isDir ? dir : muzzle;
+            const char* tn = TypeNameCached(t);
+            if (strstr(tn, "Vector3")) {
+                vbuf[i] = (vIndex == dirVIndex) ? dir : muzzle;
                 args[i] = &vbuf[i];
                 ++vIndex;
             }
-            else if (tn && strstr(tn, "Single"))  args[i] = &fbuf[i];
-            else if (tn && strstr(tn, "Int32"))   args[i] = &ibuf[i];
-            else if (tn && strstr(tn, "Double"))  args[i] = &dbuf[i];
-            else if (tn && strstr(tn, "Boolean")) args[i] = &bbuf[i];
+            else if (strstr(tn, "Single"))  args[i] = &fbuf[i];
+            else if (strstr(tn, "Int32"))   args[i] = &ibuf[i];
+            else if (strstr(tn, "Double"))  args[i] = &dbuf[i];
+            else if (strstr(tn, "Boolean")) args[i] = &bbuf[i];
             else args[i] = nullptr;
         }
-        se_runtime_invoke(M_FireBullet, g_localPlayer, args.data());
+        se_runtime_invoke(M_FireBullet, g_localPlayer, args);
     }
 
     // ======================= init / shutdown =======================
@@ -2551,8 +2607,7 @@ namespace SDK {
                 FieldInfo* f = se_class_get_fields(kPlayerScript, &it);
                 if (!f) break;
                 const Il2CppType* t = il2cpp_field_get_type ? il2cpp_field_get_type(f) : nullptr;
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : nullptr;
-                if (tn && strstr(tn, "gunStats[]")) {
+                if (strstr(TypeNameCached(t), "gunStats[]")) {
                     O_gunStatsArray = (uint32_t)se_field_offset(f);
                     Log("[sdk] array de loadout = 0x%X (%s)", O_gunStatsArray, se_field_name(f));
                     break;
@@ -2593,8 +2648,7 @@ namespace SDK {
                 MethodReturnName(M_FireBullet));
             for (uint32_t i = 0; i < np; ++i) {
                 const Il2CppType* t = il2cpp_method_get_param ? il2cpp_method_get_param(M_FireBullet, i) : nullptr;
-                const char* tn = (t && il2cpp_type_get_name) ? il2cpp_type_get_name(t) : "?";
-                Log("[sdk]   param%d = %s", i, tn ? tn : "?");
+                Log("[sdk]   param%d = %s", i, TypeNameCached(t));
             }
         }
         Log("[sdk] methods: shoot=%p fire=%p", M_shoot, M_FireBullet);

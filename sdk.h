@@ -123,8 +123,7 @@ namespace SDK {
     int           ScreenH();
     Il2CppObject* CameraObj();
 
-    // >>> FIX: raio do FOV em pixels derivado da camera REAL. Antes existiam duas
-    //     formulas divergentes (aimbot.cpp e visuals.cpp) e o circulo mentia.
+    // raio do FOV em pixels derivado da camera REAL.
     float FovRadiusPx(float deg);
 
     bool Init();
@@ -154,6 +153,10 @@ namespace SDK {
     bool  WorldToScreen(Vec3 w, Vec2& s);
     bool  VisibleLine(Vec3 a, Vec3 b);
     Vec3  TargetAimPos(Il2CppObject* p, int boneMode);
+
+    // >>> NOVO: mapeamento de osso compartilhado (aimbot.cpp e TargetAimPos usam
+    //     o MESMO). 0=auto 1=cabeca 2=peito 3=estomago 4=perna 5=aleatorio.
+    Vec3  BonePoint(Vec3 head, Vec3 feet, int boneMode);
 
     Il2CppObject* CamTfObj();
     Quat  LookRot(Vec3 dir);
@@ -188,16 +191,12 @@ namespace SDK {
     bool  HasLineOfSight(Vec3 eye, Vec3 aim);
     bool  HasLineOfSightEx(Vec3 eye, Vec3 aim,
         Il2CppObject* localTf, Il2CppObject* targetTf);
-    // >>> NOVO: versao SEM cache. O HasLineOfSightEx e' o wrapper com cache por
-    //     frame; ninguem fora do sdk.cpp deve chamar a Raw.
     bool  HasLineOfSightExRaw(Vec3 eye, Vec3 aim,
         Il2CppObject* localTf, Il2CppObject* targetTf);
-    // >>> NOVO: limpa cache de LOS + cache de dono de collider. Chame em troca
-    //     de cena / Shutdown para nao reaproveitar posicao de partida anterior.
     void  LosInvalidate();
 
     bool  LosReady();
-    const char* LosBackend();      // "off"/"Raycast4"/... para o menu
+    const char* LosBackend();
     bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);
     bool  RaycastTest(Vec3 from, Vec3 to, float& outHitDist);
     float CameraCotHalfFovY();
@@ -240,6 +239,7 @@ using SDK::TargetVisible;
 using SDK::RaycastTest;
 using SDK::CameraCotHalfFovY;
 using SDK::FovRadiusPx;
+using SDK::BonePoint;
 using SDK::LockTargets;
 using SDK::UnlockTargets;
 using SDK::FindBoneContains;

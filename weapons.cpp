@@ -1,11 +1,6 @@
 // ============================================================================
 //  weapons.cpp — stats + ANTI-RECOIL por neutralizacao dos campos de origem
 //
-//  >>> O arquivo inteiro esta dentro de #ifndef BFI_WEAPONS_CPP. Se ele for
-//      colado duas vezes no mesmo arquivo, a 2a copia e PULADA em silencio
-//      (antes era um #error que so reclamava). Tambem protege contra
-//      #include duplicado.
-//
 //  >>> FIX FPS: o Tick resolvia o objeto de gunStats TODO FRAME
 //      (FindGunStatsObj varre campos + array de loadout + get_activeInHierarchy).
 //      Agora a RESOLUCAO e' cacheada por 250 ms; as ESCRITAS continuam por frame.
@@ -23,7 +18,6 @@
 #include <cstring>
 #include <vector>
 
-// marcador de build. selectany = merge entre TUs (evita LNK2005 se incluido).
 extern "C" __declspec(selectany) int bfi_weapons_obj = 0xBF;
 
 namespace Weapons {
@@ -34,9 +28,6 @@ namespace Weapons {
     static bool g_dumped = false;
     static bool g_ammoDumped = false;
 
-    // ------------------------- anti-recoil -------------------------
-    //  MODO_ZERO   = campo de KICK aditivo       -> zera (0.0)
-    //  MODO_NEUTRO = campo MULTIPLICADOR/escala  -> volta ao neutro (1.0)
     enum { MODO_ZERO = 0, MODO_NEUTRO = 1 };
 
     struct RecField { uint32_t off; int kind; int modo; char name[48]; };
@@ -68,8 +59,6 @@ namespace Weapons {
         return true;
     }
 
-    // campo tipo "recoilStability" e MULTIPLICADOR (normalmente 1.0-1.5).
-    // Zerar ele deixava a estabilidade em 0 -> agora vai pro neutro.
     static int ModeForName(const char* n) {
         char l[64];
         Lower(l, sizeof(l), n);
@@ -207,7 +196,7 @@ namespace Weapons {
         __try {
             int len = 0;
             if (il2cpp_array_length) len = (int)il2cpp_array_length((const Il2CppArray*)arr);
-            if (len <= 0) len = *(int*)((uintptr_t)arr + 0x18);   // 0x18 = max_length
+            if (len <= 0) len = *(int*)((uintptr_t)arr + 0x18);
 
             Log("[guns] %s: len=%d", tag, len);
             if (len < 0 || len > 64) len = 64;
@@ -290,14 +279,11 @@ namespace Weapons {
         Log("[guns] ---- fim ----");
     }
 
-    // ------------------------- tick -------------------------
     void Tick() {
         if (!(C.infAmmo || C.noReload || C.noSpread || C.rapidFire || C.noRecoil)) return;
         if (!SDK::g_localPlayer) return;
 
-        // >>> FIX FPS: FindGunStatsObj varre campos + array de loadout e chama
-        //     get_activeInHierarchy. Resolver 1x a cada 250 ms basta — as
-        //     ESCRITAS continuam por frame, so a RESOLUCAO e' cacheada.
+        // >>> FIX FPS: resolucao cacheada por 250 ms.
         static Il2CppObject* s_stats = nullptr;
         static ULONGLONG     s_statsNext = 0;
         ULONGLONG nowStats = GetTickCount64();

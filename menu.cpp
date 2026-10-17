@@ -1,25 +1,16 @@
 // ============================================================
 //  menu.cpp - bfi / Bullet Force (ImGui)
 //
-//  >>> FIX (LNK2005):
-//   - Menu::Render() NAO e definido aqui. Ele vive em features.cpp
-//     (o hooks.cpp chama Render -> features.cpp -> ApplyStyle -> Draw).
-//     Definir nos dois dava: LNK2005 ?Render@Menu@@YAXXZ ja definida em
-//     features.obj + LNK1169.
-//   - O estilo bonito continua: Draw() chama ApplyStyleOnce() no inicio,
-//     uma unica vez (flag g_styled).
-//   - TabUnlock com combos de ARMA, ANEXOS (3 slots), SKIN e PERSONAGEM.
-//   - Guardas: lista vazia nao estoura o combo.
-//
-//  >>> v14: DUPE COMPLETO -> gera bfi_dupe.json ao lado da DLL. As listas
-//  (armas/camos/chars/anexos) vem do JSON, nao de varredura por frame.
-//
-//  >>> FIX C6011: ComboIdx checava 'list' na linha do 'cur' mas nao dentro do
-//  loop do combo; com lista nula, list[i] estourava.
-//
-//  >>> FIX v15 (novos controles):
+//  >>> v16:
 //   - aba Aimbot: "So visivel (sem fallback)" -> C.aimStrictVis
-//   - aba Visual: slider "LOS por frame" -> C.losPerFrame (custo de FPS do LOS)
+//   - aba Visual: slider "LOS por frame" -> C.losPerFrame
+//   - aba Trigger: slider "Raio da mira (px)" -> C.triggerRadius
+//   - aba Misc: checkbox "Profiler (ms por passo)" -> C.showFpsGraph
+//
+//  >>> FIX (LNK2005): Menu::Render() NAO e definido aqui. Ele vive em
+//      features.cpp (hooks.cpp chama Render -> features.cpp -> ApplyStyle -> Draw).
+//  >>> FIX C6011: ComboIdx checava 'list' na linha do 'cur' mas nao dentro do
+//      loop do combo; com lista nula, list[i] estourava.
 // ============================================================
 #include "common.h"
 #include "config.h"
@@ -126,10 +117,9 @@ namespace Menu {
         c[ImGuiCol_Separator] = ImVec4(0.24f, 0.24f, 0.30f, 1.f);
     }
 
-    // >>> NAO existe Menu::Render() aqui. Ele esta em features.cpp.
     void Draw()
     {
-        ApplyStyleOnce();          // uma vez, no primeiro frame
+        ApplyStyleOnce();
         if (!C.menuOpen) return;
 
         ImGui::SetNextWindowSize(ImVec2(600, 560), ImGuiCond_FirstUseEver);
@@ -167,15 +157,11 @@ namespace Menu {
         ImGui::SameLine();
         ImGui::Checkbox("Ignorar time", &C.aimTeam);
 
-        // MARCADO    = so mira em quem esta visivel (ninguem visivel -> nao gira)
-        // DESMARCADO = mira atraves da parede
         ImGui::Checkbox("Checar visao (LOS) - so visivel", &C.aimVisCheck);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Marcado: so mira em alvo visivel.\n"
                 "Desmarcado: mira atraves da parede.");
 
-        // >>> FIX: sem isso, com o visCheck ligado o alvo caia no mais proximo
-        //     da mira quando ninguem estava visivel (mirar atras do muro).
         ImGui::Checkbox("So visivel (sem fallback)", &C.aimStrictVis);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Marcado: se ninguem estiver visivel, nao mira\n"
@@ -183,10 +169,18 @@ namespace Menu {
                 "Desmarcado: cai no mais proximo da mira.");
 
         ImGui::Checkbox("Rotacionar camera", &C.aimRotate);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Desmarcado: o aimbot NAO mexe na camera\n"
+                "(util com silent aim).");
+
         ImGui::Checkbox("Circulo de FOV", &C.showFovCircle);
 
-        static const char* kModes[] = { "Camera", "Angulo", "Mouse" };
+        static const char* kModes[] = { "Camera (screen)", "Angulo (3D)", "Mouse" };
         ImGui::Combo("Modo", &C.aimMode, kModes, IM_ARRAYSIZE(kModes));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Camera: FOV medido em pixels na tela.\n"
+                "Angulo: FOV medido em graus no mundo (independe do zoom).\n"
+                "Mouse: sem suporte -> cai em Camera.");
 
         static const char* kBones[] = { "Auto", "Cabeca", "Peito", "Estomago", "Perna", "Aleatorio" };
         ImGui::Combo("Osso", &C.aimBone, kBones, IM_ARRAYSIZE(kBones));
@@ -207,6 +201,14 @@ namespace Menu {
     {
         ImGui::Checkbox("Triggerbot", &C.triggerbot);
         ImGui::SliderFloat("Delay (ms)", &C.triggerDelay, 0.0f, 300.0f, "%.0f");
+
+        // >>> NOVO: so atira se a mira estiver EM CIMA do alvo.
+        ImGui::SliderFloat("Raio da mira (px)", &C.triggerRadius, 0.0f, 60.0f, "%.0f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("So atira se o alvo estiver a menos de N pixels\n"
+                "do centro da tela. 0 = desliga (atira com o alvo em\n"
+                "qualquer lugar do FOV do aimbot).");
+
         Keybind("Tecla do trigger", &C.triggerKey);
     }
 
@@ -232,8 +234,6 @@ namespace Menu {
         ImGui::Checkbox("Checar visao", &C.espVisCheck);
         ImGui::Checkbox("Linha de visao", &C.espVisLine);
 
-        // >>> FIX FPS: quantos alvos podem ser testados por frame (rodizio).
-        //     Baixo = mais FPS. A visibilidade atualiza em poucos frames.
         ImGui::SliderInt("LOS por frame", &C.losPerFrame, 1, 32);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Quantos alvos sao testados por frame (rodizio).\n"
@@ -283,8 +283,6 @@ namespace Menu {
     }
 
     // ------------------------------------------------------------
-    // >>> FIX C6011: 'list' era checada na linha do 'cur' mas nao dentro do
-    //     loop do combo. Com lista nula, list[i] estourava.
     static bool ComboIdx(const char* label, int* sel, int count, const char* const* list,
         const char* vazio)
     {
@@ -316,7 +314,6 @@ namespace Menu {
         ImGui::InputInt("Dinheiro (valor)", &C.currencyValue);
         ImGui::SliderFloat("Intervalo", &C.unlockInterval, 0.05f, 2.0f, "%.2f");
 
-        // ---------------- CATALOGO / DUPE ----------------
         ImGui::Separator();
         ImGui::Text("Catalogo: %s", Dupe::HasFile() ? "bfi_dupe.json OK" : "AUSENTE");
 
@@ -350,7 +347,6 @@ namespace Menu {
         ImGui::SameLine();
         ImGui::Checkbox("Aplicar selecao", &C.applySelection);
 
-        // ---------------- LOADOUT ----------------
         if (ImGui::CollapsingHeader("Loadout", ImGuiTreeNodeFlags_DefaultOpen))
         {
             ImGui::SliderInt("Slot do loadout", &C.loadoutSlot, 0, 2);
@@ -378,7 +374,6 @@ namespace Menu {
             }
         }
 
-        // ---------------- SKINS ----------------
         if (ImGui::CollapsingHeader("Skins", ImGuiTreeNodeFlags_DefaultOpen))
         {
             int cn = Unlock::CamoCount();
@@ -397,7 +392,6 @@ namespace Menu {
             ImGui::InputText("Nome da skin", C.skinName, sizeof(C.skinName));
         }
 
-        // ---------------- PERSONAGENS ----------------
         if (ImGui::CollapsingHeader("Personagens", ImGuiTreeNodeFlags_DefaultOpen))
         {
             int pn = Unlock::CharCount();
@@ -416,7 +410,6 @@ namespace Menu {
             C.selWeapon, C.selCamo, C.selChar,
             C.selAttach[0], C.selAttach[1], C.selAttach[2]);
 
-        // ---------------- slots manuais ----------------
         if (ImGui::CollapsingHeader("Slots manuais"))
         {
             ImGui::Checkbox("Preencher slots", &C.fillLoadoutSlots);
@@ -440,6 +433,13 @@ namespace Menu {
     {
         ImGui::Checkbox("Watermark", &C.watermark);
         ImGui::Checkbox("Mostrar FPS", &C.fps);
+
+        // >>> NOVO: profiler por passo
+        ImGui::Checkbox("Profiler (ms por passo)", &C.showFpsGraph);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Mostra o tempo de CADA passo do tick.\n"
+                "Use pra achar o gargalo em vez de chutar.");
+
         ImGui::Checkbox("Crosshair", &C.crosshair);
         ImGui::SliderFloat("Tamanho da mira", &C.crosshairSize, 1.0f, 20.0f, "%.0f");
         ImGui::ColorEdit4("Cor da mira", C.crosshairColor);

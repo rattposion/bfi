@@ -51,7 +51,21 @@ namespace Menu {
 
 namespace ESP { void Draw(); }
 namespace Misc { void Panic(); void Draw(); void Tick(); }
-namespace Combat { void Tick(); }
+
+// ============================================================================
+//  COMBAT + PROFILER POR PASSO
+//  Cada passo do Tick e' cronometrado (QPC) e exposto pro overlay, pra voce
+//  achar o gargalo real em vez de chutar.
+// ============================================================================
+namespace Combat {
+    const int kMaxSteps = 16;
+    struct StepStat { char name[24]; float ms; float last; };
+    extern StepStat g_stats[kMaxSteps];
+    extern int       g_statsN;
+    extern float     g_tickMs;      // media exponencial do tick inteiro
+    void Tick();
+}
+
 namespace Weapons { void Init(); void Tick(); }
 namespace Movement { void Tick(); }
 

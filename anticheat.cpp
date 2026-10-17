@@ -1,23 +1,20 @@
 // ============================================================================
-//  anticheat.cpp — bypass em camadas (v4)
+//  anticheat.cpp — bypass em camadas (v5)
+//
+//  >>> FIX v5 (FPS): hk_acUpdate chamava ClearAll() DUAS vezes por Update do
+//      anti-cheat, e cada ClearAll escreve em dezenas/centenas de campos.
+//      Agora roda no maximo 1x por FRAME (usa SDK::g_frameId), mantendo o
+//      "limpa antes e depois" sem multiplicar o custo.
 //
 //  >>> FIX v4 (FPS de 1 / frame de 2,1 s):
-//      O log mostrou: dbg -> recoil = 2,14 s e nada mais no frame.
-//      O `obj` do [ac] Install nunca era achado (obj=0000000000000000), o
-//      throttle do FindInstance era 1 s, o frame dura 2,1 s -> o throttle
-//      SEMPRE expirava -> FindInstance rodava TODO FRAME, pra sempre, e caia
+//      O `obj` do [ac] Install nunca era achado, o throttle do FindInstance
+//      era 1 s, o frame durava 2,1 s -> FindInstance rodava TODO frame e caia
 //      no InstanceOnPlayer(), que varre ~300 campos do PlayerScript chamando
-//      il2cpp_class_from_type em cada um. Era isso.
-//      Agora:
-//        - estatico/getter: tentado UMA vez
-//        - scan do player: no MAXIMO 6 vezes, 3 s -> 8 s de intervalo, depois para
-//        - guarda o OFFSET do campo achado -> proximas leituras sao 1 leitura
-//        - loga o tempo do scan quando passa de 20 ms (pra confirmar)
-//        - se achar um campo de classe AntiHack/AntiCheat, ADOTA essa classe
-//          e re-escaneia (o PlayerAntiHack/StoreAntiHack sao por-jogador)
+//      il2cpp_class_from_type em cada um.
+//      Agora: estatico/getter 1x; scan do player no maximo 6x (3s -> 8s);
+//      guarda o OFFSET do campo achado; loga se o scan passar de 20 ms.
 //
-//  Mantido: template dos 16 getters (sem macro com '\', era o C1075),
-//  IsStaticField antes do static_get (era o AV 0x000002BE00000076),
+//  Mantido: template dos 16 getters, IsStaticField antes do static_get,
 //  IsStaticMethod antes do runtime_invoke, ScanFieldsFallback, __try em tudo.
 // ============================================================================
 #include "features.h"
@@ -398,7 +395,6 @@ namespace AntiCheat {
         return strstr(n, "AntiHack") || strstr(n, "AntiCheat");
     }
 
-    // >>> FIX v4: com cache de offset. O scan caro so roda se o cache falhar.
     static Il2CppObject* InstanceOnPlayerFast() {
         if (!SDK::g_localPlayer || !g_cls || !AcPtr(SDK::g_localPlayer)) return nullptr;
 
@@ -458,7 +454,6 @@ namespace AntiCheat {
 
         if (!foundObj) return nullptr;
 
-        // se a classe achada for outra (PlayerAntiHack/StoreAntiHack), adota
         if (foundCls && foundCls != g_cls && !g_adopted) {
             g_adopted = true;
             Log("[ac] adotando classe %s (era %s)", ClassName(foundCls), ClassName(g_cls));
@@ -506,7 +501,6 @@ namespace AntiCheat {
         return nullptr;
     }
 
-    // >>> FIX v4: baratos 1x; caro no maximo 6x (3s -> 8s), depois desiste.
     static void FindInstance() {
         if (g_findGiveUp) return;
 
@@ -515,7 +509,6 @@ namespace AntiCheat {
         if (g_lastTry && now - g_lastTry < wait) return;
         g_lastTry = now;
 
-        // ---- baratos: uma vez so ----
         if (!g_triedCheap) {
             g_triedCheap = true;
 
@@ -527,7 +520,7 @@ namespace AntiCheat {
                 __try { f = il2cpp_class_get_field_from_name(g_cls, n); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { f = nullptr; }
                 if (!f) continue;
-                if (!IsStaticField(f)) continue;      // <<< era o AV
+                if (!IsStaticField(f)) continue;
 
                 Il2CppObject* o = nullptr;
                 __try { if (g_fieldStaticGet) g_fieldStaticGet(f, &o); }
@@ -544,7 +537,6 @@ namespace AntiCheat {
             if (g_obj) return;
         }
 
-        // ---- caro: campo no PlayerScript (com cache) ----
         g_obj = InstanceOnPlayerFast();
         if (g_obj) { g_findFails = 0; return; }
 
@@ -591,11 +583,15 @@ namespace AntiCheat {
 
     typedef void(__fastcall* tAcUpd)(void* self, void* method);
     static void __fastcall hk_acUpdate(void* self, void* method) {
-        __try { ClearAll(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        // >>> FIX v5: no maximo 1x por frame (o AC pode rodar varias vezes).
+        static uint64_t lastFrame = (uint64_t)-1;
+        const uint64_t f = SDK::g_frameId;
+        const bool doIt = (f != lastFrame);
+        lastFrame = f;
+
+        if (doIt) { __try { ClearAll(); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
         if (o_acUpdate) ((tAcUpd)o_acUpdate)(self, method);
-        __try { ClearAll(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (doIt) { __try { ClearAll(); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
     }
 
     static void HookAcUpdates() {
@@ -618,7 +614,7 @@ namespace AntiCheat {
             if (!AcPtr(p)) continue;
             if (MH_CreateHook(p, &hk_acUpdate, (void**)&o_acUpdate) == MH_OK) {
                 MH_EnableHook(p);
-                Log("[ac] hook %s OK (%p) — limpa antes/depois", name, p);
+                Log("[ac] hook %s OK (%p) — limpa antes/depois (1x/frame)", name, p);
                 return;
             }
         }

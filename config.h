@@ -56,12 +56,11 @@ struct Config {
     float aimFov = 8.f;
     float aimSmooth = 5.f;
     int   aimBone = 0;
-    int   aimMode = 0;
+    int   aimMode = 0;              // 0=Camera(screen) 1=Angulo(3D) 2=Mouse(->Camera)
     bool  aimVisible = true;
 
     // Checar visao (LOS):
-    //   MARCADO   -> mira SOMENTE em quem esta visivel. Se ninguem estiver
-    //                visivel, NAO mira em ninguem (sem fallback).
+    //   MARCADO   -> mira SOMENTE em quem esta visivel.
     //   DESMARCADO-> sem filtro, mira atraves da parede.
     bool  aimVisCheck = true;
 
@@ -71,7 +70,7 @@ struct Config {
     bool  aimStrictVis = true;
 
     bool  aimTeam = false;
-    bool  aimRotate = true;
+    bool  aimRotate = true;         // escreve a rotacao (camera/player)
     bool  showFovCircle = false;
     float aimMaxDist = 250.f;
     float aimColor[4] = { 0.f, 1.f, 0.f, 1.f };
@@ -83,6 +82,8 @@ struct Config {
     bool  triggerbot = false;
     int   triggerKey = VK_MENU;
     float triggerDelay = 30.f;
+    // raio em px: so atira se a mira estiver EM CIMA do alvo. 0 = desliga.
+    float triggerRadius = 10.f;
 
     // ---- ARMA ----
     bool  noRecoil = true;
@@ -170,7 +171,7 @@ struct Config {
     bool  gunCustomizeAllSlots = true;
 
     bool  showAimTargetName = false;
-    bool  showFpsGraph = false;
+    bool  showFpsGraph = false;             // profiler por passo no overlay
 };
 
 extern Config  g_cfg;

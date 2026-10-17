@@ -1,36 +1,23 @@
 // ============================================================================
-//  aimbot.cpp — bfi  (v9)
+//  aimbot.cpp — bfi  (v10)
 //
-//  >>> FIX v9:
-//   1) BestStrict: quando C.aimVisCheck esta LIGADO e NINGUEM tem linha de
-//      visao, o alvo NAO cai mais no mais-proximo-da-mira (o "mirar atras do
-//      muro"). Retorna nullptr e o aimbot simplesmente nao gira. O
-//      comportamento antigo volta com C.aimStrictVis = false.
-//   2) BestStrict: AimPointOf era chamado DUAS vezes por alvo (ScoreTarget +
-//      coleta). Agora e' UMA -> metade dos GetPos/il2cpp_runtime_invoke por
-//      frame no caminho do aim.
-//   3) BestStrict: removido o teto de 12 tentativas no teste de LOS (a lista
-//      ja esta ordenada do mais perto da mira pro mais longe).
-//   4) config.h: aimStrictVis agora nasce true.
+//  >>> FIX v10:
+//   1) AimPointOf agora usa SDK::BonePoint -> o combo de osso (Auto/Cabeca/
+//      Peito/Estomago/Perna/Aleatorio) funciona de verdade. Antes 2,3,4,5
+//      caiam todos no mesmo ponto.
+//   2) C.aimMode passa a ser honrado: 1 = Angulo (FOV 3D, independe da
+//      projecao). 0/2 = Camera (screen).
+//   3) C.aimRotate passa a ser honrado: se desmarcado, nao escreve rotacao.
 //
-//  >>> FIX v8 (mantido):
-//   1) struct Cand com inicializadores -> C26495 'Cand::obj' / 'Cand::score'
-//      nao inicializados (linha 180).
-//   2) O Log do probeLog tinha 7 formatos e 6 argumentos: 'dist' nem existia,
-//      entao 'ang' era impresso como dist, o onScreen (int) caia no %.1f e
-//      todo o resto saia deslocado. Agora calcula dist e passa na ordem.
+//  >>> FIX v9 (mantido):
+//   1) visCheck LIGADO + ninguem visivel -> NAO mira em ninguem (nao mira
+//      atras do muro). C.aimStrictVis = false restaura o fallback.
+//   2) AimPointOf UMA vez por alvo (antes eram duas).
+//   3) Sem o teto de 12 tentativas no teste de LOS.
 //
-//  >>> SELECAO DE ALVO (o que voce pediu):
-//  C.aimVisCheck LIGADO  -> so visivel. Ninguem visivel = nao gira a camera.
+//  >>> SELECAO DE ALVO:
+//  C.aimVisCheck LIGADO  -> so visivel. Ninguem visivel = nao gira.
 //  C.aimVisCheck DESLIGADO -> mira atraves da parede.
-//  C.aimStrictVis = false -> se ninguem estiver visivel, cai no mais perto.
-//
-//  >>> '::Quat' explicito em tudo, chamadas internas qualificadas
-//      (Aimbot::LookRot) porque o sdk.h faz 'using SDK::LookRot;' global.
-//
-//  >>> BUG ANTIGO (mantido corrigido): LocalPos() procurava o local player em
-//      SDK::g_targets, mas RefreshTargets() EXCLUI o local -> retornava (0,0,0)
-//      e o aimbot mirava a partir da ORIGEM DO MUNDO.
 // ============================================================================
 #include "common.h"
 #include "sdk.h"
@@ -133,9 +120,8 @@ namespace Aimbot {
         Vec3 f = t.feet;
         if (t.footBone) { Vec3 b = SDK::GetPos(t.footBone); if (!b.zero()) f = b; }
 
-        if (C.aimBone == 0) return h;
-        if (C.aimBone == 2) return Vec3(h.x, (h.y + f.y) * 0.5f, h.z);
-        return Vec3(h.x, h.y - (h.y - f.y) * 0.25f, h.z);
+        // >>> FIX v10: mapeamento compartilhado com o SDK.
+        return SDK::BonePoint(h, f, C.aimBone);
     }
 
     Vec3 AimPoint(void* obj)
@@ -152,7 +138,6 @@ namespace Aimbot {
 
     // =========================================================================
     //  score: <0 = descartado. Menor = mais perto da mira.
-    //
     //  >>> FIX v9: o aim point entra por PARAMETRO (calculado 1x pelo caller).
     // =========================================================================
     static float ScoreTarget(const Target& t, Vec3 aim, Vec3 eye, Vec3 fwd,
@@ -184,7 +169,6 @@ namespace Aimbot {
         return score;
     }
 
-    // >>> FIX C26495: inicializadores explicitos.
     struct Cand
     {
         float         score = 0.f;
@@ -202,7 +186,9 @@ namespace Aimbot {
         const float cx = (float)SDK::ScreenW() * 0.5f;
         const float cy = (float)SDK::ScreenH() * 0.5f;
         const float radius = SDK::FovRadiusPx(C.aimFov);
-        const bool screenMode = (radius > 2.f && radius < 100000.f);
+
+        // >>> FIX v10: aimMode 1 = Angulo (FOV 3D). 0/2 = Camera (screen).
+        const bool screenMode = (C.aimMode != 1) && (radius > 2.f && radius < 100000.f);
 
         const Vec3 eye = EyePos();
         const Vec3 fwd = Aimbot::CamForward();
@@ -213,8 +199,7 @@ namespace Aimbot {
         for (int i = 0; i < SDK::g_targetCount && n < 64; ++i) {
             const Target& t = SDK::g_targets[i];
 
-            // >>> FIX v9: AimPointOf UMA vez por alvo (antes eram duas:
-            //     ScoreTarget + coleta -> o dobro de GetPos/invoke por frame).
+            // >>> FIX v9: AimPointOf UMA vez por alvo.
             Vec3 ap = AimPointOf(t);
             if (ap.zero()) continue;
 
@@ -240,16 +225,12 @@ namespace Aimbot {
         const bool filtrar = (C.aimVisCheck != 0) && SDK::LosReady();
         if (!filtrar) return list[0].obj;
 
-        // 4) percorre a lista (ja ordenada: mais perto da mira primeiro) e pega
-        //    o PRIMEIRO com linha de visao de verdade.
-        //    >>> FIX v9: sem o teto de 12 tentativas.
+        // 4) primeiro (mais perto da mira) com linha de visao de verdade.
         for (int i = 0; i < n; ++i) {
             if (SDK::HasLineOfSight(eye, list[i].aim)) return list[i].obj;
         }
 
         // 5) >>> FIX v9: NINGUEM visivel -> nao mira em ninguem.
-        //    Nada de mirar atras do muro.
-        //    (C.aimStrictVis = false restaura o fallback "mais perto".)
         return C.aimStrictVis ? nullptr : list[0].obj;
     }
 
@@ -308,9 +289,9 @@ namespace Aimbot {
     {
         Il2CppObject* ct = SDK::CamTfObj();
         Log("[aimbot] install: fov=%.1f tecla=0x%02X camTf=%p bone=%d smooth=%.1f "
-            "visCheck=%d strict=%d",
+            "visCheck=%d strict=%d modo=%d rotate=%d",
             C.aimFov, C.aimKey, ct, C.aimBone, C.aimSmooth,
-            (int)C.aimVisCheck, (int)C.aimStrictVis);
+            (int)C.aimVisCheck, (int)C.aimStrictVis, C.aimMode, (int)C.aimRotate);
         return true;
     }
 
@@ -319,6 +300,9 @@ namespace Aimbot {
         if (!C.aimbot || !SDK::g_localPlayer) return;
 
         ProbePlayerRot();
+
+        // >>> FIX v10: aimRotate desmarcado = nao escreve rotacao.
+        if (!C.aimRotate) return;
 
         Il2CppObject* best = SDK::g_aimTarget ? SDK::g_aimTarget : g_best;
         if (!best) return;

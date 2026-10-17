@@ -3,6 +3,11 @@
 //  + visual check: verde = visivel, vermelho = parede (SDK::HasLineOfSight)
 //  + linha do centro da mira ate o inimigo (toggle C.espVisLine)
 //  + snapline da base da tela ate os pes (toggle C.espSnapline)
+//
+//  >>> FIX 1: o lock g_targetCs era segurado durante TODO o desenho do ImGui.
+//      Agora copia a lista sob o lock e solta ANTES de desenhar -> a thread do
+//      jogo nao fica esperando o overlay.
+//  >>> FIX 2: sem sprintf por alvo/frame. Formatador de inteiro na mao.
 // ============================================================================
 #include "features.h"
 #include "sdk.h"
@@ -21,15 +26,35 @@ namespace ESP {
             (int)(c[2] * 255.f), (int)(c[3] * 255.f * aMul));
     }
 
+    // inteiro -> string, sem sprintf
+    static inline int AppendInt(char* out, int v) {
+        char tmp[12]; int n = 0; int neg = 0;
+        if (v < 0) { neg = 1; v = -v; }
+        do { tmp[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+        int p = 0;
+        if (neg) out[p++] = '-';
+        for (int i = 0; i < n; ++i) out[p + i] = tmp[n - 1 - i];
+        out[p + n] = 0;
+        return p + n;
+    }
+
     void Draw() {
         SDK::dbg_drawn = 0;
 
         if (!C.esp) return;
         if (!SDK::g_localPlayer) return;
 
+        // >>> FIX 1: snapshot sob o lock, desenho fora dele.
+        static Target snap[MAX_TARGETS];
+        int n = 0;
+        SDK::LockTargets();
+        n = SDK::g_targetCount;
+        if (n > MAX_TARGETS) n = MAX_TARGETS;
+        if (n > 0) memcpy(snap, SDK::g_targets, sizeof(Target) * (size_t)n);
+        SDK::UnlockTargets();
+
         ImDrawList* dl = ImGui::GetBackgroundDrawList();
 
-        // tamanho REAL do display do ImGui (nao depende do SDK)
         ImVec2 disp = ImGui::GetIO().DisplaySize;
         float scrW = disp.x > 1.f ? disp.x : (float)SDK::ScreenW();
         float scrH = disp.y > 1.f ? disp.y : (float)SDK::ScreenH();
@@ -43,15 +68,12 @@ namespace ESP {
         if (th < 1.f) th = 1.f;
 
         int drawn = 0, visCount = 0, snapCount = 0;
-        float cx = scrW * 0.5f;      // centro horizontal
-        float cyMid = scrH * 0.5f;   // centro da mira
-        float cyBot = scrH;          // base da tela (snapline)
-
-        SDK::LockTargets();
-        int n = SDK::g_targetCount;
+        float cx = scrW * 0.5f;
+        float cyMid = scrH * 0.5f;
+        float cyBot = scrH;
 
         for (int i = 0; i < n; ++i) {
-            Target& t = SDK::g_targets[i];
+            Target& t = snap[i];
 
             if (!t.player) continue;
             if (t.player == SDK::g_localPlayer) continue;
@@ -83,7 +105,6 @@ namespace ESP {
             }
 
             // ---- snapline: SEMPRE da base da tela ate os pes ----
-            //     (independente de espBox / espFill / visCheck)
             if (C.espSnapline) {
                 dl->AddLine(ImVec2(cx, cyBot), ImVec2(t.scrFeet.x, t.scrFeet.y),
                     C.espVisCheck ? colState : colBox, th);
@@ -98,7 +119,6 @@ namespace ESP {
             if (C.espBox)
                 dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), boxCol, 0.f, 0, th);
 
-            // alvo atual da mira: marcador extra
             if (t.player == SDK::g_aimTarget)
                 dl->AddRect(ImVec2(x0 - 2.f, y0 - 2.f), ImVec2(x1 + 2.f, y1 + 2.f),
                     colState, 0.f, 0, th + 1.f);
@@ -114,8 +134,9 @@ namespace ESP {
                     IM_COL32((int)(255.f * (1.f - hp)), (int)(255.f * hp), 0, 255));
 
                 if (C.espHealthNum) {
+                    // >>> FIX 2: sem sprintf
                     char hpBuf[16];
-                    sprintf_s(hpBuf, sizeof(hpBuf), "%.0f", (double)t.health);
+                    AppendInt(hpBuf, (int)(t.health + 0.5f));
                     dl->AddText(ImVec2(bx - 22.f, y0), colText, hpBuf);
                 }
             }
@@ -128,36 +149,37 @@ namespace ESP {
                 dl->AddLine(ImVec2(x1, sy), ImVec2(t.scrHead.x, y0 + h * 0.06f), colSkel, th);
             }
 
-            char buf[96];
-
             if (C.espName && t.name[0]) {
                 float tw = (float)strlen(t.name) * (C.espFontSize * 0.55f);
                 dl->AddText(ImVec2(t.scrHead.x - tw * 0.5f, y0 - C.espFontSize - 2.f), colText, t.name);
             }
 
             if (C.espWeapon) {
-                sprintf_s(buf, sizeof(buf), "arma %d", t.weapon);
-                dl->AddText(ImVec2(t.scrHead.x - 20.f, y1 + 2.f), colText, buf);
+                char wbuf[32];
+                int wn = AppendInt(wbuf, t.weapon);
+                wbuf[wn] = 0;
+                dl->AddText(ImVec2(t.scrHead.x - 20.f, y1 + 2.f), colText, wbuf);
             }
 
             if (C.espDistance) {
-                sprintf_s(buf, sizeof(buf), "%.0fm", (double)t.dist);
-                dl->AddText(ImVec2(t.scrHead.x - 16.f, y1 + C.espFontSize + 2.f), colText, buf);
+                // >>> FIX 2: sem sprintf
+                char dbuf[16];
+                int dn = AppendInt(dbuf, (int)(t.dist + 0.5f));
+                dbuf[dn++] = 'm'; dbuf[dn] = 0;
+                dl->AddText(ImVec2(t.scrHead.x - 16.f, y1 + C.espFontSize + 2.f), colText, dbuf);
             }
 
             drawn++;
         }
 
-        SDK::UnlockTargets();
         SDK::dbg_drawn = drawn;
 
-        // ---- diagnostico 1x por segundo (tira no BFInternal.log) ----
         static ULONGLONG lastLog = 0;
         ULONGLONG now = GetTickCount64();
         if (now - lastLog >= 1000) {
             lastLog = now;
             Log("[esp] alvos=%d desenhados=%d visiveis=%d snap=%d/%d visCheck=%d los=%s",
-                SDK::g_targetCount, drawn, visCount, snapCount, C.espSnapline ? 1 : 0,
+                n, drawn, visCount, snapCount, C.espSnapline ? 1 : 0,
                 C.espVisCheck ? 1 : 0, SDK::LosReady() ? "OK" : "OFF");
         }
     }
