@@ -99,6 +99,9 @@
     <ClInclude Include="unlock.h">
       <Filter>core\features.h</Filter>
     </ClInclude>
+    <ClInclude Include="dupe.h">
+      <Filter>core\features.h</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="imgui\imgui.cpp">

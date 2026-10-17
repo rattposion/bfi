@@ -188,6 +188,14 @@ namespace SDK {
     bool  HasLineOfSight(Vec3 eye, Vec3 aim);
     bool  HasLineOfSightEx(Vec3 eye, Vec3 aim,
         Il2CppObject* localTf, Il2CppObject* targetTf);
+    // >>> NOVO: versao SEM cache. O HasLineOfSightEx e' o wrapper com cache por
+    //     frame; ninguem fora do sdk.cpp deve chamar a Raw.
+    bool  HasLineOfSightExRaw(Vec3 eye, Vec3 aim,
+        Il2CppObject* localTf, Il2CppObject* targetTf);
+    // >>> NOVO: limpa cache de LOS + cache de dono de collider. Chame em troca
+    //     de cena / Shutdown para nao reaproveitar posicao de partida anterior.
+    void  LosInvalidate();
+
     bool  LosReady();
     const char* LosBackend();      // "off"/"Raycast4"/... para o menu
     bool  TargetVisible(int idx, Vec3 eye, Vec3 aim);
@@ -224,6 +232,8 @@ using SDK::SafeReadObjPub;
 using SDK::VisibleLine;
 using SDK::HasLineOfSight;
 using SDK::HasLineOfSightEx;
+using SDK::HasLineOfSightExRaw;
+using SDK::LosInvalidate;
 using SDK::LosReady;
 using SDK::LosBackend;
 using SDK::TargetVisible;

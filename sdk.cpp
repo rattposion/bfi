@@ -1,7 +1,30 @@
 // ============================================================================
 //  sdk.cpp — UTF-16->UTF-8, SyncVar, bones, LOS via Physics.Raycast
 //
-//  >>> CORRECOES DESTA VERSAO:
+//  >>> CORRECOES DESTA VERSAO (v3 — anti-lag de LOS):
+//   P1) Auto-hit: o raio nascia dentro do collider do proprio player, acertava
+//       o proprio corpo, OwnerKind devolvia 1 e o loop do HasLineOfSightEx
+//       gastava ATE 10 raycasts por chamada. Era isso que fazia
+//       "visiveis=0 sempre" E que multiplicava o custo por 10. Agora o raio
+//       comeca 45 cm a frente do olho.
+//   P2) OwnerKind: o fallback de posicao usava 1.5 m contra g_localPos (pe do
+//       player), mas o olho/camera fica a ~1.6 m do pe -> o heurístico nunca
+//       reconhecia o proprio corpo e devolvia "obstaculo" para todo mundo.
+//       Agora 2.5 m, igual ao que ja era usado para o alvo.
+//   P3) Cache de LOS por frame (ring buffer de 64, tolerancia 0.5 m): ESP,
+//       aimbot e silent aim compartilham o mesmo resultado no mesmo frame.
+//   P4) Cache de dono de collider por frame: o walk de ancestralidade do
+//       OwnerKind custa ate 10 il2cpp_runtime_invoke por raio. Quando varios
+//       alvos estao atras do MESMO muro, o segundo em diante vira hit de cache.
+//   P5) LOS agora roda UMA vez por frame, para todos os alvos, dentro do
+//       UpdateTargets. Antes o aimbot fazia ate 12 chamadas proprias e o
+//       Silent::Override ate 128 por tiro. Agora todos leem t.visible.
+//   P6) Orcamento opcional de raycasts COM ROTACAO por slot (kLosBudget).
+//       Sem rotacao, "os N primeiros vencem" e o resto morre de fome.
+//   P7) ++g_frameId NAO foi adicionado ao UpdateView: ja e' incrementado uma
+//       vez por frame no UpdateTargets.
+//
+//  >>> CORRECOES ANTERIORES (mantidas):
 //   A) PlausibleObj/SafeClass/SafeObjField: valida TODO ponteiro antes de
 //      entrega-lo ao il2cpp. Um campo que nao e ponteiro (int, enum, struct)
 //      ou um objeto morto por troca de cena devolve lixo tipo
@@ -14,30 +37,28 @@
 //      nao batia em nada e o HasLineOfSightEx caia no "return true" ->
 //      tudo "visivel" e aimbot mirando atraves da parede.
 //      Agora o retorno e tri-state: 0=falhou | 1=sem hit | 2=hit.
-//   C) HasLineOfSightEx: distingue falha de invoke de "sem hit", com contadores
-//      e log detalhado (gate C.probeLog) pra diagnostico.
+//   C) HasLineOfSightExRaw: distingue falha de invoke de "sem hit", com
+//      contadores e log detalhado (gate C.probeLog) pra diagnostico.
 //   D) UpdateView valida a camera; UpdateTargets re-resolve o local player se
 //      ele morrer numa troca de cena.
 //   E) RefreshTargets: diagnostico a cada 2s e checagem de plausibilidade nos
 //      objetos vindos de FindObjectsOfType.
 //
-//  >>> CORRECOES ANTERIORES (mantidas):
-//   1) FindGunStatsObj lia o TAMANHO do array em 0x10 ('bounds'). Fica em 0x18.
-//   2) se_runtime_invoke garante il2cpp_thread_attach por thread.
-//   3) il2cpp_class_from_type ganhou fallback para o nome longo do export.
-//   4) ReadTeam retorna -1 quando NAO conseguiu ler.
-//   5) O_rotationIsQuat deixou de ser hardcoded.
-//   6) FovRadiusPx centralizado.
-//   7) g_frameId nunca era incrementado -> cache de TargetVisible preso.
-//   8) Offsets do gunStats resolvidos PELA CLASSE DA INSTANCIA.
-//   9) Slots de alvo estaveis + cache de bones por player.
-//  10) LOS em round-robin (3 alvos/frame) fora do critical section.
+//  1) FindGunStatsObj lia o TAMANHO do array em 0x10 ('bounds'). Fica em 0x18.
+//  2) se_runtime_invoke garante il2cpp_thread_attach por thread.
+//  3) il2cpp_class_from_type ganhou fallback para o nome longo do export.
+//  4) ReadTeam retorna -1 quando NAO conseguiu ler.
+//  5) O_rotationIsQuat deixou de ser hardcoded.
+//  6) FovRadiusPx centralizado.
+//  7) g_frameId nunca era incrementado -> cache de TargetVisible preso.
+//  8) Offsets do gunStats resolvidos PELA CLASSE DA INSTANCIA.
+//  9) Slots de alvo estaveis + cache de bones por player.
+//  10) LOS identifica o dono do collider por ANCESTRALIDADE (nao por posicao).
 //  11) ReadHealth/ReadTeam nao leem bytes de ponteiro como float.
-//  12) LOS identifica o dono do collider por ANCESTRALIDADE (nao por posicao).
-//  13) Arma equipada detectada por gunObject.activeInHierarchy.
-//  14) AntiHack: FindClassExact (o match de sufixo casava StoreAntiHack).
-//  15) FireBullet: direcao = ULTIMO Vector3, nao indice fixo.
-//  16) WorldToScreen: 'm' podia sair nao inicializado (C6001).
+//  12) Arma equipada detectada por gunObject.activeInHierarchy.
+//  13) AntiHack: FindClassExact (o match de sufixo casava StoreAntiHack).
+//  14) FireBullet: direcao = ULTIMO Vector3, nao indice fixo.
+//  15) WorldToScreen: 'm' podia sair nao inicializado (C6001).
 // ============================================================================
 #include <windows.h>
 #include <cstdio>
@@ -1267,6 +1288,10 @@ namespace SDK {
         memcpy(g_viewProj, vp, sizeof(vp));
         g_viewProjOk = true;
         InterlockedIncrement(&g_vpSeq);
+
+        // >>> g_frameId NAO e' incrementado aqui: ja e' feito no UpdateTargets,
+        //     uma vez por frame. Incrementar nos dois lugares invalidaria o
+        //     cache de LOS no meio do frame.
     }
 
     bool WorldToScreen(Vec3 w, Vec2& out) {
@@ -1495,8 +1520,76 @@ namespace SDK {
         return PlausibleObj(p) ? (Il2CppObject*)p : nullptr;
     }
 
+    // =========================================================================
+    //  >>> P3/P4: CACHES POR FRAME
+    //
+    //  g_losCache  — chave = posicao mirada (tolerancia 0.5 m). ESP, aimbot e
+    //                silent aim pedem o mesmo alvo no mesmo frame -> hit.
+    //  g_okCache   — chave = (collider, transform do alvo). O walk de
+    //                ancestralidade do OwnerKind custa ate 10 il2cpp_runtime_
+    //                invoke POR RAIO. Varios alvos atras do MESMO muro repetem
+    //                o mesmo collider; do segundo em diante vira hit.
+    //
+    //  Ambos sao carimbados com g_losStamp (frame) e se invalidam sozinhos.
+    //  kLosBudget = 0 -> so dedup. > 0 -> no maximo N raycasts reais por frame,
+    //  com ROTACAO por slot (sem rotacao, "os N primeiros vencem" sempre e os
+    //  alvos do fim da lista morrem de fome).
+    // =========================================================================
+    namespace {
+
+        struct LosEnt { Vec3 aim; bool res; bool used; uint64_t stamp; uint32_t slot; };
+        static LosEnt   g_losCache[64];
+        static uint32_t g_losRing = 0;
+        static uint64_t g_losStamp = (uint64_t)-1;
+        static int      g_losBudget = 0;
+
+        static const int   kLosBudget = 0;      // 0 = sem teto
+        static const float kLosEps2 = 0.25f;    // 0.5 m
+
+        static LosEnt* LosFind(Vec3 aim) {
+            for (int i = 0; i < 64; ++i) {
+                if (!g_losCache[i].used) continue;
+                Vec3 d{ g_losCache[i].aim.x - aim.x,
+                        g_losCache[i].aim.y - aim.y,
+                        g_losCache[i].aim.z - aim.z };
+                if (d.x * d.x + d.y * d.y + d.z * d.z < kLosEps2) return &g_losCache[i];
+            }
+            return nullptr;
+        }
+
+        static LosEnt* LosInsert(Vec3 aim, bool res) {
+            LosEnt* e = &g_losCache[g_losRing];
+            e->slot = g_losRing;
+            g_losRing = (g_losRing + 1) % 64;
+            e->aim = aim; e->res = res; e->used = true; e->stamp = g_losStamp;
+            return e;
+        }
+
+        struct OkEnt { Il2CppObject* col; Il2CppObject* ttf; int kind; uint64_t stamp; };
+        static OkEnt   g_okCache[64];
+        static uint32_t g_okRing = 0;
+
+        static bool OkFind(Il2CppObject* col, Il2CppObject* ttf, int* out) {
+            for (int i = 0; i < 64; ++i) {
+                if (g_okCache[i].stamp != g_losStamp) continue;
+                if (g_okCache[i].col == col && g_okCache[i].ttf == ttf) {
+                    *out = g_okCache[i].kind;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        static void OkInsert(Il2CppObject* col, Il2CppObject* ttf, int kind) {
+            OkEnt* e = &g_okCache[g_okRing];
+            g_okRing = (g_okRing + 1) % 64;
+            e->col = col; e->ttf = ttf; e->kind = kind; e->stamp = g_losStamp;
+        }
+
+    } // namespace
+
     // 0 = obstaculo | 1 = corpo do local | 2 = alvo
-    static int OwnerKind(Il2CppObject* col, Il2CppObject* localTf,
+    static int OwnerKindUncached(Il2CppObject* col, Il2CppObject* localTf,
         Il2CppObject* targetTf, Vec3 aim) {
         Il2CppObject* tf = ResolveGetTransform(col);
         if (!tf) return 0;
@@ -1513,11 +1606,26 @@ namespace SDK {
         Vec3 op = GetPos(tf);
         if (op.zero()) return 0;
         if (!targetTf && (op - aim).len() < 2.5f) return 2;
-        if (!localTf && (op - g_localPos).len() < 1.5f) return 1;
+        // >>> P2: o olho/camera fica a ~1.6 m do PE do player (g_localPos).
+        //     Com 1.5 m o heurístico nunca reconhecia o proprio corpo e
+        //     devolvia 0 (obstaculo) -> "visiveis=0" em todo mundo.
+        if (!localTf && (op - g_localPos).len() < 2.5f) return 1;
         return 0;
     }
 
-    bool HasLineOfSightEx(Vec3 eye, Vec3 aim, Il2CppObject* localTf, Il2CppObject* targetTf) {
+    static int OwnerKind(Il2CppObject* col, Il2CppObject* localTf,
+        Il2CppObject* targetTf, Vec3 aim) {
+        if (!col) return 0;
+
+        int cached = 0;
+        if (OkFind(col, targetTf, &cached)) return cached;
+
+        int kind = OwnerKindUncached(col, localTf, targetTf, aim);
+        OkInsert(col, targetTf, kind);
+        return kind;
+    }
+
+    bool HasLineOfSightExRaw(Vec3 eye, Vec3 aim, Il2CppObject* localTf, Il2CppObject* targetTf) {
         if (!M_raycast) ResolveRaycast();
         if (!M_raycast) { ++g_losFalhou; return true; }
         if (!O_hitDist) HitDistOffset();
@@ -1528,6 +1636,17 @@ namespace SDK {
         float dist = d.len();
         if (dist < 2.0f) { ++g_losOk; return true; }
         Vec3 dir{ d.x / dist, d.y / dist, d.z / dist };
+
+        // >>> P1: ANTI AUTO-HIT.
+        //     O raio nascia dentro do collider do proprio player, acertava o
+        //     proprio corpo, OwnerKind devolvia 1, o loop avancava 0.30 m e
+        //     repetia — ate 10 raycasts por chamada, e no fim tudo "bloqueado".
+        //     Comecar 45 cm a frente resolve os DOIS problemas de uma vez.
+        float adv = 0.45f;
+        if (adv > dist * 0.4f) adv = dist * 0.4f;
+        eye = eye + dir * adv;
+        dist -= adv;
+        if (dist < 0.2f) { ++g_losOk; return true; }
 
         float skip = dist * 0.30f;
         if (skip > 1.4f) skip = 1.4f;
@@ -1575,8 +1694,44 @@ namespace SDK {
         return true;
     }
 
+    bool HasLineOfSightEx(Vec3 eye, Vec3 aim, Il2CppObject* lt, Il2CppObject* tt)
+    {
+        // novo frame -> zera o orcamento
+        if (g_frameId != g_losStamp) { g_losStamp = g_frameId; g_losBudget = 0; }
+
+        LosEnt* e = LosFind(aim);
+
+        // ja fizemos esse raio NESTE frame (ESP, aimbot e silent compartilham)
+        if (e && e->stamp == g_losStamp) return e->res;
+
+        if (kLosBudget > 0 && e) {
+            // rotacao por slot: cada entrada renova a cada kLosBudget frames,
+            // escalonada. Sem isso os primeiros da ordem de chamada monopolizam.
+            if (((e->slot + (uint32_t)g_losStamp) % (uint32_t)kLosBudget) != 0) return e->res;
+            if (g_losBudget >= kLosBudget) return e->res;
+        }
+
+        ++g_losBudget;
+        bool res = HasLineOfSightExRaw(eye, aim, lt, tt);
+
+        if (e) { e->res = res; e->stamp = g_losStamp; }
+        else { LosInsert(aim, res); }
+        return res;
+    }
+
     bool HasLineOfSight(Vec3 eye, Vec3 aim) {
         return HasLineOfSightEx(eye, aim, nullptr, nullptr);
+    }
+
+    void LosInvalidate() {
+        memset(g_losCache, 0, sizeof(g_losCache));
+        memset(g_okCache, 0, sizeof(g_okCache));
+        g_losRing = 0;
+        g_okRing = 0;
+        g_losStamp = (uint64_t)-1;
+        g_losBudget = 0;
+        g_losFrame = (uint64_t)-1;
+        memset(g_losState, 0xFF, sizeof(g_losState));
     }
 
     bool TargetVisible(int idx, Vec3 eye, Vec3 aim) {
@@ -2139,7 +2294,7 @@ namespace SDK {
             if (!g_localPlayer) return;
         }
 
-        ++g_frameId;
+        ++g_frameId;                       // <<< UMA vez por frame. NAO incrementar no UpdateView.
         g_localPos = GetPos(g_localPlayer);
         g_localTeam = ReadTeam(g_localPlayer);
 
@@ -2172,20 +2327,33 @@ namespace SDK {
         }
         LeaveCriticalSection(&g_targetCs);
 
-        Il2CppObject* localTf = g_localPlayer ? CachedTransform(g_localPlayer) : nullptr;
+        // =====================================================================
+        //  >>> P5: LOS UMA VEZ POR FRAME, PARA TODOS OS ALVOS.
+        //
+        //  Antes o aimbot fazia ate 12 chamadas proprias e o Silent::Override
+        //  ate 128 por tiro. Agora ninguem chama: todos leem t.visible.
+        //
+        //  O HasLineOfSightEx tem cache por frame, entao qualquer chamada
+        //  extra (ESP com visCheck, aimbot, silent) e' hit O(1) sem raycast.
+        //
+        //  Fora do critical section de proposito: e' o mesmo comportamento do
+        //  round-robin antigo e nao prende a thread de render.
+        // =====================================================================
+        if ((C.espVisCheck || C.aimVisCheck) && LosReady()) {
+            float cap = C.espMaxDist > C.aimMaxDist ? C.espMaxDist : C.aimMaxDist;
+            if (cap < 50.f) cap = 300.f;
+            cap += 50.f;
 
-        static int losCursor = 0;
-        int n = g_targetCount;
-        if (n > 0) {
-            if (losCursor >= n) losCursor = 0;
-            for (int k = 0; k < 3 && k < n; ++k) {
-                int i = losCursor + k;
-                if (i >= n) i -= n;
-                if (!g_targets[i].player || !PlausibleObj(g_targets[i].player)) continue;
-                Il2CppObject* ttf = CachedTransform(g_targets[i].player);
-                g_targets[i].visible = HasLineOfSightEx(eye, g_targets[i].head, localTf, ttf);
+            Il2CppObject* localTf = g_localPlayer ? CachedTransform(g_localPlayer) : nullptr;
+
+            int n = g_targetCount;
+            for (int i = 0; i < n; ++i) {
+                Target& t = g_targets[i];
+                if (!t.player || !t.alive) { t.visible = false; continue; }
+                if (t.dist > cap) { t.visible = false; continue; }
+                Il2CppObject* ttf = CachedTransform(t.player);
+                t.visible = HasLineOfSightEx(eye, t.head, localTf, ttf);
             }
-            losCursor = (losCursor + 3) % n;
         }
     }
 
@@ -2299,6 +2467,7 @@ namespace SDK {
         memset(g_slotOwner, 0, sizeof(g_slotOwner));
         memset(g_boneCache, 0, sizeof(g_boneCache));
         ClearTfCache();
+        LosInvalidate();
     }
 
     static void ResolveOffsets() {
@@ -2464,7 +2633,7 @@ namespace SDK {
             ListClassesContaining("Hack");
         }
 
-        memset(g_losState, 0xFF, sizeof(g_losState));
+        LosInvalidate();
 
         ResolveOffsets();
         ResolveMethods();

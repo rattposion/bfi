@@ -10,11 +10,18 @@
 //     uma unica vez (flag g_styled).
 //   - TabUnlock com combos de ARMA, ANEXOS (3 slots), SKIN e PERSONAGEM.
 //   - Guardas: lista vazia nao estoura o combo.
+//
+//  >>> v14: DUPE COMPLETO -> gera bfi_dupe.json ao lado da DLL. As listas
+//  (armas/camos/chars/anexos) vem do JSON, nao de varredura por frame.
+//
+//  >>> FIX C6011: ComboIdx checava 'list' na linha do 'cur' mas nao dentro do
+//  loop do combo; com lista nula, list[i] estourava.
 // ============================================================
 #include "common.h"
 #include "config.h"
 #include "features.h"
 #include "unlock.h"
+#include "dupe.h"
 
 #include <cstdio>
 #include <cstring>
@@ -256,14 +263,20 @@ namespace Menu {
     }
 
     // ------------------------------------------------------------
+    // >>> FIX C6011: 'list' era checada na linha do 'cur' mas nao dentro do
+    //     loop do combo. Com lista nula, list[i] estourava.
     static bool ComboIdx(const char* label, int* sel, int count, const char* const* list,
         const char* vazio)
     {
+        if (count > 0 && !list) return false;
+
         const char* cur = (*sel >= 0 && *sel < count && list) ? list[*sel] : vazio;
         bool mudou = false;
         if (ImGui::BeginCombo(label, cur)) {
-            for (int i = 0; i < count; i++)
-                if (ImGui::Selectable(list[i], *sel == i)) { *sel = i; mudou = true; }
+            for (int i = 0; i < count; i++) {
+                const char* item = (list && list[i]) ? list[i] : "(?)";
+                if (ImGui::Selectable(item, *sel == i)) { *sel = i; mudou = true; }
+            }
             ImGui::EndCombo();
         }
         return mudou;
@@ -283,8 +296,37 @@ namespace Menu {
         ImGui::InputInt("Dinheiro (valor)", &C.currencyValue);
         ImGui::SliderFloat("Intervalo", &C.unlockInterval, 0.05f, 2.0f, "%.2f");
 
+        // ---------------- CATALOGO / DUPE ----------------
         ImGui::Separator();
-        if (ImGui::Button("DUMP COMPLETO (armas/skins/chars/anexos)")) Unlock::Dump();
+        ImGui::Text("Catalogo: %s", Dupe::HasFile() ? "bfi_dupe.json OK" : "AUSENTE");
+
+        if (Dupe::Building()) {
+            ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "gerando... etapa %d/5", Dupe::Stage());
+        }
+        else {
+            ImGui::TextDisabled("%s", Dupe::Status());
+        }
+
+        if (ImGui::Button("DUPE COMPLETO (gerar JSON)")) Dupe::RequestBuild();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Varre armas, anexos, skins e personagens UMA vez\n"
+                "e salva em bfi_dupe.json, ao lado da DLL.\n"
+                "Roda em 5 etapas, 1 por frame. Entre numa partida antes.");
+        ImGui::SameLine();
+        if (ImGui::Button("Recarregar JSON")) Dupe::RequestReload();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancelar") && Dupe::Building()) Dupe::Cancel();
+        ImGui::SameLine();
+        if (ImGui::Button("Dump no log")) Unlock::Dump();
+
+        ImGui::TextDisabled("armas=%d skins=%d chars=%d anexos=%d/%d/%d",
+            Dupe::WeaponCount(), Dupe::CamoCount(), Dupe::CharCount(),
+            Dupe::AttachCount(0), Dupe::AttachCount(1), Dupe::AttachCount(2));
+
+        if (!Dupe::HasFile() && Dupe::WeaponCount() == 0)
+            ImGui::TextColored(ImVec4(1.f, 0.5f, 0.4f, 1.f),
+                "sem catalogo: aperte DUPE COMPLETO dentro de uma partida");
+
         ImGui::SameLine();
         ImGui::Checkbox("Aplicar selecao", &C.applySelection);
 
@@ -298,7 +340,7 @@ namespace Menu {
             if (wn > 0 && wl)
                 ComboIdx("Arma", &C.selWeapon, wn, wl, "(nenhuma)");
             else
-                ImGui::TextDisabled("Arma: lista vazia (aperte o DUMP)");
+                ImGui::TextDisabled("Arma: catalogo vazio (aperte DUPE COMPLETO)");
 
             for (int s = 0; s < Unlock::AttachSlotCount(); ++s) {
                 int an = Unlock::AttachCount(s);
@@ -310,7 +352,7 @@ namespace Menu {
                     if (ImGui::SmallButton("limpar")) C.selAttach[s] = -1;
                 }
                 else {
-                    ImGui::TextDisabled("%s: lista vazia", Unlock::AttachSlotName(s));
+                    ImGui::TextDisabled("%s: vazio", Unlock::AttachSlotName(s));
                 }
                 ImGui::PopID();
             }
@@ -328,7 +370,7 @@ namespace Menu {
                 }
             }
             else {
-                ImGui::TextDisabled("Skin: lista vazia");
+                ImGui::TextDisabled("Skin: catalogo vazio");
             }
             ImGui::Checkbox("Skin changer", &C.skinChanger);
             ImGui::SliderInt("Indice da skin", &C.skinIndex, 0, 255);
@@ -345,7 +387,7 @@ namespace Menu {
                     strncpy_s(C.charName, sizeof(C.charName), pl[C.selChar], _TRUNCATE);
             }
             else {
-                ImGui::TextDisabled("Personagem: lista vazia");
+                ImGui::TextDisabled("Personagem: catalogo vazio");
             }
         }
 
